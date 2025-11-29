@@ -9,6 +9,10 @@ __pycache__/
 # Vsual Studio Code
 .vscode/
 
+# Notebooks
+.ipynb_checkpoints
+*.ipynb
+
 # Distribution / packaging
 .Python
 build/
