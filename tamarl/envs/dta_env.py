@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional, Tuple
 
+import functools
 import numpy as np
 import torch
 from gymnasium import spaces
@@ -74,6 +75,7 @@ class DynamicTrafficAssignmentEnv(ParallelEnv):
         return observations, infos
 
     # Observation and action spaces -------------------------------------------------
+    @functools.lru_cache(maxsize=None)
     def observation_space(self, agent: AgentID):
         return spaces.Dict(
             {
@@ -83,7 +85,8 @@ class DynamicTrafficAssignmentEnv(ParallelEnv):
                 "visited_edges": spaces.MultiBinary(self.data.edge_index.shape[1]),
             }
         )
-
+    
+    @functools.lru_cache(maxsize=None)
     def action_space(self, agent: AgentID):
         return spaces.Discrete(self.network_meta.max_out_degree)
 
@@ -101,6 +104,7 @@ class DynamicTrafficAssignmentEnv(ParallelEnv):
         Dict[AgentID, bool],
         Dict[AgentID, dict],
     ]:
+        # If no actions provided, then just return empty observations, etc.
         if not actions:
             self.agents = []
             return {}, {}, {}, {}, {}
@@ -142,12 +146,12 @@ class DynamicTrafficAssignmentEnv(ParallelEnv):
             )
             rewards_tensor = torch.tensor([], dtype=torch.float)
 
-        rewards: Dict[AgentID, float] = {agent: 0.0 for agent in self.possible_agents}
+        rewards: Dict[AgentID, float] = {agent: 0.0 for agent in self.agents}
         terminations: Dict[AgentID, bool] = {
-            agent: False for agent in self.possible_agents
+            agent: False for agent in self.agents
         }
-        truncations: Dict[AgentID, bool] = {agent: False for agent in self.possible_agents}
-        infos: Dict[AgentID, dict] = {agent: {} for agent in self.possible_agents}
+        truncations: Dict[AgentID, bool] = {agent: False for agent in self.agents}
+        infos: Dict[AgentID, dict] = {agent: {} for agent in self.agents}
 
         # Move agents
         for idx, agent in enumerate(chosen_edges.keys()):
@@ -162,11 +166,13 @@ class DynamicTrafficAssignmentEnv(ParallelEnv):
             if self._current_nodes[agent] == self.destinations[agent_idx]:
                 terminations[agent] = True
 
+        # Check for max steps truncation
         self._step_count += 1
         if self._step_count >= self.max_steps:
             for agent in current_agents:
                 if not terminations[agent]:
                     truncations[agent] = True
+        
 
         # Remove finished agents
         self.agents = [
@@ -178,6 +184,20 @@ class DynamicTrafficAssignmentEnv(ParallelEnv):
         observations: Dict[AgentID, Observation] = {
             agent: self._build_observation(agent) for agent in self.agents
         }
+
+        # Check for agents in a dead-end (no available actions)
+        # If so, truncate them, add a big negative reward, and remove them
+        new_agents = []
+        for agent in self.agents:
+            if observations[agent]["action_mask"].sum().item() == 0:
+                truncations[agent] = True
+                rewards[agent] += -3600.0
+            else:
+                new_agents.append(agent)
+
+        self.agents = new_agents
+
+
         return observations, rewards, terminations, truncations, infos
 
     # Helpers ----------------------------------------------------------------------
@@ -200,7 +220,7 @@ class DynamicTrafficAssignmentEnv(ParallelEnv):
     def _action_mask_for_node(
         self, node: int, visited_edges: List[int]
     ) -> np.ndarray:
-        mask = np.zeros(self.network_meta.max_out_degree, dtype=int)
+        mask = np.zeros(self.network_meta.max_out_degree, dtype=np.int8)
         edges = self.network_meta.out_edges_per_node[node]
         for idx, edge_id in enumerate(edges):
             if edge_id not in visited_edges:

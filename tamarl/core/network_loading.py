@@ -1,8 +1,8 @@
-"""Pure tensor operations for dynamic network loading."""
+"""Pure tensor operations for dynamic network loading.
+Currently includes BPR travel time calculations based on each time step's link flows. (Pretty Basic.)"""
 from __future__ import annotations
 
 import torch
-
 
 def update_cumulative_flows(
     flows: torch.Tensor, edges_chosen: torch.Tensor, num_edges: int

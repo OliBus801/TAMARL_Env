@@ -9,6 +9,9 @@ __pycache__/
 # Vsual Studio Code
 .vscode/
 
+# Bebug file
+test.py
+
 # Notebooks
 .ipynb_checkpoints
 *.ipynb

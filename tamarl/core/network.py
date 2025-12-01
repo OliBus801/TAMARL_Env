@@ -40,7 +40,7 @@ def build_out_edges_per_node(data: Data) -> NetworkMetadata:
     max_out = max((len(edges) for edges in out_edges_per_node), default=0)
     return NetworkMetadata(out_edges_per_node=out_edges_per_node, max_out_degree=max_out)
 
-
+# TODO : Make this function vectorized. It takes a vector of node_ids and action_indices and returns a vector of edge_ids.
 def map_action_to_edge(
     node_id: int, action_index: int, out_edges_per_node: List[List[int]]
 ) -> int:
@@ -71,19 +71,38 @@ def edge_id_to_nodes(edge_id: int, edge_index: torch.Tensor) -> Tuple[int, int]:
     tgt = int(edge_index[1, edge_id])
     return src, tgt
 
-
-def load_network_from_json(path: str | Path) -> Data:
-    """Load a directed network from a JSON file.
+def load_scenario_from_json(path: str | Path) -> Tuple[Data, np.ndarray]:
+    """Load a directed network and OD demand matrix from a JSON file.
 
     The file must contain ``nodes`` and ``edges`` lists with ``source``, ``target``,
-    ``capacity`` and ``freeflow_travel_time`` fields.
+    ``capacity`` and ``freeflow_travel_time`` fields, as well as a ``demand`` dictionary
+    with keys formatted as ``"(o,d)"``.
+
+    Returns:
+        A tuple of (network_data, od_matrix).
     """
 
     with open(path, "r", encoding="utf-8") as f:
         payload = json.load(f)
 
-    nodes = payload.get("nodes", [])
-    edges = payload.get("edges", [])
+    network = payload.get("network", {})
+    demand = payload.get("demand", {})
+
+    network_data = load_network(network)
+    od_matrix = load_demand(demand)
+
+    return network_data, od_matrix
+
+
+def load_network(dict: Dict) -> Data:
+    """Load a directed network from a dictionary object.
+
+    The dict must contain ``nodes`` and ``edges`` lists with ``source``, ``target``,
+    ``capacity`` and ``freeflow_travel_time`` fields.
+    """
+
+    nodes = dict.get("nodes", [])
+    edges = dict.get("edges", [])
 
     node_ids = [n["id"] for n in nodes]
     num_nodes = max(node_ids) + 1 if node_ids else 0
@@ -105,33 +124,28 @@ def load_network_from_json(path: str | Path) -> Data:
     return Data(num_nodes=num_nodes, edge_index=edge_index, edge_attr=edge_attr)
 
 
-def load_demand_from_json(path: str | Path) -> np.ndarray:
-    """Load an OD demand matrix from JSON.
+def load_demand(dict: Dict) -> np.ndarray:
+    """Load the OD demand from a dictionary object.
+    Creates a list of agents based on the demand matrix.
 
-    The JSON must have a ``demand`` dictionary with keys formatted as ``"(o,d)"``.
-    Returns a dense numpy array ``od_matrix[o, d]``.
+    The JSON must have a ``demand`` dictionary with keys formatted as ``"o,d"`` and values representing demand.
+    Returns a tensor of shape (2, n) with n equal to the total demand. 
+    The first row contains origins and the second row contains destinations.
     """
 
-    with open(path, "r", encoding="utf-8") as f:
-        payload = json.load(f)
+    origins: List[int] = []
+    destinations: List[int] = []
 
-    demand_dict: Dict[str, float] = payload.get("demand", {})
-    max_node = -1
-    for key in demand_dict.keys():
-        key_clean = key.strip("()")
-        origin_str, dest_str = key_clean.split(",")
-        max_node = max(max_node, int(origin_str), int(dest_str))
+    for key, value in dict.items():
+        o_str, d_str = key.split(",")
+        origin = int(o_str)
+        destination = int(d_str)
+        demand = int(value)
 
-    size = max_node + 1 if max_node >= 0 else 0
-    od_matrix = np.zeros((size, size), dtype=float)
-
-    for key, value in demand_dict.items():
-        key_clean = key.strip("()")
-        origin_str, dest_str = key_clean.split(",")
-        od_matrix[int(origin_str), int(dest_str)] = float(value)
-
-    return od_matrix
-
+        origins.extend([origin] * demand)
+        destinations.extend([destination] * demand)
+    
+    return torch.tensor([origins, destinations], dtype=torch.long)
 
 __all__ = [
     "NetworkMetadata",
