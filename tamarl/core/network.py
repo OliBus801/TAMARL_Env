@@ -97,15 +97,21 @@ def load_scenario_from_json(path: str | Path) -> Tuple[Data, np.ndarray]:
 def load_network(dict: Dict) -> Data:
     """Load a directed network from a dictionary object.
 
-    The dict must contain ``nodes`` and ``edges`` lists with ``source``, ``target``,
+    The dict must contain ``nodes`` (with 'x' and 'y' coordinates for rendering) and ``edges`` lists with ``source``, ``target``,
     ``capacity`` and ``freeflow_travel_time`` fields.
     """
 
     nodes = dict.get("nodes", [])
     edges = dict.get("edges", [])
 
-    node_ids = [n["id"] for n in nodes]
-    num_nodes = max(node_ids) + 1 if node_ids else 0
+    num_nodes = len(nodes)
+
+    # Create a pos matrix for rendering
+    pos = np.zeros((num_nodes, 2), dtype=np.float32)
+    for node in nodes:
+        node_id = int(node["id"])
+        pos[node_id, 0] = float(node.get("x", 0.0))
+        pos[node_id, 1] = float(node.get("y", 0.0))
 
     sources: List[int] = []
     targets: List[int] = []
@@ -121,7 +127,7 @@ def load_network(dict: Dict) -> Data:
     edge_index = torch.tensor([sources, targets], dtype=torch.long)
     edge_attr = torch.tensor(np.stack([ff_times, capacities], axis=1), dtype=torch.float)
 
-    return Data(num_nodes=num_nodes, edge_index=edge_index, edge_attr=edge_attr)
+    return Data(num_nodes=num_nodes, pos=torch.tensor(pos, dtype=torch.float), edge_index=edge_index, edge_attr=edge_attr)
 
 
 def load_demand(dict: Dict) -> np.ndarray:
