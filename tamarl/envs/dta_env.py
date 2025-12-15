@@ -15,6 +15,7 @@ from tamarl.core.network_loading import (
     compute_step_rewards,
     update_cumulative_flows,
 )
+from tamarl.envs.render import RenderState, build_renderer
 
 AgentID = str
 Observation = Dict[str, np.ndarray | int]
@@ -65,9 +66,11 @@ class DynamicTrafficAssignmentEnv(ParallelEnv):
         self._visited_edges: Dict[AgentID, List[int]] = {}
         self._last_edge_taken: Dict[AgentID, Optional[int]] = {}
         self._last_rewards: Dict[AgentID, float] = {}
+        self._cumulative_rewards: Dict[AgentID, float] = {}
         self.agent_status: Dict[AgentID, str] = {}
         self._last_travel_times: Optional[torch.Tensor] = None
         self._has_reset = False
+        self._renderer = None
 
     def reset(
         self, seed: Optional[int] = None, options: Optional[dict] = None
@@ -84,6 +87,7 @@ class DynamicTrafficAssignmentEnv(ParallelEnv):
         }
         self._last_edge_taken = {agent: None for agent in self.agents}
         self._last_rewards = {agent: 0.0 for agent in self.agents}
+        self._cumulative_rewards = {agent: 0.0 for agent in self.agents}
         self.agent_status = {agent: "LIVE" for agent in self.possible_agents}
         self._last_travel_times = compute_link_travel_times(
             flows=self._flows,
@@ -185,6 +189,7 @@ class DynamicTrafficAssignmentEnv(ParallelEnv):
             rewards[agent] = float(rewards_tensor[idx].item())
             self._last_edge_taken[agent] = edge_id
             self._last_rewards[agent] = rewards[agent]
+            self._cumulative_rewards[agent] = self._cumulative_rewards.get(agent, 0.0) + rewards[agent]
 
         # Determine terminations
         for agent in current_agents:
@@ -219,8 +224,10 @@ class DynamicTrafficAssignmentEnv(ParallelEnv):
         for agent in self.agents:
             if observations[agent]["action_mask"].sum().item() == 0:
                 truncations[agent] = True
-                rewards[agent] += -3600.0
+                penalty = -3600.0
+                rewards[agent] += penalty
                 self._last_rewards[agent] = rewards[agent]
+                self._cumulative_rewards[agent] = self._cumulative_rewards.get(agent, 0.0) + penalty
             else:
                 new_agents.append(agent)
 
@@ -269,6 +276,135 @@ class DynamicTrafficAssignmentEnv(ParallelEnv):
                 mask[idx] = 1
         return mask
 
+    def _build_render_state(self) -> RenderState:
+        """Assemble the data needed by the graphical renderer."""
+
+        positions = (
+            self.data.pos.detach().cpu().numpy()
+            if hasattr(self.data, "pos") and self.data.pos is not None
+            else np.zeros((int(self.data.num_nodes), 2), dtype=np.float32)
+        )
+        edge_index = (
+            self.data.edge_index.detach().cpu().numpy()
+            if hasattr(self.data, "edge_index") and self.data.edge_index is not None
+            else np.zeros((2, 0), dtype=np.int64)
+        )
+        flows = self._flows.detach().cpu().numpy() if self._flows is not None else np.zeros(0, dtype=np.float32)
+        travel_times = (
+            self._last_travel_times.detach().cpu().numpy()
+            if self._last_travel_times is not None
+            else np.zeros_like(flows)
+        )
+        rewards_values = list(self._cumulative_rewards.values()) if self._cumulative_rewards else []
+        mean_reward = float(np.mean(rewards_values)) if rewards_values else 0.0
+        live_agents = {agent: self._current_nodes.get(agent, -1) for agent in self.agents}
+
+        return RenderState(
+            positions=positions,
+            edge_index=edge_index,
+            flows=flows,
+            travel_times=travel_times,
+            agent_nodes=live_agents,
+            step=self._step_count,
+            mean_reward=mean_reward,
+        )
+
+    def _render_ascii(self, verbose: bool = False) -> str:
+        """Text-based rendering (used for ANSI mode or as fallback)."""
+
+        live = sum(1 for status in self.agent_status.values() if status == "LIVE")
+        done = sum(1 for status in self.agent_status.values() if status == "DONE")
+        trunc = sum(1 for status in self.agent_status.values() if status == "TRUNC")
+        rewards_values = list(self._cumulative_rewards.values()) if self._cumulative_rewards else []
+        avg_cum_reward = float(np.mean(rewards_values)) if rewards_values else 0.0
+
+        header = (
+            f"🕒 Step {self._step_count} | "
+            f"🧍 {GREEN}{live}{RESET} | "
+            f"✅ {BLUE}{done}{RESET} | "
+            f"⚠️ {YELLOW}{trunc}{RESET} | "
+            f"🎯 avg cumul. r: {avg_cum_reward:.2f}"
+        )
+
+        separator = f"{BOLD}" + "-" * 60 + f"{RESET}"
+
+        lines: List[str] = [separator, header, separator, ""]
+
+        # Final recap when no live agents remain
+        if live == 0 or not self.agents:
+            lines.append("🏁 Episode finished!")
+            lines.append(
+                f"✅ Done: {BLUE}{done}{RESET} | ⚠️ Trunc: {YELLOW}{trunc}{RESET} | "
+                f"Total steps: {self._step_count} | Avg cumulative reward: {avg_cum_reward:.2f}"
+            )
+            lines.append(separator)
+            return "\n".join(lines)
+
+        # Verbose output includes per-agent and per-edge details
+        if verbose:
+            total_agents = len(self.possible_agents)
+            lines.append(f"👤 Agents (showing up to 3 of {total_agents}):")
+            for agent in self.possible_agents[:3]:
+                status = self.agent_status.get(agent, "TRUNC")
+                status_display = {
+                    "LIVE": f"{GREEN}🟢 LIVE{RESET}",
+                    "DONE": f"{BLUE}✅ DONE{RESET}",
+                    "TRUNC": f"{YELLOW}⚠️ TRUNC{RESET}",
+                }.get(status, status)
+
+                current_node = self._current_nodes.get(agent, "-")
+                dest_node = self.destinations[int(agent.split('_')[-1])] if agent in self.possible_agents else "-"
+                last_edge = self._last_edge_taken.get(agent)
+                if last_edge is not None:
+                    src, dst = edge_id_to_nodes(last_edge, self.data.edge_index)
+                    last_edge_str = f"{src}→{dst}"
+                else:
+                    last_edge_str = "None"
+                reward_val = self._last_rewards.get(agent, 0.0)
+                lines.append(
+                    f"  {agent} | {status_display:<10} | node {current_node} → dest {dest_node} | "
+                    f"last: {last_edge_str} | r_step = {reward_val:.2f}"
+                )
+
+            lines.append("")
+            lines.append(separator)
+            lines.append("🛣️ Edges (top 10 by flow):")
+            flows = self._flows if self._flows is not None else torch.zeros(0)
+            if self._last_travel_times is not None and self._last_travel_times.shape[0] == flows.shape[0]:
+                travel_times = self._last_travel_times
+            else:
+                travel_times = compute_link_travel_times(
+                    flows=flows,
+                    ff_time=self._ff_time,
+                    capacity=self._capacity,
+                    alpha=self.alpha,
+                    beta=self.beta,
+                )
+            num_edges = flows.shape[0]
+            indices = list(range(num_edges))
+            sorted_edges = sorted(indices, key=lambda idx: float(flows[idx]), reverse=True)
+            max_edges = min(10, len(sorted_edges))
+            if max_edges == 0:
+                lines.append("  (no edges)")
+            else:
+                flow_values = flows
+                tt_values = travel_times if travel_times is not None else torch.zeros(num_edges)
+                threshold = flow_values.mean().item() + flow_values.std().item() if num_edges > 0 else 0.0
+                for rank in range(max_edges):
+                    edge_id = sorted_edges[rank]
+                    src, dst = edge_id_to_nodes(edge_id, self.data.edge_index)
+                    flow_val = float(flow_values[edge_id].item())
+                    tt_val = float(tt_values[edge_id].item())
+                    color = RED if flow_val > threshold and threshold > 0 else ""
+                    reset = RESET if color else ""
+                    lines.append(
+                        f"  {edge_id:>2}: {src}→{dst} | flow = {color}{flow_val:6.1f}{reset} | t = {tt_val:5.2f}"
+                    )
+
+            lines.append(separator)
+            
+        return "\n".join(lines)
+
     # Boilerplate -----------------------------------------------------------------
     def render(self, mode: str = "human") -> Optional[str]:
         if mode not in {"human", "ansi"}:
@@ -281,107 +417,34 @@ class DynamicTrafficAssignmentEnv(ParallelEnv):
                 return None
             return msg
 
-        live = sum(1 for status in self.agent_status.values() if status == "LIVE")
-        done = sum(1 for status in self.agent_status.values() if status == "DONE")
-        trunc = sum(1 for status in self.agent_status.values() if status == "TRUNC")
-        rewards_values = list(self._last_rewards.values()) if self._last_rewards else []
-        avg_reward = float(np.mean(rewards_values)) if rewards_values else 0.0
+        ascii_output = self._render_ascii()
 
-        header = (
-            f"🕒 Step {self._step_count} | "
-            f"🧍 {GREEN}{live}{RESET} | "
-            f"✅ {BLUE}{done}{RESET} | "
-            f"⚠️ {YELLOW}{trunc}{RESET} | "
-            f"🎯 avg r: {avg_reward:.2f}"
-        )
+        if mode == "ansi":
+            print(ascii_output)
+            return ascii_output
 
-        separator = f"{BOLD}" + "-" * 60 + f"{RESET}"
+        if self._renderer is None:
+            self._renderer = build_renderer()
 
-        lines: List[str] = [separator, header, separator, ""]
+        drawn = False
+        try:
+            state = self._build_render_state()
+            drawn = self._renderer.render(state) if self._renderer is not None else False
+        except Exception:
+            drawn = False
 
-        # Final recap when no live agents remain
-        if live == 0 or not self.agents:
-            lines.append("🏁 Episode finished!")
-            lines.append(
-                f"✅ Done: {BLUE}{done}{RESET} | ⚠️ Trunc: {YELLOW}{trunc}{RESET} | "
-                f"Total steps: {self._step_count} | Avg reward (last step): {avg_reward:.2f}"
-            )
-            lines.append(separator)
-            output = "\n".join(lines)
-            if mode == "human":
-                print(output)
-                return None
-            return output
-
-        total_agents = len(self.possible_agents)
-        lines.append(f"👤 Agents (showing up to 3 of {total_agents}):")
-        for agent in self.possible_agents[:3]:
-            status = self.agent_status.get(agent, "TRUNC")
-            status_display = {
-                "LIVE": f"{GREEN}🟢 LIVE{RESET}",
-                "DONE": f"{BLUE}✅ DONE{RESET}",
-                "TRUNC": f"{YELLOW}⚠️ TRUNC{RESET}",
-            }.get(status, status)
-
-            current_node = self._current_nodes.get(agent, "-")
-            dest_node = self.destinations[int(agent.split('_')[-1])] if agent in self.possible_agents else "-"
-            last_edge = self._last_edge_taken.get(agent)
-            if last_edge is not None:
-                src, dst = edge_id_to_nodes(last_edge, self.data.edge_index)
-                last_edge_str = f"{src}→{dst}"
-            else:
-                last_edge_str = "None"
-            reward_val = self._last_rewards.get(agent, 0.0)
-            lines.append(
-                f"  {agent} | {status_display:<10} | node {current_node} → dest {dest_node} | "
-                f"last: {last_edge_str} | r_step = {reward_val:.2f}"
-            )
-
-        lines.append("")
-        lines.append(separator)
-        lines.append("🛣️ Edges (top 10 by flow):")
-        flows = self._flows if self._flows is not None else torch.zeros(0)
-        if self._last_travel_times is not None and self._last_travel_times.shape[0] == flows.shape[0]:
-            travel_times = self._last_travel_times
-        else:
-            travel_times = compute_link_travel_times(
-                flows=flows,
-                ff_time=self._ff_time,
-                capacity=self._capacity,
-                alpha=self.alpha,
-                beta=self.beta,
-            )
-        num_edges = flows.shape[0]
-        indices = list(range(num_edges))
-        sorted_edges = sorted(indices, key=lambda idx: float(flows[idx]), reverse=True)
-        max_edges = min(10, len(sorted_edges))
-        if max_edges == 0:
-            lines.append("  (no edges)")
-        else:
-            flow_values = flows
-            tt_values = travel_times if travel_times is not None else torch.zeros(num_edges)
-            threshold = flow_values.mean().item() + flow_values.std().item() if num_edges > 0 else 0.0
-            for rank in range(max_edges):
-                edge_id = sorted_edges[rank]
-                src, dst = edge_id_to_nodes(edge_id, self.data.edge_index)
-                flow_val = float(flow_values[edge_id].item())
-                tt_val = float(tt_values[edge_id].item())
-                color = RED if flow_val > threshold and threshold > 0 else ""
-                reset = RESET if color else ""
-                lines.append(
-                    f"  {edge_id:>2}: {src}→{dst} | flow = {color}{flow_val:6.1f}{reset} | t = {tt_val:5.2f}"
-                )
-
-        lines.append(separator)
-
-        output = "\n".join(lines)
-        if mode == "human":
-            print(output)
-            return None
-        return output
+        if not drawn:
+            print(ascii_output)
+        return None
 
     def close(self) -> None:
         self.agents = []
+        if self._renderer is not None:
+            try:
+                self._renderer.close()
+            except Exception:
+                pass
+        self._renderer = None
 
 
 __all__ = ["DynamicTrafficAssignmentEnv"]

@@ -1,5 +1,5 @@
 """Pure tensor operations for dynamic network loading.
-Currently includes BPR travel time calculations based on each time step's link flows. (Pretty Basic.)"""
+Currently includes BPR travel time calculations based on each time step's link flows. (pretty basic.)"""
 from __future__ import annotations
 
 import torch
