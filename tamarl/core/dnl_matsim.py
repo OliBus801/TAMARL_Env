@@ -331,29 +331,16 @@ class TorchDNLMATSim:
             # Since flow is per step, we just take top N.
             allowed_flow_cap = self.flow_capacity_per_step[c_curr_edges]
             
-            # **Integral limitation**: Flow of 0.5 means 1 vehicle every 2 steps.
-            # We need a fluid accumulator or probabilistic or floor/ceil logic.
-            # Simple approach: If 0.5 -> alternate. 
-            # Vectorized stateful accumulation is hard without persistent state per edge.
-            # But we implemented `edge_flow_used` (float). 
-            # We added `edge_flow_used` earlier.
-            # Strategy: 
-            #   allow if (rank + 1) <= capacity_per_step?
-            #   No, because capacities can be < 1.
-            #   Let's use a simplified "Bucket" model? 
-            #   Actually, for strict MATSim, capacity is accumulated.
-            #   Let's just use strict cut-off for now, assuming integer capacities or close enough.
-            #   Better: `rank < allowed_flow_cap` handles whole numbers.
-            #   For fractions: `rank < floor(allowed)` ?
-            #   If `allowed` is 0.2, nothing ever moves.
-            #   Let's standard stochastic approach or accumulated?
-            #   Let's assume standard capacity > 1 for GPU sim or randomized?
-            #   "c_e" suggests int. "D_e" flow.
-            #   For high speed, deterministic float check: `outflow_ranks < allowed_flow_cap`.
-            #   This means if cap=1.5, 2 cars move? No, 0 and 1 < 1.5 -> 2 cars.
-            #   If cap=0.5, 0 < 0.5 -> 1 car moves.
-            #   It effectively ceils.
-            flow_allowed_mask = outflow_ranks < allowed_flow_cap
+            # **Integral limitation**:
+            # Previous logic was implicit ceil: (rank < cap). E.g. rank 1 < 1.5 -> True (20 cars).
+            # New Logic (User Request): Floor with min 1 car per timestep.
+            # E.g. cap=1.5 -> floor=1 -> max(1,1)=1. Rank 0 < 1 -> True. Rank 1 < 1 -> False.
+            # E.g. cap=0.2 -> floor=0 -> max(1,0)=1. Rank 0 < 1 -> True.
+            
+            effective_cap = torch.floor(allowed_flow_cap)
+            effective_cap = torch.clamp(effective_cap, min=1.0)
+            
+            flow_allowed_mask = outflow_ranks < effective_cap
             
             # --- Spillback (Storage) & Stuck Logic ---
             # Filter candidates passing Flow check
