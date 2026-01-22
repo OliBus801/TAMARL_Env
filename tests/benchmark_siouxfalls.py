@@ -272,6 +272,7 @@ def run_benchmark():
     sim_start = time.time()
     step = 0
     active = True
+    en_route = 0
     
     print("Starting simulation loop...")
     t0 = time.time()
@@ -280,27 +281,25 @@ def run_benchmark():
         step += 1
         
         # Monitor status
-        # Monitor status
-        # agent_state[:, 0]: 0=Wait, 1=Travel, 2=Buffer, 3=Done
-        state = dnl.status
-        en_route = ((state == 0) | (state == 1) | (state == 2)).sum().item()
-        
-        # Actually in MATSim logic:
-        # 0 = Waiting to start (Not en route?) -> "Departures" count usually includes them as "waiting".
-        # But commonly En Route means left origin.
-        # Logic in dnl_matsim: Status 0 is "Waiting", but they move to 1 upon entry.
-        # Departure time check handles entry.
-        # So strictly, En Route = (1 or 2).
-        # Let's count (1 | 2).
-        
-        en_route = ((state == 1) | (state == 2)).sum().item()
-        en_route_counts.append(en_route)
-        
-        # Check completion
-        done_mask = (state == 3)
-        if done_mask.all():
-            print(f"All agents finished at step {step}")
-            active = False
+        if step % 100 == 0:
+            # Monitor status
+            # agent_state[:, 0]: 0=Wait, 1=Travel, 2=Buffer, 3=Done
+            state = dnl.status
+            
+            # Count (1 | 2)
+            en_route = ((state == 1) | (state == 2)).sum().item()
+            en_route_counts.append(en_route)
+            
+            # Check completion
+            done_mask = (state == 3)
+            if done_mask.all():
+                print(f"All agents finished at step {step}")
+                active = False
+        else:
+             # Just assume active or check less frequently? 
+             # For correct termination we might need to check done_mask roughly often.
+             # 100 steps is fine (100 seconds).
+             pass
             
         if step % 3600 == 0:
             t1 = time.time()
