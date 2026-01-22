@@ -124,11 +124,8 @@ class TorchDNLMATSim:
         self.edge_capacity_accumulator.clamp_(min=0.0)
         
         # 1. Unified Active Agent Search
+        # Explicit synchronization removal: process even if empty (CUDA graphs friendly)
         active_mask = (self.wakeup_time <= self.current_step)
-        
-        if not active_mask.any():
-            return
-
         active_indices = torch.nonzero(active_mask, as_tuple=True)[0]
         
         # Split by status
@@ -138,79 +135,90 @@ class TorchDNLMATSim:
         arrival_submask = (statuses == 1)
         arrived_agents = active_indices[arrival_submask]
         
-        newly_buffered_agents = None
+        # 1. Update State -> Buffer (2)
+        # Note: PyTorch handles empty indexing gracefully (no-op)
+        self.status[arrived_agents] = 2
+        self.stuck_since[arrived_agents] = self.current_step
         
-        if arrived_agents.numel() > 0:
-            # 1. Update State -> Buffer (2)
-            self.status[arrived_agents] = 2
-            self.stuck_since[arrived_agents] = self.current_step
-            
-            # 2. Update Metrics
-            finished_edges = self.current_edge[arrived_agents]
-            lengths = self.length[finished_edges]
-            self.agent_metrics[arrived_agents, 0] += lengths
-            
-            # 3. Update Pointers
-            curr_ptrs = self.path_ptr[arrived_agents]
-            next_ptrs = curr_ptrs + 1
-            
-            # Check validity
-            next_edges = torch.full_like(curr_ptrs, -1)
-            valid_ptr_mask = next_ptrs < self.max_path_len
-            
-            if valid_ptr_mask.any():
-                 v_agents = arrived_agents[valid_ptr_mask]
-                 v_next_ptrs = next_ptrs[valid_ptr_mask]
-                 next_edges[valid_ptr_mask] = self.paths[v_agents, v_next_ptrs]
-            
-            self.next_edge[arrived_agents] = next_edges
-            
-            newly_buffered_agents = arrived_agents
-            
+        # 2. Update Metrics
+        finished_edges = self.current_edge[arrived_agents]
+        # Safety: if arrived_agents is empty, finished_edges is empty, indexing length is empty.
+        # But we need to be careful about invalid indices if finished_edges was -1 for some reason 
+        # (though status 1 implies valid edge).
+        if finished_edges.numel() > 0: # This check is risky for sync? 
+            # Actually, standard practice on GPU: avoid condition if possible.
+            # But indexing with empty tensor is safe. 
+            pass
+
+        # To be purely sync-free, we trust the logic validity or use masks.
+        # We can just run it. 
+        lengths = self.length[finished_edges]
+        self.agent_metrics[arrived_agents, 0] += lengths
+        
+        # 3. Update Pointers
+        curr_ptrs = self.path_ptr[arrived_agents]
+        next_ptrs = curr_ptrs + 1
+        
+        # Check validity
+        # Safe no-op if arrived_agents empty
+        next_edges = torch.full_like(curr_ptrs, -1)
+        valid_ptr_mask = next_ptrs < self.max_path_len
+        
+        v_agents = arrived_agents[valid_ptr_mask]
+        v_next_ptrs = next_ptrs[valid_ptr_mask]
+        # If valid_ptr_mask is all False (or empty), v_agents is empty. indexing paths ok.
+        next_edges[valid_ptr_mask] = self.paths[v_agents, v_next_ptrs]
+        
+        # Assign back
+        self.next_edge[arrived_agents] = next_edges
+        
+        # Newly buffered are arrived_agents. 
+        # We need to carry them to candidates.
+        
         # --- B. Handle Departures (Status 0 & 2) ---
         existing_mask = (statuses != 1) & (statuses != 3) 
         existing_candidates = active_indices[existing_mask]
         
-        if newly_buffered_agents is not None:
-            candidates = torch.cat([existing_candidates, newly_buffered_agents])
-        else:
-            candidates = existing_candidates
-            
-        if candidates.numel() == 0:
-            return
-            
+        # Merge
+        candidates = torch.cat([existing_candidates, arrived_agents])
+        
         c_next_edges = self.next_edge[candidates]
         
         # --- C. Handle Exits ---
         exit_mask = (c_next_edges == -1)
-        if exit_mask.any():
-            exiting_agents = candidates[exit_mask]
-            
-            # Free Capacity
-            c_curr_edges_exit = self.current_edge[exiting_agents]
-            valid_curr_mask = (c_curr_edges_exit >= 0)
-            if valid_curr_mask.any():
-                self.edge_occupancy -= torch.bincount(c_curr_edges_exit[valid_curr_mask], minlength=self.num_edges)
-            
-            self.status[exiting_agents] = 3
-            self.wakeup_time[exiting_agents] = self.infinity 
-            
-            # Metrics
-            start_times = self.start_time[exiting_agents]
-            self.agent_metrics[exiting_agents, 1] = (self.current_step - start_times).float()
-            
-            candidates = candidates[~exit_mask]
-            if candidates.numel() == 0:
-                return
-
+        exiting_agents = candidates[exit_mask]
+        
+        # Free Capacity
+        c_curr_edges_exit = self.current_edge[exiting_agents]
+        
+        # We need to filter valid edges (-1 check) for bincount, 
+        # as bincount fails on negative indices (even if logic says they shouldn't exist).
+        # This requires a mask.
+        valid_curr_mask = (c_curr_edges_exit >= 0)
+        edges_to_free = c_curr_edges_exit[valid_curr_mask]
+        
+        # Only run bincount if we have data? 
+        # bincount on empty tensor -> zeros [minlength]. Safe.
+        # But valid_curr_mask might be empty.
+        
+        self.edge_occupancy -= torch.bincount(edges_to_free, minlength=self.num_edges)
+        
+        self.status[exiting_agents] = 3
+        self.wakeup_time[exiting_agents] = self.infinity 
+        
+        # Metrics
+        start_times = self.start_time[exiting_agents]
+        self.agent_metrics[exiting_agents, 1] = (self.current_step - start_times).float()
+        
+        # Filter continuing candidates
+        candidates = candidates[~exit_mask]
+        
         # --- D. Link Entry / Change ---
         target_edges = self.next_edge[candidates]
         current_edges = self.current_edge[candidates]
         c_arrival_times = self.arrival_time[candidates]
         
-        # 1. Sort Candidates (Flow Check Grouping + FIFO)
-        # Composite Key: (current_edge + 1) * SCALE + arrival_time
-        # Use large scale to ensure primary sort key dominance
+        # 1. Sort Candidates
         sort_keys = (current_edges.long() + 1) * 1000000 + c_arrival_times.long()
         sort_idx = torch.argsort(sort_keys, stable=True)
         
@@ -227,16 +235,12 @@ class TorchDNLMATSim:
         
         limits = torch.zeros_like(curr_sorted, dtype=torch.float32)
         valid_mask = (curr_sorted >= 0)
-        if valid_mask.any():
-            limits[valid_mask] = self.step_edge_limits[curr_sorted[valid_mask]]
-        limits[~valid_mask] = 999999 # Status 0: Infinite flow
+        limits[valid_mask] = self.step_edge_limits[curr_sorted[valid_mask]]
+        limits[~valid_mask] = 999999 
         
         flow_pass_mask = (ranks < limits)
         candidates_s2 = candidates_sorted[flow_pass_mask]
         
-        if candidates_s2.numel() == 0:
-            return
-            
         targ_s2 = targ_sorted[flow_pass_mask]
         stuck_s2 = self.stuck_since[candidates_s2]
         
@@ -261,30 +265,28 @@ class TorchDNLMATSim:
         
         winners = c_final[storage_pass]
         
-        if winners.numel() > 0:
-             w_curr = self.current_edge[winners]
-             w_next = self.next_edge[winners]
-             
-             # Update Occupancy
-             valid_rem = (w_curr >= 0)
-             if valid_rem.any():
-                 self.edge_occupancy -= torch.bincount(w_curr[valid_rem], minlength=self.num_edges)
-             self.edge_occupancy += torch.bincount(w_next, minlength=self.num_edges)
-             
-             # Update State
-             self.status[winners] = 1 # Traveling
-             self.current_edge[winners] = w_next
-             
-             # Increment Pointer (only if was on edge)
-             self.path_ptr[winners[valid_rem]] += 1
-             
-             # Arrival Time
-             ff_times = self.ff_travel_time_steps[w_next]
-             arrival_times = self.current_step + ff_times
-             self.arrival_time[winners] = arrival_times
-             
-             # Wakeup Time
-             self.wakeup_time[winners] = arrival_times
+        w_curr = self.current_edge[winners]
+        w_next = self.next_edge[winners]
+            
+        # Update Occupancy
+        valid_rem = (w_curr >= 0)
+        self.edge_occupancy -= torch.bincount(w_curr[valid_rem], minlength=self.num_edges)
+        self.edge_occupancy += torch.bincount(w_next, minlength=self.num_edges)
+        
+        # Update State
+        self.status[winners] = 1 # Traveling
+        self.current_edge[winners] = w_next
+        
+        # Increment Pointer (only if was on edge)
+        self.path_ptr[winners[valid_rem]] += 1
+        
+        # Arrival Time
+        ff_times = self.ff_travel_time_steps[w_next]
+        arrival_times = self.current_step + ff_times
+        self.arrival_time[winners] = arrival_times
+        
+        # Wakeup Time
+        self.wakeup_time[winners] = arrival_times
 
     def stop_profiling(self):
         if self.profiler:
