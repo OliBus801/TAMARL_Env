@@ -51,19 +51,10 @@ def plot_agent_status(start_steps, arrival_steps, max_steps, bucket_size_sec=300
     width_h = bucket_size_sec / 3600.0
     
     plt.figure(figsize=(12, 6))
-    
-    # Departures and Arrivals as Bars or Lines? 
-    # Usually "Curves" requested. Step plot or Line plot.
-    # MATSim Leg Histogram is usually a line plot connecting the centers or steps.
-    # Let's use Line plot for clarity with 3 curves.
-    
-    # Center x-axis for line plot
-    x_centers = x_axis + (width_h / 2.0)
-    
-    plt.plot(x_centers, dep_counts, label='Departures', color='red', linewidth=2, alpha=0.7)
-    plt.plot(x_centers, arr_counts, label='Arrivals', color='blue', linewidth=2, alpha=0.7)
-    plt.plot(x_centers, en_route_counts, label='En Route', color='green', linewidth=2, alpha=0.7)
-    
+    # Use step plots to represent counts over intervals
+    plt.step(x_axis, dep_counts, where='post', label='Departures', color='red', linewidth=2, alpha=0.7)
+    plt.step(x_axis, arr_counts, where='post', label='Arrivals', color='blue', linewidth=2, alpha=0.7)
+    plt.step(x_axis, en_route_counts, where='post', label='En Route', color='green', linewidth=2, alpha=0.7)
     plt.xlabel('Time (Hours)')
     plt.ylabel(f'Agents per {bucket_size_sec}s')
     plt.xticks([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24])

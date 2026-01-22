@@ -261,7 +261,7 @@ def run_benchmark():
         device=device, 
         departure_times=departure_times, 
         dt=1.0,
-        stuck_threshold=10,
+        stuck_threshold=15,
         enable_profiling=True
     )
     
@@ -280,8 +280,9 @@ def run_benchmark():
         step += 1
         
         # Monitor status
+        # Monitor status
         # agent_state[:, 0]: 0=Wait, 1=Travel, 2=Buffer, 3=Done
-        state = dnl.agent_state[:, 0]
+        state = dnl.status
         en_route = ((state == 0) | (state == 1) | (state == 2)).sum().item()
         
         # Actually in MATSim logic:
@@ -319,9 +320,8 @@ def run_benchmark():
     metrics = dnl.agent_metrics.cpu().numpy()
     
     # State: [status, curr, next, ptr, arrival, stuck, start_time]
-    # start_time is col 6
-    state_cpu = dnl.agent_state.cpu().numpy()
-    start_steps = state_cpu[:, 6]
+    start_steps = dnl.start_time.cpu().numpy()
+    status_cpu = dnl.status.cpu().numpy()
     
     # Arrival Steps
     # For finished agents: start + travel_time
@@ -333,7 +333,8 @@ def run_benchmark():
     # We pass all steps to plot_histogram, it handles filtering.
     # But arrival_steps for unfinished agents is invalid (travel time is 0).
     # We should set invalid arrivals to -1
-    unfinished = (state_cpu[:, 0] != 3)
+    # We should set invalid arrivals to -1
+    unfinished = (status_cpu != 3)
     arrival_steps[unfinished] = -1
     
     print("Generating Plot...")
