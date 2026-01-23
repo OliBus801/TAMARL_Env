@@ -281,7 +281,7 @@ def run_benchmark():
         step += 1
         
         # Monitor status
-        if step % 100 == 0:
+        if step % 3600 == 0:
             # Monitor status
             # agent_state[:, 0]: 0=Wait, 1=Travel, 2=Buffer, 3=Done
             state = dnl.status
