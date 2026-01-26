@@ -240,6 +240,10 @@ def run_simulation(network_file, population_file):
     
     for s in range(max_steps):
         step_fn()
+        if (s + 1) % 3600 == 0:
+            elapsed = time.time() - t_sim_start
+            hour = (s + 1) // 3600
+            print(f"[Hour: {hour:02d}] Progress: {(s+1)/max_steps*100:5.1f}% | Elapsed: {elapsed:6.2f}s", flush=True)
         
     t_sim_end = time.time()
     total_time = t_sim_end - t_sim_start
