@@ -236,14 +236,17 @@ def run_simulation(network_file, population_file):
     print(f"Starting Simulation for {max_steps} steps...")
     
     t_sim_start = time.time()
+    last_step_time = t_sim_start
     step_fn = dnl.step
     
     for s in range(max_steps):
         step_fn()
         if (s + 1) % 3600 == 0:
-            elapsed = time.time() - t_sim_start
+            elapsed = time.time() - last_step_time
+            last_step_time = time.time()
+            total_elapsed = last_step_time - t_sim_start
             hour = (s + 1) // 3600
-            print(f"[Hour: {hour:02d}] Progress: {(s+1)/max_steps*100:5.1f}% | Elapsed: {elapsed:6.2f}s", flush=True)
+            print(f"[Hour: {hour:02d}] | Elapsed: {elapsed:6.2f}s | Total Elapsed: {total_elapsed:6.2f}s | Memory Usage: {get_memory_usage():.4f} MB", flush=True)
         
     t_sim_end = time.time()
     total_time = t_sim_end - t_sim_start
