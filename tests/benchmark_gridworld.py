@@ -246,7 +246,9 @@ def run_simulation(network_file, population_file):
             last_step_time = time.time()
             total_elapsed = last_step_time - t_sim_start
             hour = (s + 1) // 3600
-            print(f"[Hour: {hour:02d}] | Elapsed: {elapsed:6.2f}s | Total Elapsed: {total_elapsed:6.2f}s | Memory Usage: {get_memory_usage():.4f} MB", flush=True)
+            mem_val = torch.cuda.memory_allocated() / 1024 / 1024 if device == 'cuda' else get_memory_usage()
+            mem_label = "VRAM" if device == 'cuda' else "Memory"
+            print(f"[Hour: {hour:02d}] | Elapsed: {elapsed:6.2f}s | Total Elapsed: {total_elapsed:6.2f}s | {mem_label} Usage: {mem_val:.2f} MB", flush=True)
         
     t_sim_end = time.time()
     total_time = t_sim_end - t_sim_start
