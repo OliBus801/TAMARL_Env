@@ -114,26 +114,14 @@ class TorchDNLMATSim:
         if self.profiler:
             self.profiler.clear()
 
-    def step(self):
-        self.current_step += 1
-        
+    def _update_flow_limits(self):
         # 0. Update Flow Capacity Limits
         self.edge_capacity_accumulator += self.flow_capacity_per_step
         torch.floor(self.edge_capacity_accumulator, out=self.step_edge_limits)
         self.edge_capacity_accumulator -= self.step_edge_limits
         self.edge_capacity_accumulator.clamp_(min=0.0)
-        
-        # 1. Unified Active Agent Search
-        active_mask = (self.wakeup_time <= self.current_step)
-        
-        if not active_mask.any():
-            return
 
-        active_indices = torch.nonzero(active_mask, as_tuple=True)[0]
-        
-        # Split by status
-        statuses = self.status[active_indices]
-        
+    def _handle_arrivals_A(self, active_indices, statuses):
         # --- A. Handle Arrivals (Status 1 -> 2) ---
         arrival_submask = (statuses == 1)
         arrived_agents = active_indices[arrival_submask]
@@ -148,7 +136,18 @@ class TorchDNLMATSim:
             # 2. Update Metrics
             finished_edges = self.current_edge[arrived_agents]
             lengths = self.length[finished_edges]
-            self.agent_metrics[arrived_agents, 0] += lengths
+            
+            # Only add length if not the first link (path_ptr > 0)
+            # MATSim logic: "vehicle enters traffic" on link, but don't traverse it.
+            
+            current_ptrs = self.path_ptr[arrived_agents]
+            mask_not_first = (current_ptrs > 0)
+            
+            if mask_not_first.any():
+                 # Only add lengths for non-first links
+                 agents_to_update = arrived_agents[mask_not_first]
+                 lengths_to_add = lengths[mask_not_first]
+                 self.agent_metrics[agents_to_update, 0] += lengths_to_add
             
             # 3. Update Pointers
             curr_ptrs = self.path_ptr[arrived_agents]
@@ -167,22 +166,25 @@ class TorchDNLMATSim:
             
             newly_buffered_agents = arrived_agents
             
+        return newly_buffered_agents
+
+    def _prepare_candidates_B(self, active_indices, statuses, newly_buffered_agents):
         # --- B. Handle Departures (Status 0 & 2) ---
         existing_mask = (statuses != 1) & (statuses != 3) 
         existing_candidates = active_indices[existing_mask]
-        
+
         if newly_buffered_agents is not None:
             candidates = torch.cat([existing_candidates, newly_buffered_agents])
         else:
             candidates = existing_candidates
             
-        if candidates.numel() == 0:
-            return
-            
-        c_next_edges = self.next_edge[candidates]
-        
+        return candidates
+
+    def _handle_exits_C(self, candidates):
         # --- C. Handle Exits ---
+        c_next_edges = self.next_edge[candidates]
         exit_mask = (c_next_edges == -1)
+        
         if exit_mask.any():
             exiting_agents = candidates[exit_mask]
             
@@ -200,8 +202,12 @@ class TorchDNLMATSim:
             self.agent_metrics[exiting_agents, 1] = (self.current_step - start_times).float()
             
             candidates = candidates[~exit_mask]
-            if candidates.numel() == 0:
-                return
+            
+        return candidates
+
+    def _process_link_moves_D(self, candidates):
+        if candidates.numel() == 0:
+            return
 
         # --- D. Link Entry / Change ---
         target_edges = self.next_edge[candidates]
@@ -280,11 +286,50 @@ class TorchDNLMATSim:
              
              # Arrival Time
              ff_times = self.ff_travel_time_steps[w_next]
+             
+             # Modify for First Link Start
+             # MATSim Logic : "vehicle enters traffic" on first link of their path, but don't traverse it.
+             
+             # w_curr (defined at start of block) holds previous edge index (if == -1, they are starting)
+             is_start = (w_curr == -1)
+             
              arrival_times = self.current_step + ff_times
+             
+             if is_start.any():
+                 # Agents starting: arrival time = current step (instant arrival at end of link)
+                 arrival_times[is_start] = self.current_step
+             
              self.arrival_time[winners] = arrival_times
              
              # Wakeup Time
              self.wakeup_time[winners] = arrival_times
+
+    def step(self):
+        self.current_step += 1
+        
+        self._update_flow_limits()
+        
+        # 1. Unified Active Agent Search
+        active_mask = (self.wakeup_time <= self.current_step)
+        
+        if not active_mask.any():
+            return
+
+        active_indices = torch.nonzero(active_mask, as_tuple=True)[0]
+        
+        # Split by status
+        statuses = self.status[active_indices]
+        
+        newly_buffered_agents = self._handle_arrivals_A(active_indices, statuses)
+        
+        candidates = self._prepare_candidates_B(active_indices, statuses, newly_buffered_agents)
+            
+        if candidates.numel() == 0:
+            return
+            
+        candidates = self._handle_exits_C(candidates)
+            
+        self._process_link_moves_D(candidates)
 
     def stop_profiling(self):
         if self.profiler:

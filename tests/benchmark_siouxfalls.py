@@ -39,13 +39,16 @@ def parse_network(network_file):
     scale_factor = 1.0 # 100% sample
     eff_cell_size = 7.5
     
-    for link in links_xml.findall('link'):
+    link_id_to_idx = {}
+    
+    for idx, link in enumerate(links_xml.findall('link')):
         modes = link.get('modes')
         if 'car' not in modes:
             continue
             
         u_id = link.get('from')
         v_id = link.get('to')
+        link_id = link.get('id')
         u = node_id_to_idx[u_id]
         v = node_id_to_idx[v_id]
         
@@ -63,22 +66,22 @@ def parse_network(network_file):
         attr = [length, freespeed, c_e, D_e, ff_time]
         
         edges.append({'u': u, 'v': v, 'attr': attr})
+        link_id_to_idx[link_id] = valid_links
         valid_links += 1
         
     print(f"Parsed {valid_links} car links.")
-    return node_id_to_idx, node_coords, edges
+    return node_id_to_idx, node_coords, edges, link_id_to_idx
 
-def parse_population(pop_file, node_id_to_idx, node_coords):
+def parse_population(pop_file, link_id_to_idx):
     print(f"Parsing Population: {pop_file}")
-    
-    tree = spatial.KDTree(node_coords)
-    trips = []
     
     et = ET.parse(pop_file)
     root = et.getroot()
     
+    trips = []
     count = 0
-    skipped = 0
+    skipped_no_car = 0
+    skipped_no_path = 0
     
     def time_to_sec(t_str):
         h, m, s = map(int, t_str.split(':'))
@@ -86,10 +89,8 @@ def parse_population(pop_file, node_id_to_idx, node_coords):
         
     for person in root.findall('person'):
         car_avail = person.get('car_avail')
-        if car_avail == 'never':
-            skipped += 1
-            continue
-            
+        # Some scenarios don't set car_avail="never", check modes later
+        
         plan = person.find("plan[@selected='yes']")
         if plan is None:
             plan = person.find('plan')
@@ -98,158 +99,82 @@ def parse_population(pop_file, node_id_to_idx, node_coords):
             continue
             
         elements = list(plan)
-        current_act = None
+        current_act_end_time = 0
         
         for i, el in enumerate(elements):
             if el.tag == 'act':
-                current_act = el
+                end_time_str = el.get('end_time')
+                if end_time_str:
+                    current_act_end_time = time_to_sec(end_time_str)
+                # Else it keeps previous time or 0
+                
             elif el.tag == 'leg':
                 mode = el.get('mode')
                 if mode != 'car':
                     continue
+                
+                route_tag = el.find('route')
+                if route_tag is None or not route_tag.text:
+                    skipped_no_path += 1
+                    continue
                     
-                if i + 1 < len(elements) and elements[i+1].tag == 'act':
-                    next_act = elements[i+1]
-                    ox = float(current_act.get('x'))
-                    oy = float(current_act.get('y'))
-                    dx = float(next_act.get('x'))
-                    dy = float(next_act.get('y'))
-                    
-                    end_time_str = current_act.get('end_time')
-                    if end_time_str:
-                        dep_time = time_to_sec(end_time_str)
+                route_str = route_tag.text.strip()
+                link_ids = route_str.split(' ')
+                
+                # Convert to indices
+                path_indices = []
+                valid_path = True
+                for lid in link_ids:
+                    if lid in link_id_to_idx:
+                        path_indices.append(link_id_to_idx[lid])
                     else:
-                        dep_time = 0 
-                        
+                        print(f"Warning: Unknown link {lid} in route for agent {person.get('id')}")
+                        valid_path = False
+                        break
+                
+                if valid_path and len(path_indices) > 0:
                     trips.append({
-                        'ox': ox, 'oy': oy,
-                        'dx': dx, 'dy': dy,
-                        'dep_time': dep_time
+                        'dep_time': current_act_end_time,
+                        'path': path_indices
                     })
+                else:
+                    skipped_no_path += 1
                     
         count += 1
         
-    print(f"Parsed {count} persons. Skipped {skipped} (no car). Total trips: {len(trips)}")
-    
-    if not trips:
-        return [], []
-        
-    trips_ox = [t['ox'] for t in trips]
-    trips_oy = [t['oy'] for t in trips]
-    trips_dx = [t['dx'] for t in trips]
-    trips_dy = [t['dy'] for t in trips]
-    
-    origins_coords = np.column_stack((trips_ox, trips_oy))
-    dests_coords = np.column_stack((trips_dx, trips_dy))
-    
-    print("Mapping coordinates to nearest nodes...")
-    _, origin_indices = tree.query(origins_coords)
-    _, dest_indices = tree.query(dests_coords)
-    
-    trip_data = []
-    for i in range(len(trips)):
-        trip_data.append({
-            'u': origin_indices[i],
-            'v': dest_indices[i],
-            'dep_time': trips[i]['dep_time']
-        })
-        
-    return trip_data
+    print(f"Parsed {count} persons. Skipped {skipped_no_path} legs (no route/bad link). Total trips: {len(trips)}")
+    return trips
 
 def run_benchmark():
     base_dir = "tamarl/data/scenarios/sioux_falls"
     net_file = os.path.join(base_dir, "Siouxfalls_network_PT.xml")
-    pop_file = os.path.join(base_dir, "Siouxfalls_population.xml")
+    pop_file = os.path.join(base_dir, "Siouxfalls_route_population.xml")
     
     # 1. Parse Data
-    node_map, node_coords, edges_data = parse_network(net_file)
-    trips = parse_population(pop_file, node_map, node_coords)
+    node_map, node_coords, edges_data, link_id_to_idx = parse_network(net_file)
+    trips = parse_population(pop_file, link_id_to_idx)
     
     if len(trips) == 0:
         print("No trips found. Exiting.")
         return
         
-    num_nodes = len(node_map)
-    
-    # 2. Build Graph for Dijkstra
-    uv_to_edge = {}
-    g_data, g_row, g_col = [], [], []
-    
-    edge_static_list = []
-    
-    for i, e in enumerate(edges_data):
-        u, v = e['u'], e['v']
-        w = e['attr'][4] # ff_time
-        edge_static_list.append(e['attr'])
-        
-        if (u,v) not in uv_to_edge:
-            uv_to_edge[(u,v)] = i
-            g_data.append(w)
-            g_row.append(u)
-            g_col.append(v)
-        else:
-            curr_best = uv_to_edge[(u,v)]
-            if w < edges_data[curr_best]['attr'][4]:
-                uv_to_edge[(u,v)] = i
-                # Note: This simple overwrite in uv_to_edge logic 
-                # doesn't update g_data if we appended already.
-                # But typically Sioux Falls links are unique or parallel.
-                # We assume standard graph for now.
-                pass
-
-    graph = sp.csr_matrix((g_data, (g_row, g_col)), shape=(num_nodes, num_nodes))
-    
-    # 3. Pathfinding
-    print(f"Running Pathfinding for {len(trips)} trips...")
-    origins = [t['u'] for t in trips]
-    destinations = [t['v'] for t in trips]
-    
-    print("Calculating All-Pairs Shortest Path...")
-    dist_matrix, predecessors = csgraph.shortest_path(graph, return_predecessors=True, directed=True)
-    
-    # Reconstruct paths
-    paths_list = []
-    valid_trip_indices = []
-    max_len = 0
-    
-    for i, (u, v) in enumerate(zip(origins, destinations)):
-        if u == v: continue
-        if np.isinf(dist_matrix[u, v]): continue
-             
-        path_nodes = []
-        curr = v
-        while curr != u:
-             path_nodes.append(curr)
-             curr = predecessors[u, curr]
-             if curr == -9999: break
-        path_nodes.append(u)
-        path_nodes.reverse() 
-        
-        edge_path = []
-        possible = True
-        for k in range(len(path_nodes)-1):
-            n1, n2 = path_nodes[k], path_nodes[k+1]
-            if (n1, n2) in uv_to_edge:
-                edge_path.append(uv_to_edge[(n1, n2)])
-            else:
-                possible = False
-                break
-        
-        if possible and len(edge_path) > 0:
-            paths_list.append(edge_path)
-            valid_trip_indices.append(i)
-            max_len = max(max_len, len(edge_path))
-            
-    print(f"Found valid paths for {len(paths_list)} / {len(trips)} trips.")
-    
-    # 4. Prepare DNL
-    num_agents = len(paths_list)
-    paths_tensor = torch.full((num_agents, max_len), -1, dtype=torch.long)
-    for i, p in enumerate(paths_list):
-        paths_tensor[i, :len(p)] = torch.tensor(p, dtype=torch.long)
-        
-    departure_times = torch.tensor([trips[i]['dep_time'] for i in valid_trip_indices], dtype=torch.long)
+    # 2. Prepare Data for DNL (No Dijkstra needed)
+    edge_static_list = [e['attr'] for e in edges_data]
     edge_static = torch.tensor(edge_static_list, dtype=torch.float32)
+    
+    departure_times = torch.tensor([t['dep_time'] for t in trips], dtype=torch.long)
+    
+    # Pack paths into tensor
+    lengths = [len(t['path']) for t in trips]
+    max_len = max(lengths)
+    num_agents = len(trips)
+    
+    print(f"Packing {num_agents} paths (max len {max_len})...")
+    paths_tensor = torch.full((num_agents, max_len), -1, dtype=torch.long)
+    
+    for i, t in enumerate(trips):
+        p = t['path']
+        paths_tensor[i, :len(p)] = torch.tensor(p, dtype=torch.long)
     
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Running Simulation on {device}...")
@@ -260,8 +185,8 @@ def run_benchmark():
         paths_tensor, 
         device=device, 
         departure_times=departure_times, 
-        dt=1.0,
-        stuck_threshold=15,
+        dt=1.0, 
+        stuck_threshold=10,
         enable_profiling=True
     )
     
@@ -279,33 +204,12 @@ def run_benchmark():
     while active and step < max_steps:
         dnl.step()
         step += 1
-        
-        # Monitor status
-        if step % 3600 == 0:
-            # Monitor status
-            # agent_state[:, 0]: 0=Wait, 1=Travel, 2=Buffer, 3=Done
-            state = dnl.status
-            
-            # Count (1 | 2)
-            en_route = ((state == 1) | (state == 2)).sum().item()
-            en_route_counts.append(en_route)
-            
-            # Check completion
-            done_mask = (state == 3)
-            if done_mask.all():
-                print(f"All agents finished at step {step}")
-                active = False
-        else:
-             # Just assume active or check less frequently? 
-             # For correct termination we might need to check done_mask roughly often.
-             # 100 steps is fine (100 seconds).
-             pass
             
         if step % 3600 == 0:
             t1 = time.time()
             dt = t1 - t0
             ms_per_step = (dt / 3600) * 1000
-            print(f"Step {step}, En Route: {en_route}, Speed: {ms_per_step:.2f} ms/step")
+            print(f"Hour {step//3600} | En Route: {en_route} | Speed: {ms_per_step:.2f} ms/step | Elapsed time : {dt:.2f}s")
             t0 = time.time()
 
     sim_end = time.time()
@@ -317,6 +221,12 @@ def run_benchmark():
     # Post-process for Plotting
     # metrics = [accum_dist, final_travel_time]
     metrics = dnl.agent_metrics.cpu().numpy()
+
+    print(f"--- Average Agents Metrics ---")
+    print(f"Average Traveled Distance: {metrics[:, 0].mean():.2f}")
+    print(f"Average Travel Time: {metrics[:, 1].mean():.2f}")
+    print(f"Average Travel Speed: {metrics[:, 0].mean() / metrics[:, 1].mean():.2f}")
+    print("-----------------------")
     
     # State: [status, curr, next, ptr, arrival, stuck, start_time]
     start_steps = dnl.start_time.cpu().numpy()
