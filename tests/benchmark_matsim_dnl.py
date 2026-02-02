@@ -4,6 +4,8 @@ import xml.etree.ElementTree as ET
 import torch
 import numpy as np
 import time
+import sys
+import psutil
 import datetime
 import pandas as pd
 from tamarl.core.dnl_matsim import TorchDNLMATSim
@@ -163,7 +165,22 @@ def parse_population(pop_file, link_id_to_idx):
     print(f"Parsed {count} persons. Skipped {skipped_no_path} legs. Total trips: {len(trips)}")
     return trips, trip_metadata
 
+def get_memory_usage():
+    process = psutil.Process(os.getpid())
+    mem_info = process.memory_info()
+    return mem_info.rss / 1024 / 1024 # MB
+
 def run_benchmark(root_folder):
+    
+    # Start tracemalloc for memory profiling
+    # Start memory monitoring helper
+    process = psutil.Process(os.getpid())
+    def get_mem():
+        return process.memory_info().rss / 1024 / 1024
+
+    initial_mem = get_mem()
+
+    
     # 1. Locate files
     files = [f for f in os.listdir(root_folder) if f.endswith('.xml')]
     network_file = None
@@ -210,8 +227,14 @@ def run_benchmark(root_folder):
     os.makedirs(output_dir, exist_ok=True)
     
     # 3. Parse Data
+    t_start_net = time.time()
     node_map, edges_data, link_id_to_idx = parse_network(network_file)
+    mem_net = get_mem()
+    print(f"Peak Memory after Network Parsing: {mem_net:.2f} MB")
+    
     trips, trip_metadata = parse_population(population_file, link_id_to_idx)
+    mem_pop = get_mem()
+    print(f"Peak Memory after Population Parsing: {mem_pop:.2f} MB")
     
     if len(trips) == 0:
         print("No trips found. Exiting.")
@@ -233,6 +256,23 @@ def run_benchmark(root_folder):
     for i, t in enumerate(trips):
         p = t['path']
         paths_tensor[i, :len(p)] = torch.tensor(p, dtype=torch.long)
+    
+    # Object Sizes
+    edge_static_size = edge_static.element_size() * edge_static.nelement() / 1024 / 1024
+    paths_tensor_size = paths_tensor.element_size() * paths_tensor.nelement() / 1024 / 1024
+    
+    # Estimate trips size (shallow + content roughly)
+    trips_size = sys.getsizeof(trips) / 1024 / 1024 
+    # Add elements size
+    if trips:
+        trips_size += sum(sys.getsizeof(t) + sys.getsizeof(t['path']) for t in trips) / 1024 / 1024
+
+    print("\n--- 📦 Object Sizes ---")
+    print(f"🛣️  Network (edge_static): {edge_static_size:.2f} MB")
+    print(f"👥 Population (trips): {trips_size:.2f} MB")
+    print(f"🔢 Population (paths_tensor): {paths_tensor_size:.2f} MB")
+    print("-----------------------\n")
+
     
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Running Simulation on {device}...")
@@ -268,7 +308,7 @@ def run_benchmark(root_folder):
             # Use dnl status to get en_route count
             status = dnl.status # array on device
             en_route = ((status == 1) | (status == 2)).sum().item()
-            
+
             print(f"Hour {step//3600} | En Route: {en_route} | Speed: {ms_per_step:.2f} ms/step | Elapsed time : {dt:.2f}s")
             t0 = time.time()
             
@@ -290,10 +330,8 @@ def run_benchmark(root_folder):
     sim_end = time.time()
     print(f"Simulation done in {step} steps, {sim_end - sim_start:.2f}s")
 
-    print("\n--- Profiling Stats ---")
-    dnl.print_stats(limit=20)
-    print("-----------------------")
-    
+    compute_time, peak_mem, peak_vram = dnl.print_stats(limit=20)
+
     # 6. Post-process & Export
     
     # Metrics: [traveled_distance, travel_time]
@@ -337,11 +375,14 @@ def run_benchmark(root_folder):
     print(f"Saved paths to {paths_out_path}")
 
     # average_metrics.csv --------------
-    # "avg_trav_dist, avg_trav_time, avg_trav_speed"
+    # "avg_trav_dist, avg_trav_time, avg_trav_speed, peak_memory, peak_vram, compute_time"
     avg_metrics = pd.DataFrame({
         'avg_trav_dist': [metrics[:, 0].mean()],
         'avg_trav_time': [metrics[:, 1].mean()],
-        'avg_trav_speed': [metrics[:, 0].mean() / metrics[:, 1].mean()]
+        'avg_trav_speed': [metrics[:, 0].mean() / metrics[:, 1].mean()],
+        'compute_time': [compute_time],
+        'peak_memory': [peak_mem],
+        'peak_vram': [peak_vram],
     })
     
     avg_metrics.to_csv(os.path.join(output_dir, "average_metrics.csv"), index=False)

@@ -4,6 +4,8 @@ import cProfile
 import pstats
 import io
 import math
+import psutil
+import os
 
 class TorchDNLMATSim:
     def __init__(self, 
@@ -337,12 +339,33 @@ class TorchDNLMATSim:
 
     def print_stats(self, sort='cumtime', limit=20):
         if self.profiler:
+            print("\n--- 📊 Profiling Stats ---")
+            
+            print("\n--- ⏱️ Computational Time  ---")
             s = io.StringIO()
             ps = pstats.Stats(self.profiler, stream=s).sort_stats(sort)
             ps.print_stats(limit)
             print(s.getvalue())
+
+            compute_time = ps.total_tt
+            
+            print("\n--- 🧠 Peak Memory Usage  ---")
+            # RAM
+            process = psutil.Process(os.getpid())
+            mem_mb = process.memory_info().rss / 1024 / 1024
+            print(f"RAM: {mem_mb:.2f} MB")
+            
+            # VRAM
+            vram_mb = 0
+            if self.device == 'cuda':
+                vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
+                print(f"VRAM: {vram_mb:.2f} MB")
+            
+            print("-----------------------")
         else:
             print("Profiling was not enabled.")
+        
+        return compute_time, mem_mb, vram_mb
 
     def get_snapshot(self):
         """Returns current edge occupancy"""
