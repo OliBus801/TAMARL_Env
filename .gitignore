@@ -14,8 +14,10 @@ __pycache__/
 
 # MATSim scenarios data
 *.xml
+*.pkl
 
 # output Data
+graphs/
 output/
 *.csv
 

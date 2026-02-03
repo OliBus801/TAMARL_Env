@@ -8,6 +8,8 @@ import sys
 import psutil
 import datetime
 import pandas as pd
+import pickle
+import gc
 from tamarl.core.dnl_matsim import TorchDNLMATSim
 from tamarl.core.plot_histogram import plot_agent_status
 
@@ -18,150 +20,176 @@ def sec_to_hms(seconds):
 
 def parse_network(network_file):
     print(f"Parsing Network: {network_file}")
-    tree = ET.parse(network_file)
-    root = tree.getroot()
     
     # Parse Nodes
     node_id_to_idx = {}
-    node_coords = []
     
-    nodes_xml = root.find('nodes')
-    for idx, node in enumerate(nodes_xml.findall('node')):
-        nid = node.get('id')
-        x = float(node.get('x'))
-        y = float(node.get('y'))
-        node_id_to_idx[nid] = idx
-        node_coords.append([x, y])
+    # Context iterator for streaming parsing
+    context = ET.iterparse(network_file, events=("start", "end"))
+    context = iter(context)
+    event, root = next(context) # Get root element
+
+    num_nodes = 0
+    
+    for event, elem in context:
+        if event == "end" and elem.tag == "node":
+            nid = elem.get('id')
+            # x = float(elem.get('x')) # Not storing coords for now to save memory if not needed for simulation
+            # y = float(elem.get('y'))
+            node_id_to_idx[nid] = num_nodes
+            num_nodes += 1
+            root.clear() # Clear memory
         
-    num_nodes = len(node_id_to_idx)
-    print(f"Parsed {num_nodes} nodes.")
+        elif event == "end" and elem.tag == "nodes":
+             # Finished nodes
+             print(f"Parsed {num_nodes} nodes.")
+             root.clear()
+             
+    # Reset iterator for links (iterparse assumes sequential, but 'links' comes after 'nodes' usually)
+    # If the file structure allows, we can continue. MATSim XML has nodes then links.
+    # We need to restart or ensure we didn't miss 'links' start if it was nested? 
+    # Actually, in MATSim, <nodes> and <links> are siblings under <network>.
+    # So the previous loop would exit after </nodes>. We continue to find <links>.
     
-    # Parse Links
+    # Re-open or continue? 
+    # Iterparse consumes the file. If we broke out, we might have consumed start of links?
+    # Actually, the above loop processes until end of file normally unless we break.
+    # To process both strictly, we should just loop once.
+
+    # Re-implementing as single pass
+    return parse_network_single_pass(network_file)
+
+def parse_network_single_pass(network_file):
+    print(f"Parsing Network: {network_file}")
+    node_id_to_idx = {}
     edges = []
-    links_xml = root.find('links')
+    link_id_to_idx = {}
     valid_links = 0
+    
+    context = ET.iterparse(network_file, events=("end",))
     
     scale_factor = 1.0 
     eff_cell_size = 7.5
     
-    link_id_to_idx = {}
-    
-    for idx, link in enumerate(links_xml.findall('link')):
-        modes = link.get('modes')
-        if 'car' not in modes:
-            continue
+    for event, elem in context:
+        if elem.tag == "node":
+            nid = elem.get('id')
+            node_id_to_idx[nid] = len(node_id_to_idx)
+            elem.clear()
             
-        u_id = link.get('from')
-        v_id = link.get('to')
-        link_id = link.get('id')
-        
-        # Ensure nodes exist
-        if u_id not in node_id_to_idx or v_id not in node_id_to_idx:
-            continue
-
-        u = node_id_to_idx[u_id]
-        v = node_id_to_idx[v_id]
-        
-        length = float(link.get('length'))
-        freespeed = float(link.get('freespeed')) # m/s
-        capacity_h = float(link.get('capacity')) # veh/h
-        lanes = float(link.get('permlanes'))
-        
-        # Derived
-        D_e = (capacity_h * scale_factor) 
-        c_e = (length * lanes) / eff_cell_size 
-        ff_time = length / freespeed
-        
-        # [length, free_flow_speed, c_e, D_e, ff_travel_time]
-        attr = [length, freespeed, c_e, D_e, ff_time]
-        
-        edges.append({'u': u, 'v': v, 'id': link_id, 'attr': attr})
-        link_id_to_idx[link_id] = valid_links
-        valid_links += 1
-        
-    print(f"Parsed {valid_links} car links.")
+        elif elem.tag == "link":
+            modes = elem.get('modes')
+            if 'car' in modes:
+                u_id = elem.get('from')
+                v_id = elem.get('to')
+                link_id = elem.get('id')
+                
+                if u_id in node_id_to_idx and v_id in node_id_to_idx:
+                    u = node_id_to_idx[u_id]
+                    v = node_id_to_idx[v_id]
+                    
+                    length = float(elem.get('length'))
+                    freespeed = float(elem.get('freespeed')) # m/s
+                    capacity_h = float(elem.get('capacity')) # veh/h
+                    lanes = float(elem.get('permlanes'))
+                    
+                    D_e = (capacity_h * scale_factor) 
+                    c_e = (length * lanes) / eff_cell_size 
+                    ff_time = length / freespeed
+                    
+                    attr = [length, freespeed, c_e, D_e, ff_time]
+                    
+                    edges.append({'u': u, 'v': v, 'id': link_id, 'attr': attr})
+                    link_id_to_idx[link_id] = valid_links
+                    valid_links += 1
+            
+            elem.clear()
+            
+    print(f"Parsed {len(node_id_to_idx)} nodes and {valid_links} car links.")
     return node_id_to_idx, edges, link_id_to_idx
+
+# Alias for compatibility
+parse_network = parse_network_single_pass
 
 def parse_population(pop_file, link_id_to_idx):
     print(f"Parsing Population: {pop_file}")
-    
-    et = ET.parse(pop_file)
-    root = et.getroot()
     
     trips = []
     trip_metadata = []
     
     count = 0
     skipped_no_path = 0
+
+    context = ET.iterparse(pop_file, events=("end",))
     
     def time_to_sec(t_str):
         h, m, s = map(int, t_str.split(':'))
         return h * 3600 + m * 60 + s
         
-    for person in root.findall('person'):
-        person_id = person.get('id')
-        
-        plan = person.find("plan[@selected='yes']")
-        if plan is None:
-            plan = person.find('plan')
-        
-        if plan is None:
-            continue
+    for event, elem in context:
+        if elem.tag == "person":
+            person_id = elem.get('id')
             
-        elements = list(plan)
-        current_act_end_time = 0
-        trip_counter = 0
-        
-        for i, el in enumerate(elements):
-            if el.tag == 'act':
-                end_time_str = el.get('end_time')
-                if end_time_str:
-                    current_act_end_time = time_to_sec(end_time_str)
-                
-            elif el.tag == 'leg':
-                mode = el.get('mode')
-                if mode != 'car':
-                    continue
-                
-                route_tag = el.find('route')
-                # Try to get text from route tag, handles None
-                route_str = route_tag.text.strip() if (route_tag is not None and route_tag.text) else None
-                
-                if not route_str:
-                    skipped_no_path += 1
-                    continue
-                    
-                link_ids = route_str.split(' ')
-                
-                # Convert to indices
-                path_indices = []
-                valid_path = True
-                
-                # In basic MATSim, routes are link based.
-                for lid in link_ids:
-                    if lid in link_id_to_idx:
-                        path_indices.append(link_id_to_idx[lid])
-                    else:
-                        # print(f"Warning: Unknown link {lid} in route")
-                        valid_path = False
+            # Simple assumption: first selected plan or first plan
+            selected_plan = None
+            
+            # Since we get "person" END event, all children (plan) are processed.
+            # We iterate over children of 'person' element
+            for child in elem:
+                if child.tag == 'plan':
+                    if child.get('selected') == 'yes':
+                        selected_plan = child
                         break
+                    if selected_plan is None:
+                        selected_plan = child
+            
+            if selected_plan is not None:
+                current_act_end_time = 0
+                trip_counter = 0
                 
-                if valid_path and len(path_indices) > 0:
-                    trips.append({
-                        'dep_time': current_act_end_time,
-                        'path': path_indices
-                    })
-                    trip_metadata.append({
-                        'agent_id': person_id,
-                        'trip_number': trip_counter,
-                        'path_str': route_str
-                    })
-                    trip_counter += 1
-                else:
-                    skipped_no_path += 1
+                for el in selected_plan:
+                    if el.tag == 'act':
+                        end_time_str = el.get('end_time')
+                        if end_time_str:
+                            current_act_end_time = time_to_sec(end_time_str)
                     
-        count += 1
-        
+                    elif el.tag == 'leg':
+                        mode = el.get('mode')
+                        if mode == 'car':
+                            route_tag = el.find('route')
+                            route_str = route_tag.text.strip() if (route_tag is not None and route_tag.text) else None
+                            
+                            if route_str:
+                                link_ids = route_str.split(' ')
+                                path_indices = []
+                                valid_path = True
+                                
+                                for lid in link_ids:
+                                    if lid in link_id_to_idx:
+                                        path_indices.append(link_id_to_idx[lid])
+                                    else:
+                                        valid_path = False
+                                        break
+                                
+                                if valid_path and len(path_indices) > 0:
+                                    trips.append({
+                                        'dep_time': current_act_end_time,
+                                        'path': path_indices
+                                    })
+                                    trip_metadata.append({
+                                        'agent_id': person_id,
+                                        'trip_number': trip_counter,
+                                        'path_str': route_str
+                                    })
+                                    trip_counter += 1
+                                else:
+                                    skipped_no_path += 1
+                            else:
+                                skipped_no_path += 1
+            
+            count += 1
+            elem.clear() # Clear person element from memory
+            
     print(f"Parsed {count} persons. Skipped {skipped_no_path} legs. Total trips: {len(trips)}")
     return trips, trip_metadata
 
@@ -170,17 +198,14 @@ def get_memory_usage():
     mem_info = process.memory_info()
     return mem_info.rss / 1024 / 1024 # MB
 
-def run_benchmark(root_folder):
+def run_benchmark(root_folder, population_filter=None, save_pickle=False, load_pickle=True):
     
-    # Start tracemalloc for memory profiling
-    # Start memory monitoring helper
     process = psutil.Process(os.getpid())
     def get_mem():
         return process.memory_info().rss / 1024 / 1024
 
     initial_mem = get_mem()
 
-    
     # 1. Locate files
     files = [f for f in os.listdir(root_folder) if f.endswith('.xml')]
     network_file = None
@@ -199,12 +224,16 @@ def run_benchmark(root_folder):
             
     # Select Network
     if net_candidates:
-        # Prefer shortest name or specific logic? Just take first for now
         network_file = os.path.join(root_folder, net_candidates[0])
         
     # Select Population
     if pop_candidates:
-        # Prefer one with "route" in name
+        if population_filter:
+            pop_candidates = [p for p in pop_candidates if population_filter in p]
+            if not pop_candidates:
+                print(f"Error: No population file found matching '{population_filter}' in {root_folder}")
+                return
+
         route_pops = [p for p in pop_candidates if 'route' in p.lower()]
         if route_pops:
             population_file = os.path.join(root_folder, route_pops[0])
@@ -226,23 +255,77 @@ def run_benchmark(root_folder):
     output_dir = os.path.join(root_folder, "output")
     os.makedirs(output_dir, exist_ok=True)
     
-    # 3. Parse Data
-    t_start_net = time.time()
-    node_map, edges_data, link_id_to_idx = parse_network(network_file)
-    mem_net = get_mem()
-    print(f"Peak Memory after Network Parsing: {mem_net:.2f} MB")
+    # 3. Parse/Load Data
     
-    trips, trip_metadata = parse_population(population_file, link_id_to_idx)
+    # --- Network ---
+    network_pkl = network_file.replace('.xml', '.pkl')
+    network_loaded = False
+    
+    if load_pickle and os.path.exists(network_pkl):
+        print(f"Loading cached network from {network_pkl}...")
+        try:
+            with open(network_pkl, 'rb') as f:
+                node_map, edges_data, link_id_to_idx = pickle.load(f)
+            network_loaded = True
+            print("Loaded network from pickle.")
+        except Exception as e:
+            print(f"Failed to load network pickle: {e}. Reparsing...")
+
+    if not network_loaded:
+        t_start_net = time.time()
+        node_map, edges_data, link_id_to_idx = parse_network(network_file)
+        if save_pickle:
+             print(f"Saving network to {network_pkl}...")
+             with open(network_pkl, 'wb') as f:
+                 pickle.dump((node_map, edges_data, link_id_to_idx), f)
+    
+    mem_net = get_mem()
+    print(f"Peak Memory after Network Processing: {mem_net:.2f} MB")
+    
+    # --- Population ---
+    pop_basename = os.path.basename(population_file)
+    pop_pkl = os.path.join(os.path.dirname(population_file), pop_basename.rsplit('.', 1)[0] + '.pkl')
+    pop_loaded = False
+    
+    if load_pickle and os.path.exists(pop_pkl):
+        print(f"Loading cached population from {pop_pkl}...")
+        try:
+            with open(pop_pkl, 'rb') as f:
+                trips, trip_metadata = pickle.load(f)
+            pop_loaded = True
+            print("Loaded population from pickle.")
+        except Exception as e:
+            print(f"Failed to load population pickle: {e}. Reparsing...")
+            
+    if not pop_loaded:
+        trips, trip_metadata = parse_population(population_file, link_id_to_idx)
+        if save_pickle:
+            print(f"Saving population to {pop_pkl}...")
+            # We might want to avoid pickling trip_metadata if it's huge and not needed for simulation proper, 
+            # but usually it is needed for output.
+            with open(pop_pkl, 'wb') as f:
+                pickle.dump((trips, trip_metadata), f)
+
     mem_pop = get_mem()
-    print(f"Peak Memory after Population Parsing: {mem_pop:.2f} MB")
+    print(f"Peak Memory after Population Processing: {mem_pop:.2f} MB")
     
     if len(trips) == 0:
         print("No trips found. Exiting.")
         return
         
+    # Free memory of raw data if possible?
+    # We need edges_data and trips for tensor creation.
+    # link_id_to_idx is not needed afterwards if not used. 
+    del link_id_to_idx
+    gc.collect()
+
     # 4. Prepare Data for DNL
     edge_static_list = [e['attr'] for e in edges_data]
     edge_static = torch.tensor(edge_static_list, dtype=torch.float32)
+    
+    # Free edges_data
+    del edges_data
+    gc.collect()
     
     departure_times = torch.tensor([t['dep_time'] for t in trips], dtype=torch.long)
     
@@ -257,19 +340,21 @@ def run_benchmark(root_folder):
         p = t['path']
         paths_tensor[i, :len(p)] = torch.tensor(p, dtype=torch.long)
     
+    # We can free 'trips' list now if we don't need it later?
+    # We only need trip_metadata for final CSVs.
+    del trips
+    gc.collect()
+
     # Object Sizes
     edge_static_size = edge_static.element_size() * edge_static.nelement() / 1024 / 1024
     paths_tensor_size = paths_tensor.element_size() * paths_tensor.nelement() / 1024 / 1024
     
-    # Estimate trips size (shallow + content roughly)
-    trips_size = sys.getsizeof(trips) / 1024 / 1024 
-    # Add elements size
-    if trips:
-        trips_size += sum(sys.getsizeof(t) + sys.getsizeof(t['path']) for t in trips) / 1024 / 1024
+    # Estimate metadata size
+    trips_size = sys.getsizeof(trip_metadata) / 1024 / 1024 
 
     print("\n--- 📦 Object Sizes ---")
     print(f"🛣️  Network (edge_static): {edge_static_size:.2f} MB")
-    print(f"👥 Population (trips): {trips_size:.2f} MB")
+    print(f"👥 Population (metadata): {trips_size:.2f} MB")
     print(f"🔢 Population (paths_tensor): {paths_tensor_size:.2f} MB")
     print("-----------------------\n")
 
@@ -312,20 +397,9 @@ def run_benchmark(root_folder):
             print(f"Hour {step//3600} | En Route: {en_route} | Speed: {ms_per_step:.2f} ms/step | Elapsed time : {dt:.2f}s")
             t0 = time.time()
             
-        # Check if all finished
-        # Status 0: inactive, 1: enroute, 2: on link, 3: arrived, 4: stuck
-        # Simulation is active if any agent is not arrived(3) or stuck(4) AND has started (status!=0) ?
-        # Actually simplest check is if any encoded logic or manual check
-        
-        # Optimization: We can check less frequently or trust max_steps
-        # But if we want to stop early:
         if step % 100 == 0:
-             # Check if any agents are still running (status 1 or 2, or waiting to start 0)
-             # Wait, status 0 means not started yet.
-             # So we must continue until all agents are >= 3.
-             # Note: torch.all(status >= 3)
+             # Check completion logic if needed
              pass
-
 
     sim_end = time.time()
     print(f"Simulation done in {step} steps, {sim_end - sim_start:.2f}s")
@@ -339,12 +413,13 @@ def run_benchmark(root_folder):
 
     print(f"--- Average Agents Metrics ---")
     print(f"Average Traveled Distance: {metrics[:, 0].mean():.2f}")
-    print(f"Average Travel Time: {metrics[:, 1].mean():.2f}")
-    print(f"Average Travel Speed: {metrics[:, 0].mean() / metrics[:, 1].mean():.2f}")
+    if metrics[:, 1].mean() > 0:
+        print(f"Average Travel Time: {metrics[:, 1].mean():.2f}")
+        print(f"Average Travel Speed: {metrics[:, 0].mean() / metrics[:, 1].mean():.2f}")
+    else:
+        print("Average Travel Time: 0.00")
+        print("Average Travel Speed: N/A")
     print("-----------------------")
-    
-    # agent_metrics.csv --------------
-    # "agent_id,trip_number,departure_time,travel_time,traveled_distance"
     
     dep_times_np = departure_times.cpu().numpy()
     
@@ -364,8 +439,6 @@ def run_benchmark(root_folder):
     print(f"Saved metrics to {metrics_path}")
     
     # paths.csv --------------
-    # "agent_id, trip_number, path"
-    # We already have path_str in trip_metadata
     df_paths = pd.DataFrame(trip_metadata)
     df_paths.rename(columns={'path_str': 'path'}, inplace=True)
     df_paths = df_paths[['agent_id', 'trip_number', 'path']]
@@ -375,18 +448,20 @@ def run_benchmark(root_folder):
     print(f"Saved paths to {paths_out_path}")
 
     # average_metrics.csv --------------
-    # "avg_trav_dist, avg_trav_time, avg_trav_speed, peak_memory, peak_vram, compute_time"
+    avg_trav_time = metrics[:, 1].mean()
+    avg_speed = metrics[:, 0].mean() / avg_trav_time if avg_trav_time > 0 else 0
+    
     avg_metrics = pd.DataFrame({
         'avg_trav_dist': [metrics[:, 0].mean()],
-        'avg_trav_time': [metrics[:, 1].mean()],
-        'avg_trav_speed': [metrics[:, 0].mean() / metrics[:, 1].mean()],
+        'avg_trav_time': [avg_trav_time],
+        'avg_trav_speed': [avg_speed],
         'compute_time': [compute_time],
         'peak_memory': [peak_mem],
         'peak_vram': [peak_vram],
     })
     
     avg_metrics.to_csv(os.path.join(output_dir, "average_metrics.csv"), index=False)
-    print(f"Saved average metrics to {os.path.join(output_dir, "average_metrics.csv")}")
+    print(f"Saved average metrics to {os.path.join(output_dir, 'average_metrics.csv')}")
     
     # Plot --------------
     start_steps = dnl.start_time.cpu().numpy()
@@ -406,9 +481,15 @@ def run_benchmark(root_folder):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("root_folder", help="Root folder containing network.xml and population.xml")
+    parser.add_argument("--population", help="Substring to match for population file (e.g. '100000')", default=None)
+    parser.add_argument("--save_pickle", help="If set, saves parsed network and population to .pkl files for faster loading next time.", action="store_true")
+    # By default, we load pickle if it exists, unless user might want to force reparse?
+    # Let's add --no_load_pickle to force reparse
+    parser.add_argument("--no_load_pickle", help="Force reparsing from XML even if pickle exists.", action="store_true")
+    
     args = parser.parse_args()
     
     if not os.path.exists(args.root_folder):
         print(f"Root folder not found: {args.root_folder}")
     else:
-        run_benchmark(args.root_folder)
+        run_benchmark(args.root_folder, args.population, save_pickle=args.save_pickle, load_pickle=not args.no_load_pickle)
