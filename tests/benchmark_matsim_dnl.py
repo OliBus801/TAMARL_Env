@@ -198,7 +198,7 @@ def get_memory_usage():
     mem_info = process.memory_info()
     return mem_info.rss / 1024 / 1024 # MB
 
-def run_benchmark(root_folder, population_filter=None, save_pickle=False, load_pickle=True):
+def run_benchmark(root_folder, population_filter=None, save_pickle=False, load_pickle=True, save_paths=False, save_agents=False):
     
     process = psutil.Process(os.getpid())
     def get_mem():
@@ -434,18 +434,21 @@ def run_benchmark(root_folder, population_filter=None, save_pickle=False, load_p
     # Reorder columns as requested
     df_metrics = df_metrics[['agent_id', 'trip_number', 'departure_time', 'travel_time', 'traveled_distance']]
     
-    metrics_path = os.path.join(output_dir, "agent_metrics.csv")
-    df_metrics.to_csv(metrics_path, index=False)
-    print(f"Saved metrics to {metrics_path}")
+    # agents_metrics.csv --------------
+    if save_agents:
+        metrics_path = os.path.join(output_dir, "agent_metrics.csv")
+        df_metrics.to_csv(metrics_path, index=False)
+        print(f"Saved metrics to {metrics_path}")
     
     # paths.csv --------------
-    df_paths = pd.DataFrame(trip_metadata)
-    df_paths.rename(columns={'path_str': 'path'}, inplace=True)
-    df_paths = df_paths[['agent_id', 'trip_number', 'path']]
-    
-    paths_out_path = os.path.join(output_dir, "paths.csv")
-    df_paths.to_csv(paths_out_path, index=False)
-    print(f"Saved paths to {paths_out_path}")
+    if save_paths:
+        df_paths = pd.DataFrame(trip_metadata)
+        df_paths.rename(columns={'path_str': 'path'}, inplace=True)
+        df_paths = df_paths[['agent_id', 'trip_number', 'path']]
+        
+        paths_out_path = os.path.join(output_dir, "paths.csv")
+        df_paths.to_csv(paths_out_path, index=False)
+        print(f"Saved paths to {paths_out_path}")
 
     # average_metrics.csv --------------
     avg_trav_time = metrics[:, 1].mean()
@@ -486,10 +489,12 @@ if __name__ == "__main__":
     # By default, we load pickle if it exists, unless user might want to force reparse?
     # Let's add --no_load_pickle to force reparse
     parser.add_argument("--no_load_pickle", help="Force reparsing from XML even if pickle exists.", action="store_true")
+    parser.add_argument("--save_paths", help="If set, exports paths.csv containing agent paths.", action="store_true")
+    parser.add_argument("--save_agents", help="If set, exports agent_metrics.csv containing individual agent statistics.", action="store_true")
     
     args = parser.parse_args()
     
     if not os.path.exists(args.root_folder):
         print(f"Root folder not found: {args.root_folder}")
     else:
-        run_benchmark(args.root_folder, args.population, save_pickle=args.save_pickle, load_pickle=not args.no_load_pickle)
+        run_benchmark(args.root_folder, args.population, save_pickle=args.save_pickle, load_pickle=not args.no_load_pickle, save_paths=args.save_paths, save_agents=args.save_agents)
