@@ -229,7 +229,20 @@ def run_benchmark(root_folder, population_filter=None, save_pickle=False, load_p
     # Select Population
     if pop_candidates:
         if population_filter:
-            pop_candidates = [p for p in pop_candidates if population_filter in p]
+            # Try to find exact token matches first
+            tokens_candidates = []
+            for p in pop_candidates:
+                # Split by common delimiters
+                tokens = p.replace('.', '_').split('_')
+                if population_filter in tokens:
+                    tokens_candidates.append(p)
+            
+            if tokens_candidates:
+                pop_candidates = tokens_candidates
+            else:
+                # Fallback to substring matching
+                pop_candidates = [p for p in pop_candidates if population_filter in p]
+
             if not pop_candidates:
                 print(f"Error: No population file found matching '{population_filter}' in {root_folder}")
                 return

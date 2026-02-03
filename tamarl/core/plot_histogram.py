@@ -58,6 +58,7 @@ def plot_agent_status(start_steps, arrival_steps, max_steps, bucket_size_sec=300
     plt.xlabel('Time (Hours)')
     plt.ylabel(f'Agents per {bucket_size_sec}s')
     plt.xticks([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24])
+    plt.yticks(np.arange(0, max(en_route_counts), 5000))
     plt.title('Agent Status Over Time')
     plt.legend()
     plt.grid(True, alpha=0.3)
