@@ -17,49 +17,7 @@ def sec_to_hms(seconds):
     """Convert seconds to HH:MM:SS format."""
     return str(datetime.timedelta(seconds=int(seconds)))
 
-
-def parse_network(network_file):
-    print(f"Parsing Network: {network_file}")
-    
-    # Parse Nodes
-    node_id_to_idx = {}
-    
-    # Context iterator for streaming parsing
-    context = ET.iterparse(network_file, events=("start", "end"))
-    context = iter(context)
-    event, root = next(context) # Get root element
-
-    num_nodes = 0
-    
-    for event, elem in context:
-        if event == "end" and elem.tag == "node":
-            nid = elem.get('id')
-            # x = float(elem.get('x')) # Not storing coords for now to save memory if not needed for simulation
-            # y = float(elem.get('y'))
-            node_id_to_idx[nid] = num_nodes
-            num_nodes += 1
-            root.clear() # Clear memory
-        
-        elif event == "end" and elem.tag == "nodes":
-             # Finished nodes
-             print(f"Parsed {num_nodes} nodes.")
-             root.clear()
-             
-    # Reset iterator for links (iterparse assumes sequential, but 'links' comes after 'nodes' usually)
-    # If the file structure allows, we can continue. MATSim XML has nodes then links.
-    # We need to restart or ensure we didn't miss 'links' start if it was nested? 
-    # Actually, in MATSim, <nodes> and <links> are siblings under <network>.
-    # So the previous loop would exit after </nodes>. We continue to find <links>.
-    
-    # Re-open or continue? 
-    # Iterparse consumes the file. If we broke out, we might have consumed start of links?
-    # Actually, the above loop processes until end of file normally unless we break.
-    # To process both strictly, we should just loop once.
-
-    # Re-implementing as single pass
-    return parse_network_single_pass(network_file)
-
-def parse_network_single_pass(network_file):
+def parse_network(network_file, scale_factor=1.0, timestep=1.0):
     print(f"Parsing Network: {network_file}")
     node_id_to_idx = {}
     edges = []
@@ -67,8 +25,7 @@ def parse_network_single_pass(network_file):
     valid_links = 0
     
     context = ET.iterparse(network_file, events=("end",))
-    
-    scale_factor = 1.0 
+     
     eff_cell_size = 7.5
     
     for event, elem in context:
@@ -88,15 +45,29 @@ def parse_network_single_pass(network_file):
                     u = node_id_to_idx[u_id]
                     v = node_id_to_idx[v_id]
                     
-                    length = float(elem.get('length'))
+                    length = float(elem.get('length')) # meters
                     freespeed = float(elem.get('freespeed')) # m/s
                     capacity_h = float(elem.get('capacity')) # veh/h
                     lanes = float(elem.get('permlanes'))
                     
-                    D_e = (capacity_h * scale_factor) 
-                    c_e = (length * lanes) / eff_cell_size 
-                    ff_time = length / freespeed
-                    
+                    # Calculate Flow Capacity (maximum Inflow per timestep)
+                    unscaledFlowCapacity_s = (capacity_h / 3600) 
+                    D_e = unscaledFlowCapacity_s * timestep * scale_factor
+
+                    # Calculate Storage Capacity
+                    # First guess
+                    c_e = ((length * lanes) / eff_cell_size) * scale_factor # storageCapacity
+
+                    # Storage Capacity needs to be at least enough to handle the flow per timestep
+                    c_e = max(c_e, D_e)
+
+                    # If speed on link is too slow, then we need more cells than above to handle the flowCap per timestep
+                    # i.e. if freeFlowTravelTime is 2 seconds, then we need spaceCap = 2 * flowCap to handle it.
+                    ff_time = length / freespeed # freeFlowTravelTime
+                    temp_spaceCap = ff_time * unscaledFlowCapacity_s * scale_factor
+                    # Adjust storageCapacity if too small, needs to accomodate at least free flow flux
+                    c_e = max(c_e, temp_spaceCap)
+
                     attr = [length, freespeed, c_e, D_e, ff_time]
                     
                     edges.append({'u': u, 'v': v, 'id': link_id, 'attr': attr})
@@ -107,9 +78,6 @@ def parse_network_single_pass(network_file):
             
     print(f"Parsed {len(node_id_to_idx)} nodes and {valid_links} car links.")
     return node_id_to_idx, edges, link_id_to_idx
-
-# Alias for compatibility
-parse_network = parse_network_single_pass
 
 def parse_population(pop_file, link_id_to_idx):
     print(f"Parsing Population: {pop_file}")
@@ -148,10 +116,14 @@ def parse_population(pop_file, link_id_to_idx):
                 trip_counter = 0
                 
                 for el in selected_plan:
-                    if el.tag == 'act':
+                    if el.tag in ['act', 'activity']:
                         end_time_str = el.get('end_time')
                         if end_time_str:
                             current_act_end_time = time_to_sec(end_time_str)
+                        else:
+                            max_dur = el.get('max_dur')
+                            if max_dur:
+                                current_act_end_time += time_to_sec(max_dur)
                     
                     elif el.tag == 'leg':
                         mode = el.get('mode')
@@ -198,7 +170,7 @@ def get_memory_usage():
     mem_info = process.memory_info()
     return mem_info.rss / 1024 / 1024 # MB
 
-def run_benchmark(root_folder, population_filter=None, save_pickle=False, load_pickle=True, save_paths=False, save_agents=False):
+def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_factor=1.0, n_hours=24, save_pickle=False, load_pickle=True, save_paths=False, save_agents=False):
     
     process = psutil.Process(os.getpid())
     def get_mem():
@@ -286,7 +258,7 @@ def run_benchmark(root_folder, population_filter=None, save_pickle=False, load_p
 
     if not network_loaded:
         t_start_net = time.time()
-        node_map, edges_data, link_id_to_idx = parse_network(network_file)
+        node_map, edges_data, link_id_to_idx = parse_network(network_file, scale_factor, timestep)
         if save_pickle:
              print(f"Saving network to {network_pkl}...")
              with open(network_pkl, 'wb') as f:
@@ -380,13 +352,13 @@ def run_benchmark(root_folder, population_filter=None, save_pickle=False, load_p
         paths_tensor, 
         device=device, 
         departure_times=departure_times, 
-        dt=1.0, 
+        dt=timestep, 
         stuck_threshold=10,
         enable_profiling=True
     )
     
     # 5. Simulation Loop
-    max_steps = 86400 
+    max_steps = n_hours * 3600 
     
     sim_start = time.time()
     step = 0
@@ -476,8 +448,8 @@ def run_benchmark(root_folder, population_filter=None, save_pickle=False, load_p
         'peak_vram': [peak_vram],
     })
     
-    avg_metrics.to_csv(os.path.join(output_dir, "average_metrics.csv"), index=False)
-    print(f"Saved average metrics to {os.path.join(output_dir, 'average_metrics.csv')}")
+    avg_metrics.to_csv(os.path.join(output_dir, f"{population_filter}_average_metrics.csv"), index=False)
+    print(f"Saved average metrics to {os.path.join(output_dir, f"{population_filter}_average_metrics.csv")}")
     
     # Plot --------------
     start_steps = dnl.start_time.cpu().numpy()
@@ -499,15 +471,17 @@ if __name__ == "__main__":
     parser.add_argument("root_folder", help="Root folder containing network.xml and population.xml")
     parser.add_argument("--population", help="Substring to match for population file (e.g. '100000')", default=None)
     parser.add_argument("--save_pickle", help="If set, saves parsed network and population to .pkl files for faster loading next time.", action="store_true")
-    # By default, we load pickle if it exists, unless user might want to force reparse?
-    # Let's add --no_load_pickle to force reparse
     parser.add_argument("--no_load_pickle", help="Force reparsing from XML even if pickle exists.", action="store_true")
     parser.add_argument("--save_paths", help="If set, exports paths.csv containing agent paths.", action="store_true")
     parser.add_argument("--save_agents", help="If set, exports agent_metrics.csv containing individual agent statistics.", action="store_true")
-    
+    parser.add_argument("--n_hours", help="If set, sets the number of hours the simulation needs to run for. By default 24h.", default=24)
+    parser.add_argument("--scale_factor", help="If set, scales the storageCapacity and outflowCapacity of the network links. By default 1.0.", default=1.0)
+    parser.add_argument("--timestep", help="Time step size of each simulation step, by default 1 second.", default=1)
+
+
     args = parser.parse_args()
     
     if not os.path.exists(args.root_folder):
         print(f"Root folder not found: {args.root_folder}")
     else:
-        run_benchmark(args.root_folder, args.population, save_pickle=args.save_pickle, load_pickle=not args.no_load_pickle, save_paths=args.save_paths, save_agents=args.save_agents)
+        run_benchmark(args.root_folder, args.population, timestep=float(args.timestep), scale_factor=float(args.scale_factor), n_hours=int(args.n_hours), save_pickle=args.save_pickle, load_pickle=not args.no_load_pickle, save_paths=args.save_paths, save_agents=args.save_agents)

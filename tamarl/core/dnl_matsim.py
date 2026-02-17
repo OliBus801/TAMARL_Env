@@ -53,7 +53,9 @@ class TorchDNLMATSim:
         self.storage_capacity = self.edge_static[:, 2].contiguous()
         
         # Flow capacity is usually veh/hour. Convert to veh/step.
-        self.flow_capacity_per_step = (self.edge_static[:, 3] / 3600.0) * self.dt
+        #self.flow_capacity_per_step = (self.edge_static[:, 3] / 3600.0) * self.dt
+        # We set the flow_capacity to veh/timestep already
+        self.flow_capacity_per_step = self.edge_static[:, 3]
         
         # Free flow travel time (steps)
         self.ff_travel_time_steps = torch.ceil(self.edge_static[:, 4] / self.dt).long().contiguous()
@@ -119,9 +121,11 @@ class TorchDNLMATSim:
     def _update_flow_limits(self):
         # 0. Update Flow Capacity Limits
         self.edge_capacity_accumulator += self.flow_capacity_per_step
-        torch.floor(self.edge_capacity_accumulator, out=self.step_edge_limits)
-        self.edge_capacity_accumulator -= self.step_edge_limits
-        self.edge_capacity_accumulator.clamp_(min=0.0)
+        # Avoid banking inflow to infinity if it's not used
+        torch.minimum(self.edge_capacity_accumulator, self.flow_capacity_per_step, out=self.edge_capacity_accumulator)
+        #torch.floor(self.edge_capacity_accumulator, out=self.step_edge_limits)
+        #self.edge_capacity_accumulator -= self.step_edge_limits
+        #self.edge_capacity_accumulator.clamp_(min=0.0)
 
     def _handle_arrivals_A(self, active_indices, statuses):
         # --- A. Handle Arrivals (Status 1 -> 2) ---
@@ -135,8 +139,11 @@ class TorchDNLMATSim:
             self.status[arrived_agents] = 2
             self.stuck_since[arrived_agents] = self.current_step
             
-            # 2. Update Metrics
+            # Update Occupancy (MATSim logic: buffer is not part of link occupancy)
             finished_edges = self.current_edge[arrived_agents]
+            self.edge_occupancy -= torch.bincount(finished_edges, minlength=self.num_edges)
+
+            # 2. Update Metrics
             lengths = self.length[finished_edges]
             
             # Only add length if not the first link (path_ptr > 0)
@@ -191,10 +198,7 @@ class TorchDNLMATSim:
             exiting_agents = candidates[exit_mask]
             
             # Free Capacity
-            c_curr_edges_exit = self.current_edge[exiting_agents]
-            valid_curr_mask = (c_curr_edges_exit >= 0)
-            if valid_curr_mask.any():
-                self.edge_occupancy -= torch.bincount(c_curr_edges_exit[valid_curr_mask], minlength=self.num_edges)
+            # MATSim logic: occupancy already removed when entering buffer (A)
             
             self.status[exiting_agents] = 3
             self.wakeup_time[exiting_agents] = self.infinity 
@@ -235,8 +239,11 @@ class TorchDNLMATSim:
         
         limits = torch.zeros_like(curr_sorted, dtype=torch.float32)
         valid_mask = (curr_sorted >= 0)
+
         if valid_mask.any():
-            limits[valid_mask] = self.step_edge_limits[curr_sorted[valid_mask]]
+            active_acc = self.edge_capacity_accumulator[curr_sorted[valid_mask]]
+            limits[valid_mask] = torch.ceil(torch.clamp(active_acc, min=0.0))
+
         limits[~valid_mask] = 999999 # Status 0: Infinite flow
         
         flow_pass_mask = (ranks < limits)
@@ -273,10 +280,11 @@ class TorchDNLMATSim:
              w_curr = self.current_edge[winners]
              w_next = self.next_edge[winners]
              
-             # Update Occupancy
              valid_rem = (w_curr >= 0)
-             if valid_rem.any():
-                 self.edge_occupancy -= torch.bincount(w_curr[valid_rem], minlength=self.num_edges)
+
+             # Update Occupancy
+             # Decrease: Already done in (A) when moving to buffer
+             # Increase: New edge
              self.edge_occupancy += torch.bincount(w_next, minlength=self.num_edges)
              
              # Update State
@@ -305,6 +313,10 @@ class TorchDNLMATSim:
              
              # Wakeup Time
              self.wakeup_time[winners] = arrival_times
+
+             # Remove 1.0 from flow accumulator for each winners that went through
+             ones = torch.ones(winners[valid_rem].size(0), device=self.device)
+             self.edge_capacity_accumulator.scatter_add_(0, w_curr[valid_rem], -ones)
 
     def step(self):
         self.current_step += 1
