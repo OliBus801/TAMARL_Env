@@ -170,7 +170,7 @@ def get_memory_usage():
     mem_info = process.memory_info()
     return mem_info.rss / 1024 / 1024 # MB
 
-def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_factor=1.0, n_hours=24, save_pickle=False, load_pickle=True, save_paths=False, save_agents=False):
+def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_factor=1.0, n_hours=24, save_pickle=False, load_pickle=True, save_paths=False, save_agents=False, output_folder="output"):
     
     process = psutil.Process(os.getpid())
     def get_mem():
@@ -237,7 +237,7 @@ def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_facto
     print(f"Selected Population: {os.path.basename(population_file)}")
 
     # 2. Setup Output Directory
-    output_dir = os.path.join(root_folder, "output")
+    output_dir = os.path.join(root_folder, output_folder)
     os.makedirs(output_dir, exist_ok=True)
     
     # 3. Parse/Load Data
@@ -449,7 +449,7 @@ def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_facto
     })
     
     avg_metrics.to_csv(os.path.join(output_dir, f"{population_filter}_average_metrics.csv"), index=False)
-    print(f"Saved average metrics to {os.path.join(output_dir, f"{population_filter}_average_metrics.csv")}")
+    print(f"Saved average metrics to {os.path.join(output_dir, f'{population_filter}_average_metrics.csv')}")
     
     # Plot --------------
     start_steps = dnl.start_time.cpu().numpy()
@@ -477,6 +477,7 @@ if __name__ == "__main__":
     parser.add_argument("--n_hours", help="If set, sets the number of hours the simulation needs to run for. By default 24h.", default=24)
     parser.add_argument("--scale_factor", help="If set, scales the storageCapacity and outflowCapacity of the network links. By default 1.0.", default=1.0)
     parser.add_argument("--timestep", help="Time step size of each simulation step, by default 1 second.", default=1)
+    parser.add_argument("--output_folder", help="Output folder for results.", default="output")
 
 
     args = parser.parse_args()
@@ -484,4 +485,4 @@ if __name__ == "__main__":
     if not os.path.exists(args.root_folder):
         print(f"Root folder not found: {args.root_folder}")
     else:
-        run_benchmark(args.root_folder, args.population, timestep=float(args.timestep), scale_factor=float(args.scale_factor), n_hours=int(args.n_hours), save_pickle=args.save_pickle, load_pickle=not args.no_load_pickle, save_paths=args.save_paths, save_agents=args.save_agents)
+        run_benchmark(args.root_folder, args.population, timestep=float(args.timestep), scale_factor=float(args.scale_factor), n_hours=int(args.n_hours), save_pickle=args.save_pickle, load_pickle=not args.no_load_pickle, save_paths=args.save_paths, save_agents=args.save_agents, output_folder=args.output_folder)
