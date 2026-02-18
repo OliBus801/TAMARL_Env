@@ -312,18 +312,18 @@ def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_facto
     del edges_data
     gc.collect()
     
-    departure_times = torch.tensor([t['dep_time'] for t in trips], dtype=torch.long)
+    departure_times = torch.tensor([t['dep_time'] for t in trips], dtype=torch.int32)
     
     lengths = [len(t['path']) for t in trips]
     max_len = max(lengths)
     num_agents = len(trips)
     
     print(f"Packing {num_agents} paths (max len {max_len})...")
-    paths_tensor = torch.full((num_agents, max_len), -1, dtype=torch.long)
+    paths_tensor = torch.full((num_agents, max_len), -1, dtype=torch.int32)
     
     for i, t in enumerate(trips):
         p = t['path']
-        paths_tensor[i, :len(p)] = torch.tensor(p, dtype=torch.long)
+        paths_tensor[i, :len(p)] = torch.tensor(p, dtype=torch.int32)
     
     # We can free 'trips' list now if we don't need it later?
     # We only need trip_metadata for final CSVs.

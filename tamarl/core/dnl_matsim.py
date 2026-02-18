@@ -40,7 +40,7 @@ class TorchDNLMATSim:
 
         # Move constants to device
         self.edge_static = edge_static.to(device)
-        self.paths = paths.to(device)
+        self.paths = paths.to(device).int()
         
         self.num_edges = self.edge_static.shape[0]
         self.num_agents = self.paths.shape[0]
@@ -61,7 +61,7 @@ class TorchDNLMATSim:
         self.ff_travel_time_steps = torch.ceil(self.edge_static[:, 4] / self.dt).long().contiguous()
 
         # Edge Dynamic State [E]
-        self.edge_occupancy = torch.zeros(self.num_edges, device=self.device, dtype=torch.long)
+        self.edge_occupancy = torch.zeros(self.num_edges, device=self.device, dtype=torch.int32)
         
         # Flow Capacity Accumulator & Daily Limits
         self.edge_capacity_accumulator = torch.zeros(self.num_edges, device=self.device, dtype=torch.float32)
@@ -70,18 +70,18 @@ class TorchDNLMATSim:
         # Agent State - Structure of Arrays (SOA)
         # 0: Waiting, 1: Traveling, 2: Buffer, 3: Done
         self.status = torch.zeros(self.num_agents, device=self.device, dtype=torch.uint8)
-        self.current_edge = torch.full((self.num_agents,), -1, device=self.device, dtype=torch.long)
-        self.next_edge = torch.full((self.num_agents,), -1, device=self.device, dtype=torch.long)
-        self.path_ptr = torch.zeros(self.num_agents, device=self.device, dtype=torch.long)
-        self.arrival_time = torch.zeros(self.num_agents, device=self.device, dtype=torch.long)
-        self.stuck_since = torch.zeros(self.num_agents, device=self.device, dtype=torch.long)
-        self.start_time = torch.zeros(self.num_agents, device=self.device, dtype=torch.long)
+        self.current_edge = torch.full((self.num_agents,), -1, device=self.device, dtype=torch.int32)
+        self.next_edge = torch.full((self.num_agents,), -1, device=self.device, dtype=torch.int32)
+        self.path_ptr = torch.zeros(self.num_agents, device=self.device, dtype=torch.int32)
+        self.arrival_time = torch.zeros(self.num_agents, device=self.device, dtype=torch.int32)
+        self.stuck_since = torch.zeros(self.num_agents, device=self.device, dtype=torch.int32)
+        self.start_time = torch.zeros(self.num_agents, device=self.device, dtype=torch.int32)
         
         # Initialize Status
         if departure_times is not None:
-             self.departure_times = departure_times.to(self.device).long()
+             self.departure_times = departure_times.to(self.device).int()
         else:
-             self.departure_times = torch.zeros(self.num_agents, device=self.device, dtype=torch.long)
+             self.departure_times = torch.zeros(self.num_agents, device=self.device, dtype=torch.int32)
              
         self.start_time.copy_(self.departure_times)
         
@@ -94,7 +94,7 @@ class TorchDNLMATSim:
         # Optimization: Wakeup Time [A]
         # Unified scheduler: agents are only processed if current_step >= wakeup_time
         self.wakeup_time = self.departure_times.clone()
-        self.infinity = 2**62
+        self.infinity = 2**30
 
         self.current_step = 0
 
@@ -163,7 +163,7 @@ class TorchDNLMATSim:
             next_ptrs = curr_ptrs + 1
             
             # Check validity
-            next_edges = torch.full_like(curr_ptrs, -1)
+            next_edges = torch.full_like(curr_ptrs, -1, dtype=torch.int32)
             valid_ptr_mask = next_ptrs < self.max_path_len
             
             if valid_ptr_mask.any():
@@ -309,14 +309,14 @@ class TorchDNLMATSim:
                  # Agents starting: arrival time = current step (instant arrival at end of link)
                  arrival_times[is_start] = self.current_step
              
-             self.arrival_time[winners] = arrival_times
+             self.arrival_time[winners] = arrival_times.int()
              
              # Wakeup Time
-             self.wakeup_time[winners] = arrival_times
+             self.wakeup_time[winners] = arrival_times.int()
 
              # Remove 1.0 from flow accumulator for each winners that went through
              ones = torch.ones(winners[valid_rem].size(0), device=self.device)
-             self.edge_capacity_accumulator.scatter_add_(0, w_curr[valid_rem], -ones)
+             self.edge_capacity_accumulator.scatter_add_(0, w_curr[valid_rem].long(), -ones)
 
     def step(self):
         self.current_step += 1
