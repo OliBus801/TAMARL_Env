@@ -205,7 +205,7 @@ def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_facto
             tokens_candidates = []
             for p in pop_candidates:
                 # Split by common delimiters
-                tokens = p.replace('.', '_').split('_')
+                tokens = p.replace('-', '_').replace('.', '_').split('_')
                 if population_filter in tokens:
                     tokens_candidates.append(p)
             
