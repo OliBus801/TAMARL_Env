@@ -348,7 +348,7 @@ class TorchDNLGEMSim:
             avail_space = self.in_queue_sizes[targets] - self.in_cnt[targets] - self.squeeze_margin
             return torch.repeat_interleave(avail_space, counts)
 
-        def resolveGridlock(stuck_agents, stuck_targets, stuck_ranks, stuck_item_avails):
+        def resolveGridlock(self, stuck_agents, stuck_targets, stuck_ranks, stuck_item_avails):
             """
             Resolve agents that are stuck for too long if there's available space in the physical queue.
             Physical queue = Logicial queue + Security Buffer
