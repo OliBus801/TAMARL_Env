@@ -61,12 +61,9 @@ class TorchDNLGEMSim:
         self.ff_travel_time_steps = torch.ceil(self.edge_static[:, 4] / self.dt).int().contiguous()
         
         # Topology
-        # We need to process nodes, so we need max_nodes or similar
-        # net_topology = (upstream_indices, upstream_offsets)
         if net_topology is None:
              raise ValueError("net_topology is required for TorchDNLGEMSim")
         
-        # We don't seem to use this even. 
         self.upstream_indices = net_topology[0].to(device).long()
         self.upstream_offsets = net_topology[1].to(device).long()
         self.num_nodes = self.upstream_offsets.shape[0] - 1
@@ -74,30 +71,20 @@ class TorchDNLGEMSim:
         # --- 1. Structure of Arrays (SoA) & Ring Buffers ---
         
         # -- 1.1 Buffer Descriptors --
-        # Descriptors : Global Pointers (queue_offset, queue_size) | Tells us where each link's queue starts and ends in the global ring buffer.
         # queue_offset : start index of the link's queue in the global ring buffer.
         # queue_size : size of the link's queue.
 
-        # Calculate queue_size --------------------
-        # TODO: Remove calculation from benchmark_gemsim_dnl.py and calculate here instead.
         # Spatial Buffer (N_l)
-        # N_l = max(floor(L_link / L_veh) * lanes, 1)
-        # Actually storage_capacity is already calculated in benchmark_gemsim_dnl.py.
-        # So we can just use storage_capacity as size. 
         self.in_queue_sizes = torch.clamp(self.storage_capacity.int(), min=1)
         
         # Capacity Buffer (N_f)
-        # N_f = max(floor(q * dt / period), 1)
-        # q is outflow_capacity per period (ex. veh/hour), dt is timeStepSize (sec), period is in seconds
-        # Actually capacity_buffer is already calculated in benchmark_gemsim_dnl.py.  
         self.out_queue_sizes = torch.clamp(self.flow_capacity_per_step.int(), min=1)
 
         # Add squeeze_margin to the buffer sizes for Gridlock "Squeeze-in"
-        # TODO : Find out what GEMSim does exactly. Or find better dynamic way to set squeeze_margin size.
         self.in_queue_sizes += self.squeeze_margin
         self.out_queue_sizes += self.squeeze_margin
 
-        # Calculate queue_offset --------------------
+        # Calculate queue_offset
         self.in_queue_offsets = torch.zeros(self.num_edges + 1, device=device, dtype=torch.int32)
         self.in_queue_offsets[1:] = torch.cumsum(self.in_queue_sizes, dim=0)
         self.total_in_queue_size = self.in_queue_offsets[-1].item()
@@ -107,7 +94,6 @@ class TorchDNLGEMSim:
         self.total_out_queue_size = self.out_queue_offsets[-1].item()
         
         # -- 1.2 Dynamic State Buffer Descriptors --
-        # States : Local Pointers (q_cur, q_cnt) | Tells us the dynamic state of each link's queue in their local ring buffer.
         # q_cur : current index of the link's first occupied cell, relative to q_off.
         # q_cnt : number of occupied cells in the link's queue.
         self.in_cur = torch.zeros(self.num_edges, device=device, dtype=torch.short)
@@ -121,7 +107,6 @@ class TorchDNLGEMSim:
         self.out_queues = torch.full((self.total_out_queue_size,), -1, device=device, dtype=torch.int32)
         
         # Agent State
-        # TODO: GEMSim has an activity-based model and also embedded AoS approach. 
         # 0: Waiting, 1: Traveling (in_queue), 2: Buffer (out_queue/transit), 3: Done
         self.status = torch.zeros(self.num_agents, device=self.device, dtype=torch.uint8)
         self.current_edge = torch.full((self.num_agents,), -1, device=self.device, dtype=torch.int32)
@@ -156,8 +141,10 @@ class TorchDNLGEMSim:
         self.flow_accumulator = torch.zeros(self.num_edges, device=device, dtype=torch.float32)
 
         # Gridlock Management
-        # TODO: Verify the -1000 initialization is okay.
-        self.last_link_exit_time = torch.zeros(self.num_edges, device=device, dtype=torch.int32) - 1000 # Init with past
+        self.last_link_exit_time = torch.zeros(self.num_edges, device=device, dtype=torch.int32) - 1000
+
+        # --- Pre-allocated scratch buffers ---
+        self._scratch_flow_cap = torch.empty(self.num_edges, device=device, dtype=torch.float32)
 
     def reset(self):
         # Reset Logic
@@ -208,6 +195,7 @@ class TorchDNLGEMSim:
         """
         Add agents to the tail of queues safely handling multiple agents entering the same link.
         Requires 'ranks' (0, 1, 2...) for agents entering the same link_id.
+        link_ids MUST be sorted for the counter update to work correctly.
         """
         # 1. Calculate local index with arrival rank to avoid collisions
         write_indices = (currents[link_ids] + counts[link_ids] + ranks) % sizes[link_ids]
@@ -216,8 +204,7 @@ class TorchDNLGEMSim:
         global_write_idx = offsets[link_ids] + write_indices
         queues[global_write_idx] = agent_ids
         
-        # 3. Update counters securely (agglomerated operation)
-        # Group by link and add the number of agents entering
+        # 3. Update counters — link_ids are sorted, so unique_consecutive is O(n_winners)
         unique_links, counts_to_add = torch.unique_consecutive(link_ids, return_counts=True)
         counts.index_add_(0, unique_links, counts_to_add.short())
     
@@ -228,63 +215,63 @@ class TorchDNLGEMSim:
         """
         return queues[offsets[link_ids] + currents[link_ids]]
 
-    def _accumulate_capacity(self):
-        # Accumulate only if occupied
-        # allowing negative accumulator.
-        
-        active_mask = self.in_cnt > 0
-        if active_mask.any():
-            self.flow_accumulator[active_mask] += self.flow_capacity_per_step[active_mask]
-            
-            # Cap at max(1.0, flow_capacity) to prevent infinite banking
-            caps = torch.maximum(torch.tensor(1.0, device=self.device), self.flow_capacity_per_step[active_mask])
-            self.flow_accumulator[active_mask] = torch.minimum(self.flow_accumulator[active_mask], caps)
+    @staticmethod
+    def _compute_sorted_ranks(sorted_values, n, device):
+        """
+        Compute within-group ranks for a SORTED tensor.
+        For sorted [A, A, B, B, B, C] -> returns [0, 1, 0, 1, 2, 0]
+        O(n) — no cumsum over edges, works purely on the agent-sized tensors.
+        """
+        if n <= 1:
+            return torch.zeros(n, device=device, dtype=torch.int32)
+        # Detect group boundaries and compute group_id per element
+        # group_id: [0,0,1,1,1,2] for [A,A,B,B,B,C]
+        group_ids = torch.zeros(n, device=device, dtype=torch.int32)
+        group_ids[1:] = (sorted_values[1:] != sorted_values[:-1]).int().cumsum_(0)
+        # group_start[g] = first position of group g
+        # boundary positions: 0, then positions where changes occur
+        num_groups = group_ids[-1].item() + 1
+        group_starts = torch.zeros(num_groups, device=device, dtype=torch.int32)
+        if num_groups > 1:
+            group_starts[1:] = (sorted_values[1:] != sorted_values[:-1]).nonzero(as_tuple=True)[0] + 1
+        # rank = position - group_start[group_id]
+        return torch.arange(n, device=device, dtype=torch.int32) - group_starts[group_ids]
 
     def _process_links(self):
         """
         Kernel 1: Links
         Logic to move appropriate agents from in_queue to out_queue
         (spatial buffer --> capacity buffer)
+        Fused with capacity accumulation.
         """
+        # Early exit: if no link has agents in its in_queue, skip entirely
+        if not (self.in_cnt > 0).any():
+            return
 
-        def getActiveLinks(self):
-            """
-            Get links that need processing in `_process_links` based on the following criteria:
-            1. in_queue is not empty
-            2. out_queue is not full
-            3. flow_accumulator is positive
-            """
-            mask = (self.in_cnt > 0) & (self.out_cnt < self.out_queue_sizes) & (self.flow_accumulator > 0)
-            return torch.nonzero(mask, as_tuple=True)[0]
+        # 0. Accumulate Capacity (fused)
+        active_cap_mask = self.in_cnt > 0
+        self.flow_accumulator[active_cap_mask] += self.flow_capacity_per_step[active_cap_mask]
+        # Cap at max(1.0, flow_capacity) to prevent infinite banking
+        caps = torch.maximum(torch.tensor(1.0, device=self.device), self.flow_capacity_per_step[active_cap_mask])
+        torch.minimum(self.flow_accumulator[active_cap_mask], caps, out=caps)
+        self.flow_accumulator[active_cap_mask] = caps
 
-            
-        def updateStatus(self, link_ids, agent_ids):
-            """
-            Update active agent status and active link exit time 
-            """
-            self.status[agent_ids] = 2 # Status = Buffer
-            self.stuck_since[agent_ids] = self.current_step
-            self.last_link_exit_time[link_ids] = self.current_step
-
-        # 0. Accumulate Capacity
-        self._accumulate_capacity()
-        
         while True:
-            # 1. Get active links
-            # in_queue is not empty, out_queue is not full, flow_accumulator is positive
-            active_links = getActiveLinks(self)
+            # 1. Get active links: in_queue not empty, out_queue not full, flow > 0
+            mask = (self.in_cnt > 0) & (self.out_cnt < self.out_queue_sizes) & (self.flow_accumulator > 0)
+            active_links = torch.nonzero(mask, as_tuple=True)[0]
 
             if active_links.numel() == 0:
-                break # No links to process
+                break
 
-            # 2. Get agents at head of in_queues of active links 
+            # 2. Get agents at head of in_queues
             agent_ids = self.getFrontAgent(self.in_cur, self.in_queue_offsets, self.in_queues, active_links)
 
-            # 3. Filter agents which can leave
+            # 3. Filter agents which can leave (travel time elapsed)
             ready_mask = (self.current_step - self.enter_link_time[agent_ids]) >= self.ff_travel_time_steps[active_links]
 
             if not ready_mask.any():
-                break # No agents to process
+                break
 
             # 4. Apply mask
             moving_links = active_links[ready_mask]
@@ -296,7 +283,9 @@ class TorchDNLGEMSim:
             self.flow_accumulator[moving_links] -= 1.0
 
             # 6. Update Agent and Link Status
-            updateStatus(self, moving_links, moving_agents)
+            self.status[moving_agents] = 2  # Status = Buffer
+            self.stuck_since[moving_agents] = self.current_step
+            self.last_link_exit_time[moving_links] = self.current_step
 
     def _process_nodes(self):
         """
@@ -304,98 +293,31 @@ class TorchDNLGEMSim:
         Logic to move appropriate agents from out_queue of upstream links 
         to in_queue of downstream links
         (capacity buffer --> spatial buffer)
+        
+        Optimized: O(n_agents) ranking via sorted diff instead of O(n_edges) cumsum.
         """
-
-        def getNextLinks(agent_ids):
-            # Agent -> Next Edge
-            curr_ptrs = self.path_ptr[agent_ids]
-            next_ptrs = curr_ptrs + 1
-            
-            valid_idx_mask = next_ptrs < self.max_path_len
-            next_links = torch.full_like(curr_ptrs, -1)
-            
-            if valid_idx_mask.any():
-                valid_agents = agent_ids[valid_idx_mask]
-                valid_ptrs = next_ptrs[valid_idx_mask]
-                next_links[valid_idx_mask] = self.paths[valid_agents, valid_ptrs.long()]
-            return next_links
-
-        def scheduleNextActivity(agents, exiting_links):
-            """Finalize agent metrics and status upon reaching destination."""
-            self.status[agents] = 3
-            self.wakeup_time[agents] = self.infinity
-            self.agent_metrics[agents, 1] = (self.current_step - self.start_time[agents]).float()
-            self.agent_metrics[agents, 0] += self.length[exiting_links]
-
-        def calculateArrivalRank(sorted_targets):
-            # TODO: Make ArrivalRank random with probability based on link outflow
-            unique_targets, counts = torch.unique_consecutive(sorted_targets, return_counts=True)
-            group_starts = torch.zeros_like(unique_targets, dtype=torch.int)
-            group_starts[1:] = torch.cumsum(counts[:-1], dim=0)
-
-            repeat_group_starts = torch.repeat_interleave(group_starts, counts)
-            
-            # Calculate arrival rank
-            indices = torch.arange(sorted_targets.shape[0], device=self.device)
-            ranks = indices - repeat_group_starts
-            return ranks, unique_targets, counts
-
-        def getAvailableCapacityLogical(self, targets, counts):
-            """
-            Get available capacity for each link spatial buffer and spread it to match agent shape
-            This doesn't include the squeeze_margin.
-            """
-            avail_space = self.in_queue_sizes[targets] - self.in_cnt[targets] - self.squeeze_margin
-            return torch.repeat_interleave(avail_space, counts)
-
-        def resolveGridlock(self, stuck_agents, stuck_targets, stuck_ranks, stuck_item_avails):
-            """
-            Resolve agents that are stuck for too long if there's available space in the physical queue.
-            Physical queue = Logicial queue + Security Buffer
-            """
-            
-            # Is the agent stuck ?
-            stuck_dur = self.current_step - self.stuck_since[stuck_agents]
-            is_stuck_long = stuck_dur > self.stuck_threshold
-
-            # Is there still space available in the physical buffer of the target link, including the squeeze margin ?
-            item_avails_phy = stuck_item_avails + self.squeeze_margin
-            has_phy_space = stuck_ranks < item_avails_phy
-
-            return is_stuck_long & has_phy_space
-
-        def scheduleNextLink(self, agents, from_links, to_links):
-            """
-            Handle agents entering a new link.
-            """
-            
-            # Status = 1 (Traveling)
-            self.status[agents] = 1
-
-            # Update position on the graph
-            self.current_edge[agents] = to_links
-            
-            # Update next link based on path
-            self.path_ptr[agents] += 1
-
-            # Update clock
-            self.enter_link_time[agents] = self.current_step
-
-            # Update agent metrics
-            self.agent_metrics[agents, 0] += self.length[from_links]
 
         while True:
             # 1. Get all links with agents ready to leave
             active_links = torch.nonzero(self.out_cnt > 0, as_tuple=True)[0]
 
             if active_links.numel() == 0:
-                break # No links to process
+                break
 
-            # 2. Get agents at head of out_queues of active links and their next links
+            # 2. Get agents at head of out_queues and their next links
             agent_ids = self.getFrontAgent(self.out_cur, self.out_queue_offsets, self.out_queues, active_links)
-            next_links = getNextLinks(agent_ids)
+            
+            # Get next links for these agents
+            curr_ptrs = self.path_ptr[agent_ids]
+            next_ptrs = curr_ptrs + 1
+            valid_idx_mask = next_ptrs < self.max_path_len
+            next_links = torch.full_like(curr_ptrs, -1)
+            if valid_idx_mask.any():
+                valid_agents = agent_ids[valid_idx_mask]
+                valid_ptrs = next_ptrs[valid_idx_mask]
+                next_links[valid_idx_mask] = self.paths[valid_agents, valid_ptrs.long()]
 
-            # 3. Handle Exits
+            # 3. Handle Exits (agents reaching destination)
             exit_mask = next_links == -1
 
             if exit_mask.any():
@@ -403,57 +325,79 @@ class TorchDNLGEMSim:
                 exiting_agents = agent_ids[exit_mask]
 
                 self.removeFront(self.out_cnt, self.out_cur, self.out_queue_sizes, exiting_links)
-                scheduleNextActivity(exiting_agents, exiting_links)
+                # scheduleNextActivity inlined
+                self.status[exiting_agents] = 3
+                self.wakeup_time[exiting_agents] = self.infinity
+                self.agent_metrics[exiting_agents, 1] = (self.current_step - self.start_time[exiting_agents]).float()
+                self.agent_metrics[exiting_agents, 0] += self.length[exiting_links]
             
             # 4. Handle Continuity / Transfers
             cont_mask = ~exit_mask
 
             if not cont_mask.any():
-                continue # Every agent exited, continue next iteration
+                continue
 
             cont_links = active_links[cont_mask]
             cont_agents = agent_ids[cont_mask]
             cont_targets = next_links[cont_mask]
 
-            # We MUST sort everything by cont_targets to group agents entering the same link
+            # Sort by target to group agents heading to the same link
             sort_idx = torch.argsort(cont_targets)
             s_targets = cont_targets[sort_idx]
             s_agents = cont_agents[sort_idx]
             s_links = cont_links[sort_idx]
+            
+            n = s_targets.shape[0]
 
-            ranks, unique_targets, counts = calculateArrivalRank(s_targets)
-            available_capacity = getAvailableCapacityLogical(self, unique_targets, counts)
+            # O(n) ranking: compute within-group rank on sorted targets
+            sorted_ranks = self._compute_sorted_ranks(s_targets, n, self.device)
 
-            winners_mask = ranks < available_capacity
+            # Get available capacity (logical, without squeeze margin)
+            available_capacity = self.in_queue_sizes[s_targets] - self.in_cnt[s_targets] - self.squeeze_margin
 
-            # 4.1 Handle stuck agents
+            winners_mask = sorted_ranks < available_capacity
+
+            # 4.1 Handle stuck agents (gridlock resolution)
             stuck_mask = ~winners_mask
 
             if stuck_mask.any():
-                stuck_agents = cont_agents[stuck_mask]
-                stuck_targets = cont_targets[stuck_mask]
+                stuck_agents = s_agents[stuck_mask]
+                stuck_ranks = sorted_ranks[stuck_mask]
+                stuck_avails = available_capacity[stuck_mask]
 
-                # Find out who can force their way into the spatial buffer
-                gridlock_mask = resolveGridlock(self, stuck_agents, stuck_targets, ranks[stuck_mask], available_capacity[stuck_mask])
+                # Is the agent stuck long enough?
+                stuck_dur = self.current_step - self.stuck_since[stuck_agents]
+                is_stuck_long = stuck_dur > self.stuck_threshold
+
+                # Is there space in the physical buffer (logical + squeeze margin)?
+                item_avails_phy = stuck_avails + self.squeeze_margin
+                has_phy_space = stuck_ranks < item_avails_phy
+
+                gridlock_mask = is_stuck_long & has_phy_space
                 winners_mask[stuck_mask] = gridlock_mask
 
             # 5. Move "winning" agents
             if not winners_mask.any():
-                break # Nobody is moving
-            
+                break
+
             win_from = s_links[winners_mask]
             win_to = s_targets[winners_mask]
             win_agents_id = s_agents[winners_mask]
-            win_ranks = ranks[winners_mask]
+            win_ranks = sorted_ranks[winners_mask]
 
-            # 6. Update queues
+            # 6. Update queues (win_to is sorted since s_targets was sorted and winners is a submask)
             self.removeFront(self.out_cnt, self.out_cur, self.out_queue_sizes, win_from)
             self.pushBackAtomic(self.in_queues, self.in_queue_offsets, self.in_cur, self.in_cnt, self.in_queue_sizes, win_to, win_agents_id, win_ranks)
-            scheduleNextLink(self, win_agents_id, win_from, win_to)
+            
+            # scheduleNextLink inlined
+            self.status[win_agents_id] = 1  # Traveling
+            self.current_edge[win_agents_id] = win_to
+            self.path_ptr[win_agents_id] += 1
+            self.enter_link_time[win_agents_id] = self.current_step
+            self.agent_metrics[win_agents_id, 0] += self.length[win_from]
                 
     def _schedule_demand(self):
-        # Previously _inject_departures
-        # Check active agents
+        """Schedule departures for waiting agents."""
         active_mask = (self.status == 0) & (self.departure_times <= self.current_step)
         if not active_mask.any():
             return
@@ -463,39 +407,29 @@ class TorchDNLGEMSim:
         # Target Edges
         first_edges = self.paths[active_agents, 0]
         
-        # Check Capacity of First Edges
+        # Sort by target edge to group agents
         sort_idx = torch.argsort(first_edges)
         s_agents = active_agents[sort_idx]
         s_edges = first_edges[sort_idx]
+        n = s_agents.shape[0]
         
-        unique_edges, counts = torch.unique_consecutive(s_edges, return_counts=True)
+        # O(n) ranking on sorted edges
+        sorted_ranks = self._compute_sorted_ranks(s_edges, n, self.device)
         
-        # Cap check
-        current_in = self.in_cnt[unique_edges]
+        # Available capacity per target
+        avail = self.in_queue_sizes[s_edges] - self.in_cnt[s_edges]
         
-        max_sizes = self.in_queue_sizes[unique_edges]
-        avail = max_sizes - current_in
-        
-        group_starts = torch.zeros_like(unique_edges)
-        group_starts[1:] = torch.cumsum(counts, dim=0)[:-1]
-        
-        indices = torch.arange(s_agents.shape[0], device=self.device)
-        item_group_starts = torch.repeat_interleave(group_starts, counts)
-        ranks = indices - item_group_starts
-        
-        item_avails = torch.repeat_interleave(avail, counts)
-        
-        passed = ranks < item_avails
+        passed = sorted_ranks < avail
         
         if passed.any():
             w_agents = s_agents[passed]
             w_edges = s_edges[passed]
-            w_ranks = ranks[passed]
+            w_ranks = sorted_ranks[passed]
             
             # Insert to In-Queue
             t_heads = self.in_cur[w_edges]
             t_counts = self.in_cnt[w_edges]
-            t_sizes = self.in_queue_sizes[w_edges] # Physical size
+            t_sizes = self.in_queue_sizes[w_edges]
             t_offsets = self.in_queue_offsets[w_edges]
             
             write_curr = (t_heads + t_counts + w_ranks) % t_sizes
@@ -503,15 +437,14 @@ class TorchDNLGEMSim:
             
             self.in_queues[global_write] = w_agents.int()
             
-            # Update Counts
+            # Update Counts — w_edges is sorted
             unique_w, counts_w = torch.unique_consecutive(w_edges, return_counts=True)
             self.in_cnt.index_add_(0, unique_w, counts_w.short())
             
             # Update Agent
-            self.status[w_agents] = 1 # Traveling
+            self.status[w_agents] = 1  # Traveling
             self.current_edge[w_agents] = w_edges
             self.enter_link_time[w_agents] = self.current_step
-            # path_ptr remains 0
 
     def step(self):
         # Step Order: ProcessLinks -> ProcessNodes -> ScheduleDemand
