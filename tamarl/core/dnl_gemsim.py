@@ -246,6 +246,17 @@ class TorchDNLGEMSim:
         Logic to move appropriate agents from in_queue to out_queue
         (spatial buffer --> capacity buffer)
         """
+
+        def getActiveLinks(self):
+            """
+            Get links that need processing in `_process_links` based on the following criteria:
+            1. in_queue is not empty
+            2. out_queue is not full
+            3. flow_accumulator is positive
+            """
+            mask = (self.in_cnt > 0) & (self.out_cnt < self.out_queue_sizes) & (self.flow_accumulator > 0)
+            return torch.nonzero(mask, as_tuple=True)[0]
+
             
         def updateStatus(self, link_ids, agent_ids):
             """
@@ -258,11 +269,14 @@ class TorchDNLGEMSim:
         # 0. Accumulate Capacity
         self._accumulate_capacity()
         
-        # 1. Get initial active links
-        mask = (self.in_cnt > 0) & (self.out_cnt < self.out_queue_sizes) & (self.flow_accumulator > 0)
-        active_links = torch.nonzero(mask, as_tuple=True)[0]
+        while True:
+            # 1. Get active links
+            # in_queue is not empty, out_queue is not full, flow_accumulator is positive
+            active_links = getActiveLinks(self)
 
-        while active_links.numel() > 0:
+            if active_links.numel() == 0:
+                break # No links to process
+
             # 2. Get agents at head of in_queues of active links 
             agent_ids = self.getFrontAgent(self.in_cur, self.in_queue_offsets, self.in_queues, active_links)
 
@@ -283,13 +297,6 @@ class TorchDNLGEMSim:
 
             # 6. Update Agent and Link Status
             updateStatus(self, moving_links, moving_agents)
-            
-            # 7. Check conditions again ONLY for moving_links to continue looping
-            still_active_mask = (self.in_cnt[moving_links] > 0) & \
-                                (self.out_cnt[moving_links] < self.out_queue_sizes[moving_links]) & \
-                                (self.flow_accumulator[moving_links] > 0)
-            
-            active_links = moving_links[still_active_mask]
 
     def _process_nodes(self):
         """
@@ -322,25 +329,24 @@ class TorchDNLGEMSim:
 
         def calculateArrivalRank(sorted_targets):
             # TODO: Make ArrivalRank random with probability based on link outflow
-            unique_targets, inverse_indices, counts = torch.unique_consecutive(sorted_targets, return_inverse=True, return_counts=True)
+            unique_targets, counts = torch.unique_consecutive(sorted_targets, return_counts=True)
             group_starts = torch.zeros_like(unique_targets, dtype=torch.int)
-            if unique_targets.numel() > 0:
-                group_starts[1:] = torch.cumsum(counts[:-1], dim=0)
+            group_starts[1:] = torch.cumsum(counts[:-1], dim=0)
 
-            repeat_group_starts = group_starts[inverse_indices]
+            repeat_group_starts = torch.repeat_interleave(group_starts, counts)
             
             # Calculate arrival rank
             indices = torch.arange(sorted_targets.shape[0], device=self.device)
             ranks = indices - repeat_group_starts
-            return ranks, unique_targets, inverse_indices, counts
+            return ranks, unique_targets, counts
 
-        def getAvailableCapacityLogical(self, targets, counts, inverse_indices):
+        def getAvailableCapacityLogical(self, targets, counts):
             """
             Get available capacity for each link spatial buffer and spread it to match agent shape
             This doesn't include the squeeze_margin.
             """
             avail_space = self.in_queue_sizes[targets] - self.in_cnt[targets] - self.squeeze_margin
-            return avail_space[inverse_indices]
+            return torch.repeat_interleave(avail_space, counts)
 
         def resolveGridlock(stuck_agents, stuck_targets, stuck_ranks, stuck_item_avails):
             """
@@ -378,18 +384,19 @@ class TorchDNLGEMSim:
             # Update agent metrics
             self.agent_metrics[agents, 0] += self.length[from_links]
 
-        # 1. Get initial active links
-        active_links = torch.nonzero(self.out_cnt > 0, as_tuple=True)[0]
-        
-        while active_links.numel() > 0:
+        while True:
+            # 1. Get all links with agents ready to leave
+            active_links = torch.nonzero(self.out_cnt > 0, as_tuple=True)[0]
+
+            if active_links.numel() == 0:
+                break # No links to process
+
             # 2. Get agents at head of out_queues of active links and their next links
             agent_ids = self.getFrontAgent(self.out_cur, self.out_queue_offsets, self.out_queues, active_links)
             next_links = getNextLinks(agent_ids)
 
             # 3. Handle Exits
             exit_mask = next_links == -1
-            
-            exiting_links = torch.empty(0, dtype=torch.long, device=self.device)
 
             if exit_mask.any():
                 exiting_links = active_links[exit_mask]
@@ -401,58 +408,53 @@ class TorchDNLGEMSim:
             # 4. Handle Continuity / Transfers
             cont_mask = ~exit_mask
 
-            win_from = torch.empty(0, dtype=torch.long, device=self.device)
-            if cont_mask.any():
-                cont_links = active_links[cont_mask]
-                cont_agents = agent_ids[cont_mask]
-                cont_targets = next_links[cont_mask]
+            if not cont_mask.any():
+                continue # Every agent exited, continue next iteration
 
-                # We MUST sort everything by cont_targets to group agents entering the same link
-                sort_idx = torch.argsort(cont_targets)
-                s_targets = cont_targets[sort_idx]
-                s_agents = cont_agents[sort_idx]
-                s_links = cont_links[sort_idx]
+            cont_links = active_links[cont_mask]
+            cont_agents = agent_ids[cont_mask]
+            cont_targets = next_links[cont_mask]
 
-                ranks, unique_targets, inverse_indices, counts = calculateArrivalRank(s_targets)
-                available_capacity = getAvailableCapacityLogical(self, unique_targets, counts, inverse_indices)
+            # We MUST sort everything by cont_targets to group agents entering the same link
+            sort_idx = torch.argsort(cont_targets)
+            s_targets = cont_targets[sort_idx]
+            s_agents = cont_agents[sort_idx]
+            s_links = cont_links[sort_idx]
 
-                winners_mask = ranks < available_capacity
+            ranks, unique_targets, counts = calculateArrivalRank(s_targets)
+            available_capacity = getAvailableCapacityLogical(self, unique_targets, counts)
 
-                # 4.1 Handle stuck agents
-                stuck_mask = ~winners_mask
+            winners_mask = ranks < available_capacity
 
-                if stuck_mask.any():
-                    stuck_agents = cont_agents[stuck_mask]
-                    stuck_targets = cont_targets[stuck_mask]
+            # 4.1 Handle stuck agents
+            stuck_mask = ~winners_mask
 
-                    # Find out who can force their way into the spatial buffer
-                    gridlock_mask = resolveGridlock(self, stuck_agents, stuck_targets, ranks[stuck_mask], available_capacity[stuck_mask])
-                    winners_mask[stuck_mask] = gridlock_mask
+            if stuck_mask.any():
+                stuck_agents = cont_agents[stuck_mask]
+                stuck_targets = cont_targets[stuck_mask]
 
-                # 5. Move "winning" agents
-                if winners_mask.any():
-                    win_from = s_links[winners_mask]
-                    win_to = s_targets[winners_mask]
-                    win_agents_id = s_agents[winners_mask]
-                    win_ranks = ranks[winners_mask]
+                # Find out who can force their way into the spatial buffer
+                gridlock_mask = resolveGridlock(self, stuck_agents, stuck_targets, ranks[stuck_mask], available_capacity[stuck_mask])
+                winners_mask[stuck_mask] = gridlock_mask
 
-                    # 6. Update queues
-                    self.removeFront(self.out_cnt, self.out_cur, self.out_queue_sizes, win_from)
-                    self.pushBackAtomic(self.in_queues, self.in_queue_offsets, self.in_cur, self.in_cnt, self.in_queue_sizes, win_to, win_agents_id, win_ranks)
-                    scheduleNextLink(self, win_agents_id, win_from, win_to)
+            # 5. Move "winning" agents
+            if not winners_mask.any():
+                break # Nobody is moving
             
-            # 7. Update active links for next iteration
-            if exiting_links.numel() == 0 and win_from.numel() == 0:
-                break
-                
-            moved_links = torch.cat([exiting_links, win_from])
-            still_active = self.out_cnt[moved_links] > 0
-            active_links = moved_links[still_active]
+            win_from = s_links[winners_mask]
+            win_to = s_targets[winners_mask]
+            win_agents_id = s_agents[winners_mask]
+            win_ranks = ranks[winners_mask]
+
+            # 6. Update queues
+            self.removeFront(self.out_cnt, self.out_cur, self.out_queue_sizes, win_from)
+            self.pushBackAtomic(self.in_queues, self.in_queue_offsets, self.in_cur, self.in_cnt, self.in_queue_sizes, win_to, win_agents_id, win_ranks)
+            scheduleNextLink(self, win_agents_id, win_from, win_to)
                 
     def _schedule_demand(self):
         # Previously _inject_departures
         # Check active agents
-        active_mask = (self.wakeup_time <= self.current_step)
+        active_mask = (self.status == 0) & (self.departure_times <= self.current_step)
         if not active_mask.any():
             return
 
@@ -466,7 +468,7 @@ class TorchDNLGEMSim:
         s_agents = active_agents[sort_idx]
         s_edges = first_edges[sort_idx]
         
-        unique_edges, inverse_indices, counts = torch.unique_consecutive(s_edges, return_inverse=True, return_counts=True)
+        unique_edges, counts = torch.unique_consecutive(s_edges, return_counts=True)
         
         # Cap check
         current_in = self.in_cnt[unique_edges]
@@ -475,14 +477,13 @@ class TorchDNLGEMSim:
         avail = max_sizes - current_in
         
         group_starts = torch.zeros_like(unique_edges)
-        if unique_edges.numel() > 0:
-            group_starts[1:] = torch.cumsum(counts[:-1], dim=0)
+        group_starts[1:] = torch.cumsum(counts, dim=0)[:-1]
         
         indices = torch.arange(s_agents.shape[0], device=self.device)
-        item_group_starts = group_starts[inverse_indices]
+        item_group_starts = torch.repeat_interleave(group_starts, counts)
         ranks = indices - item_group_starts
         
-        item_avails = avail[inverse_indices]
+        item_avails = torch.repeat_interleave(avail, counts)
         
         passed = ranks < item_avails
         
@@ -510,7 +511,6 @@ class TorchDNLGEMSim:
             self.status[w_agents] = 1 # Traveling
             self.current_edge[w_agents] = w_edges
             self.enter_link_time[w_agents] = self.current_step
-            self.wakeup_time[w_agents] = self.infinity # Agent departed! Skip checking until done.
             # path_ptr remains 0
 
     def step(self):
