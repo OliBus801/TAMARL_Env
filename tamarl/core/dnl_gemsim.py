@@ -154,7 +154,6 @@ class TorchDNLGEMSim:
         
         # Flow Accumulator
         self.flow_accumulator = torch.zeros(self.num_edges, device=device, dtype=torch.float32)
-        self.flow_caps = torch.maximum(torch.tensor(1.0, device=device), self.flow_capacity_per_step)
 
         # Gridlock Management
         # TODO: Verify the -1000 initialization is okay.
@@ -232,19 +231,14 @@ class TorchDNLGEMSim:
     def _accumulate_capacity(self):
         # Accumulate only if occupied
         # allowing negative accumulator.
-        traveling_agents = torch.nonzero(self.status == 1, as_tuple=True)[0]
-        if traveling_agents.numel() > 0:
-            candidate_links = torch.unique(self.current_edge[traveling_agents])
-            active_links = candidate_links[self.in_cnt[candidate_links] > 0]
+        
+        active_mask = self.in_cnt > 0
+        if active_mask.any():
+            self.flow_accumulator[active_mask] += self.flow_capacity_per_step[active_mask]
             
-            if active_links.numel() > 0:
-                self.flow_accumulator[active_links] += self.flow_capacity_per_step[active_links]
-                
-                # Cap at max(1.0, flow_capacity) to prevent infinite banking
-                self.flow_accumulator[active_links] = torch.minimum(
-                    self.flow_accumulator[active_links], 
-                    self.flow_caps[active_links]
-                )
+            # Cap at max(1.0, flow_capacity) to prevent infinite banking
+            caps = torch.maximum(torch.tensor(1.0, device=self.device), self.flow_capacity_per_step[active_mask])
+            self.flow_accumulator[active_mask] = torch.minimum(self.flow_accumulator[active_mask], caps)
 
     def _process_links(self):
         """
@@ -265,13 +259,8 @@ class TorchDNLGEMSim:
         self._accumulate_capacity()
         
         # 1. Get initial active links
-        traveling_agents = torch.nonzero(self.status == 1, as_tuple=True)[0]
-        if traveling_agents.numel() == 0:
-            return
-            
-        candidate_links = torch.unique(self.current_edge[traveling_agents])
-        mask = (self.in_cnt[candidate_links] > 0) & (self.out_cnt[candidate_links] < self.out_queue_sizes[candidate_links]) & (self.flow_accumulator[candidate_links] > 0)
-        active_links = candidate_links[mask]
+        mask = (self.in_cnt > 0) & (self.out_cnt < self.out_queue_sizes) & (self.flow_accumulator > 0)
+        active_links = torch.nonzero(mask, as_tuple=True)[0]
 
         while active_links.numel() > 0:
             # 2. Get agents at head of in_queues of active links 
@@ -390,12 +379,7 @@ class TorchDNLGEMSim:
             self.agent_metrics[agents, 0] += self.length[from_links]
 
         # 1. Get initial active links
-        buffer_agents = torch.nonzero(self.status == 2, as_tuple=True)[0]
-        if buffer_agents.numel() == 0:
-            return
-            
-        candidate_links = torch.unique(self.current_edge[buffer_agents])
-        active_links = candidate_links[self.out_cnt[candidate_links] > 0]
+        active_links = torch.nonzero(self.out_cnt > 0, as_tuple=True)[0]
         
         while active_links.numel() > 0:
             # 2. Get agents at head of out_queues of active links and their next links
