@@ -16,7 +16,8 @@ class TorchDNLGEMSim:
                  departure_times: torch.Tensor = None,
                  stuck_threshold: int = 10,
                  dt: float = 1.0,
-                 enable_profiling: bool = False):
+                 enable_profiling: bool = False,
+                 compile: str = None):
         """
         Initialize the TorchDNLGEMSim simulation engine according to the GEMSim implementation (Saprykin et al., 2025).
         
@@ -135,7 +136,7 @@ class TorchDNLGEMSim:
         # Agent Metrics [A, 2] -> [accumulated_distance, final_travel_time]
         self.agent_metrics = torch.zeros((self.num_agents, 2), device=self.device, dtype=torch.float32)
 
-        self.current_step = 0
+        self.current_step = torch.tensor(0, device=self.device, dtype=torch.int32)
         
         # Flow Accumulator
         self.flow_accumulator = torch.zeros(self.num_edges, device=device, dtype=torch.float32)
@@ -145,6 +146,16 @@ class TorchDNLGEMSim:
 
         # --- Pre-allocated scratch buffers ---
         self._scratch_flow_cap = torch.empty(self.num_edges, device=device, dtype=torch.float32)
+
+        # --- torch.compile ---
+        # NOTE: cProfile and torch.compile are mutually exclusive.
+        # Profiling hooks prevent compilation from working.
+        # compile: None = disabled, 'default' | 'reduce-overhead' | 'max-autotune'
+        if compile and not enable_profiling:
+            print(f"torch.compile enabled (mode={compile}). First steps will be slow (compilation)...")
+            self._process_links = torch.compile(self._process_links, mode=compile, dynamic=True)
+            self._process_nodes = torch.compile(self._process_nodes, mode=compile, dynamic=True)
+            self._schedule_demand = torch.compile(self._schedule_demand, mode=compile, dynamic=True)
 
     def reset(self):
         # Reset Logic
@@ -166,7 +177,7 @@ class TorchDNLGEMSim:
         
         self.agent_metrics.fill_(0)
         self.wakeup_time.copy_(self.departure_times)
-        self.current_step = 0
+        self.current_step.zero_()
         self.flow_accumulator.fill_(0)
         self.last_link_exit_time.fill_(-1000)
 
@@ -221,21 +232,26 @@ class TorchDNLGEMSim:
         Compute within-group ranks for a SORTED tensor.
         For sorted [A, A, B, B, B, C] -> returns [0, 1, 0, 1, 2, 0]
         O(n) — no cumsum over edges, works purely on the agent-sized tensors.
+        torch.compile compatible — no .item() calls.
         """
         if n <= 1:
             return torch.zeros(n, device=device, dtype=torch.int32)
-        # Detect group boundaries and compute group_id per element
-        # group_id: [0,0,1,1,1,2] for [A,A,B,B,B,C]
+        # Detect group boundaries
+        changes = sorted_values[1:] != sorted_values[:-1]
+        # group_id per element: [0,0,1,1,1,2] for [A,A,B,B,B,C]
         group_ids = torch.zeros(n, device=device, dtype=torch.int32)
-        group_ids[1:] = (sorted_values[1:] != sorted_values[:-1]).int().cumsum_(0)
-        # group_start[g] = first position of group g
-        # boundary positions: 0, then positions where changes occur
-        num_groups = group_ids[-1].item() + 1
-        group_starts = torch.zeros(num_groups, device=device, dtype=torch.int32)
-        if num_groups > 1:
-            group_starts[1:] = (sorted_values[1:] != sorted_values[:-1]).nonzero(as_tuple=True)[0] + 1
-        # rank = position - group_start[group_id]
-        return torch.arange(n, device=device, dtype=torch.int32) - group_starts[group_ids]
+        group_ids[1:] = changes.int().cumsum_(0)
+        # group_start per element (no .item() needed):
+        # For each position, group_start = position if it's a boundary, else propagate from left.
+        # We build group_starts[n] where starts[i] = i if boundary, else 0, then take cummax.
+        starts = torch.zeros(n, device=device, dtype=torch.int32)
+        starts[0] = 0
+        boundary_idx = changes.nonzero(as_tuple=True)[0] + 1  # positions where groups start
+        starts[boundary_idx] = boundary_idx.int()
+        # cummax propagates each boundary start forward until the next boundary 
+        group_start_per_elem, _ = starts.cummax(dim=0)
+        # rank = position - group_start 
+        return torch.arange(n, device=device, dtype=torch.int32) - group_start_per_elem
 
     def _process_links(self):
         """
@@ -459,6 +475,13 @@ class TorchDNLGEMSim:
         # Schedule Demand (Departures)
         self._schedule_demand()
 
+        self.current_step += 1
+
+    def step_no_compile(self):
+        """Same as step(), but guaranteed not compiled (for profiling)."""
+        self._process_links()
+        self._process_nodes()
+        self._schedule_demand()
         self.current_step += 1
 
     def stop_profiling(self):

@@ -179,7 +179,7 @@ def parse_population(pop_file, link_id_to_idx):
     print(f"Parsed {count} persons. Skipped {skipped_no_path} legs. Total trips: {len(trips)}")
     return trips, trip_metadata
 
-def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_factor=1.0, n_hours=24, save_pickle=False, load_pickle=True, save_paths=False, save_agents=False, output_folder="output_gemsim"):
+def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_factor=1.0, n_hours=24, save_pickle=False, load_pickle=True, save_paths=False, save_agents=False, output_folder="output_gemsim", compile_mode=None):
     
     process = psutil.Process(os.getpid())
     def get_mem():
@@ -342,6 +342,9 @@ def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_facto
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Running Simulation on {device}...")
     
+    # When using torch.compile, disable profiling (cProfile hooks break compilation)
+    enable_profiling = not compile_mode
+    
     dnl = TorchDNLGEMSim(
         edge_static, 
         paths_tensor, 
@@ -350,7 +353,8 @@ def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_facto
         departure_times=departure_times, 
         dt=timestep, 
         stuck_threshold=10,
-        enable_profiling=True
+        enable_profiling=enable_profiling,
+        compile=compile_mode
     )
     
     # 5. Simulation Loop
@@ -438,10 +442,11 @@ if __name__ == "__main__":
     parser.add_argument("--scale_factor", help="Scale factor", default=1.0)
     parser.add_argument("--timestep", help="Time step size", default=1)
     parser.add_argument("--output_folder", help="Output folder", default="output_gemsim")
+    parser.add_argument("--compile", help="Enable torch.compile with given mode (default, reduce-overhead, max-autotune)", default=None)
 
     args = parser.parse_args()
     
     if not os.path.exists(args.root_folder):
         print(f"Root folder not found: {args.root_folder}")
     else:
-        run_benchmark(args.root_folder, args.population, timestep=float(args.timestep), scale_factor=float(args.scale_factor), n_hours=int(args.n_hours), save_pickle=args.save_pickle, load_pickle=not args.no_load_pickle, save_paths=args.save_paths, save_agents=args.save_agents, output_folder=args.output_folder)
+        run_benchmark(args.root_folder, args.population, timestep=float(args.timestep), scale_factor=float(args.scale_factor), n_hours=int(args.n_hours), save_pickle=args.save_pickle, load_pickle=not args.no_load_pickle, save_paths=args.save_paths, save_agents=args.save_agents, output_folder=args.output_folder, compile_mode=args.compile)
