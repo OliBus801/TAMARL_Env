@@ -1,4 +1,5 @@
 import torch
+import torch._inductor.config
 import cProfile
 import pstats
 import io
@@ -30,6 +31,7 @@ class TorchDNLGEMSim:
             stuck_threshold: Time in steps an agent waits in buffer before forcing entry.
             dt: Simulation time step in seconds.
             enable_profiling: If True, enables cProfile.
+            compile: None = disabled, 'default' | 'reduce-overhead' | 'max-autotune'
         """
         self.device = device
         self.stuck_threshold = stuck_threshold
@@ -146,12 +148,24 @@ class TorchDNLGEMSim:
 
         # --- Pre-allocated scratch buffers ---
         self._scratch_flow_cap = torch.empty(self.num_edges, device=device, dtype=torch.float32)
+        # Pre-computed constant for capacity capping
+        self._flow_cap_ceil = torch.maximum(torch.tensor(1.0, device=device), self.flow_capacity_per_step)
+        # Full-tensor zero for where() ops (avoids repeated allocation)
+        self._zero_f = torch.tensor(0.0, device=device)
+        self._zero_i = torch.tensor(0, device=device, dtype=torch.int32)
+        self._one_f = torch.tensor(1.0, device=device)
 
         # --- torch.compile ---
         # NOTE: cProfile and torch.compile are mutually exclusive.
         # Profiling hooks prevent compilation from working.
         # compile: None = disabled, 'default' | 'reduce-overhead' | 'max-autotune'
         if compile and not enable_profiling:
+            # Configure inductor for our simulation pattern:
+            # - Skip CUDAGraphs for dynamic-shape subgraphs (our tensor sizes change every iteration)
+            # - Suppress the dynamic shape warning
+            torch._inductor.config.triton.cudagraph_skip_dynamic_graphs = True
+            torch._inductor.config.triton.cudagraph_dynamic_shape_warn_limit = None
+
             print(f"torch.compile enabled (mode={compile}). First steps will be slow (compilation)...")
             self._process_links = torch.compile(self._process_links, mode=compile, dynamic=True)
             self._process_nodes = torch.compile(self._process_nodes, mode=compile, dynamic=True)
@@ -202,11 +216,11 @@ class TorchDNLGEMSim:
         counters[link_ids] += 1
 
     @staticmethod
-    def pushBackAtomic(queues, offsets, currents, counts, sizes, link_ids, agent_ids, ranks):
+    def pushBackAtomic(queues, offsets, currents, counts, sizes, link_ids, agent_ids, ranks, num_edges):
         """
         Add agents to the tail of queues safely handling multiple agents entering the same link.
         Requires 'ranks' (0, 1, 2...) for agents entering the same link_id.
-        link_ids MUST be sorted for the counter update to work correctly.
+        Uses bincount for CUDAGraph-friendly full-tensor counter update.
         """
         # 1. Calculate local index with arrival rank to avoid collisions
         write_indices = (currents[link_ids] + counts[link_ids] + ranks) % sizes[link_ids]
@@ -215,9 +229,10 @@ class TorchDNLGEMSim:
         global_write_idx = offsets[link_ids] + write_indices
         queues[global_write_idx] = agent_ids
         
-        # 3. Update counters — link_ids are sorted, so unique_consecutive is O(n_winners)
-        unique_links, counts_to_add = torch.unique_consecutive(link_ids, return_counts=True)
-        counts.index_add_(0, unique_links, counts_to_add.short())
+        # 3. Update counters with bincount — full-tensor op, CUDAGraph-friendly
+        # bincount produces a fixed-size [num_edges] tensor (no dynamic shapes)
+        counts_delta = torch.bincount(link_ids.long(), minlength=num_edges)
+        counts.add_(counts_delta.short())
     
     @staticmethod
     def getFrontAgent(currents, offsets, queues, link_ids):
@@ -259,18 +274,22 @@ class TorchDNLGEMSim:
         Logic to move appropriate agents from in_queue to out_queue
         (spatial buffer --> capacity buffer)
         Fused with capacity accumulation.
+        CUDAGraph-friendly: uses full-tensor where() ops instead of masked in-place.
         """
         # Early exit: if no link has agents in its in_queue, skip entirely
         if not (self.in_cnt > 0).any():
             return
 
-        # 0. Accumulate Capacity (fused)
+        # 0. Accumulate Capacity — full-tensor ops (CUDAGraph-compatible)
         active_cap_mask = self.in_cnt > 0
-        self.flow_accumulator[active_cap_mask] += self.flow_capacity_per_step[active_cap_mask]
-        # Cap at max(1.0, flow_capacity) to prevent infinite banking
-        caps = torch.maximum(torch.tensor(1.0, device=self.device), self.flow_capacity_per_step[active_cap_mask])
-        torch.minimum(self.flow_accumulator[active_cap_mask], caps, out=caps)
-        self.flow_accumulator[active_cap_mask] = caps
+        # Add flow capacity only where links are active, 0 otherwise
+        self.flow_accumulator.add_(torch.where(active_cap_mask, self.flow_capacity_per_step, self._zero_f))
+        # Cap at max(1.0, flow_capacity) — full-tensor clamp
+        self.flow_accumulator = torch.where(
+            active_cap_mask,
+            torch.minimum(self.flow_accumulator, self._flow_cap_ceil),
+            self.flow_accumulator
+        )
 
         while True:
             # 1. Get active links: in_queue not empty, out_queue not full, flow > 0
@@ -403,7 +422,7 @@ class TorchDNLGEMSim:
 
             # 6. Update queues (win_to is sorted since s_targets was sorted and winners is a submask)
             self.removeFront(self.out_cnt, self.out_cur, self.out_queue_sizes, win_from)
-            self.pushBackAtomic(self.in_queues, self.in_queue_offsets, self.in_cur, self.in_cnt, self.in_queue_sizes, win_to, win_agents_id, win_ranks)
+            self.pushBackAtomic(self.in_queues, self.in_queue_offsets, self.in_cur, self.in_cnt, self.in_queue_sizes, win_to, win_agents_id, win_ranks, self.num_edges)
             
             # scheduleNextLink inlined
             self.status[win_agents_id] = 1  # Traveling
@@ -453,9 +472,9 @@ class TorchDNLGEMSim:
             
             self.in_queues[global_write] = w_agents.int()
             
-            # Update Counts — w_edges is sorted
-            unique_w, counts_w = torch.unique_consecutive(w_edges, return_counts=True)
-            self.in_cnt.index_add_(0, unique_w, counts_w.short())
+            # Update Counts — bincount for CUDAGraph-friendly full-tensor op
+            counts_delta = torch.bincount(w_edges.long(), minlength=self.num_edges)
+            self.in_cnt.add_(counts_delta.short())
             
             # Update Agent
             self.status[w_agents] = 1  # Traveling
