@@ -80,10 +80,10 @@ class TorchDNLGEMSim:
         self.out_queue_offsets[1:] = torch.cumsum(self.out_queue_sizes, dim=0)
         self.total_out_queue_size = self.out_queue_offsets[-1].item()
         
-        self.in_cur = torch.zeros(self.num_edges, device=device, dtype=torch.short)
-        self.in_cnt = torch.zeros(self.num_edges, device=device, dtype=torch.short)
-        self.out_cur = torch.zeros(self.num_edges, device=device, dtype=torch.short)
-        self.out_cnt = torch.zeros(self.num_edges, device=device, dtype=torch.short)
+        self.in_cur = torch.zeros(self.num_edges, device=device, dtype=torch.int)
+        self.in_cnt = torch.zeros(self.num_edges, device=device, dtype=torch.int)
+        self.out_cur = torch.zeros(self.num_edges, device=device, dtype=torch.int)
+        self.out_cnt = torch.zeros(self.num_edges, device=device, dtype=torch.int)
 
         self.in_queues = torch.full((self.total_in_queue_size,), -1, device=device, dtype=torch.int32)
         self.out_queues = torch.full((self.total_out_queue_size,), -1, device=device, dtype=torch.int32)
@@ -208,14 +208,14 @@ class TorchDNLGEMSim:
                 break
 
             # 4. removeFront — fixed [num_edges], no dynamic shapes
-            self.in_cnt -= ready.short()
-            self.in_cur = torch.where(ready, ((self.in_cur + 1) % self.in_queue_sizes.short()), self.in_cur)
+            self.in_cnt -= ready.int()
+            self.in_cur = torch.where(ready, ((self.in_cur + 1) % self.in_queue_sizes.int()), self.in_cur)
 
             # 5. pushBack to out_queue — fixed [num_edges]
             out_pos = (self._out_offsets + ((self.out_cur + self.out_cnt) % self.out_queue_sizes)).long()
             existing = self.out_queues[out_pos]
             self.out_queues[out_pos] = torch.where(ready, front_agents, existing)
-            self.out_cnt += ready.short()
+            self.out_cnt += ready.int()
 
             # 6. Flow update — fixed [num_edges]
             self.flow_accumulator -= torch.where(ready, self._one_f, self._zero_f)
@@ -258,8 +258,8 @@ class TorchDNLGEMSim:
                 exiting_agents = agent_ids[exit_mask]
                 # removeFront via bincount — fixed [num_edges] output
                 exit_dec = torch.bincount(exiting_links.long(), minlength=self.num_edges)
-                self.out_cnt -= exit_dec.short()
-                self.out_cur = (self.out_cur + exit_dec.short()) % self.out_queue_sizes.short()
+                self.out_cnt -= exit_dec.int()
+                self.out_cur = (self.out_cur + exit_dec.int()) % self.out_queue_sizes.int()
                 # Agent state
                 self.status[exiting_agents] = 3
                 self.wakeup_time[exiting_agents] = self.infinity
@@ -305,15 +305,15 @@ class TorchDNLGEMSim:
 
             # removeFront via bincount — fixed [num_edges] output
             remove_dec = torch.bincount(win_from.long(), minlength=self.num_edges)
-            self.out_cnt -= remove_dec.short()
-            self.out_cur = (self.out_cur + remove_dec.short()) % self.out_queue_sizes.short()
+            self.out_cnt -= remove_dec.int()
+            self.out_cur = (self.out_cur + remove_dec.int()) % self.out_queue_sizes.int()
 
             # pushBackAtomic — queue write (inherently dynamic) + bincount counter (fixed)
             write_indices = (self.in_cur[win_to] + self.in_cnt[win_to] + win_ranks) % self.in_queue_sizes[win_to]
             global_write_idx = self.in_queue_offsets[win_to] + write_indices
             self.in_queues[global_write_idx.long()] = win_agents_id
             add_dec = torch.bincount(win_to.long(), minlength=self.num_edges)
-            self.in_cnt += add_dec.short()
+            self.in_cnt += add_dec.int()
 
             # Agent state
             self.status[win_agents_id] = 1
@@ -356,7 +356,7 @@ class TorchDNLGEMSim:
             
             # Counter update via bincount — fixed [num_edges]
             counts_delta = torch.bincount(w_edges.long(), minlength=self.num_edges)
-            self.in_cnt += counts_delta.short()
+            self.in_cnt += counts_delta.int()
             
             self.status[w_agents] = 1
             self.current_edge[w_agents] = w_edges
