@@ -9,6 +9,9 @@ __pycache__/
 # Scripts
 *.sh
 
+# Agent
+.agent/
+
 # Images
 *.png
 *.jpg
