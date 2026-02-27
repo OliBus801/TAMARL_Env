@@ -379,7 +379,11 @@ def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_facto
             status = dnl.status # array on device
             en_route = ((status == 1) | (status == 2)).sum().item()
 
-            print(f"Hour {step//3600} | En Route: {en_route} | Speed: {ms_per_step:.2f} ms/step | Elapsed time : {dt:.2f}s")
+            # Calculate interactions and reset
+            interactions = dnl.interactions
+            dnl.interactions = 0
+
+            print(f"Hour {step//3600} | En Route: {en_route} | Speed: {ms_per_step:.2f} ms/step | Interactions: {interactions} | Elapsed time : {dt:.2f}s")
             t0 = time.time()
             
         if step % 100 == 0:

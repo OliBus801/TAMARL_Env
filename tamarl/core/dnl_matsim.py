@@ -38,6 +38,9 @@ class TorchDNLMATSim:
             self.profiler = cProfile.Profile()
             self.profiler.enable()
 
+        # Test number of interactions
+        self.interactions = 0
+
         # Move constants to device
         self.edge_static = edge_static.to(device)
         self.paths = paths.to(device).int()
@@ -212,8 +215,13 @@ class TorchDNLMATSim:
         return candidates
 
     def _process_link_moves_D(self, candidates):
-        if candidates.numel() == 0:
+        
+        nb_candidates = candidates.numel() 
+
+        if nb_candidates == 0:
             return
+        
+        self.interactions += nb_candidates # All candidates are interactions
 
         # --- D. Link Entry / Change ---
         target_edges = self.next_edge[candidates]
@@ -248,6 +256,7 @@ class TorchDNLMATSim:
         
         flow_pass_mask = (ranks < limits)
         candidates_s2 = candidates_sorted[flow_pass_mask]
+        self.interactions += (~flow_pass_mask).sum().item() # Blocked agents
         
         if candidates_s2.numel() == 0:
             return
@@ -273,50 +282,55 @@ class TorchDNLMATSim:
         
         is_stuck = (self.current_step - stuck_final) > self.stuck_threshold
         storage_pass = is_stuck | (inflow_ranks_final < avail)
+
+        self.interactions += (~storage_pass).sum().item() # Blocked agents cause of storage capacity
         
         winners = c_final[storage_pass]
         
         if winners.numel() > 0:
-             w_curr = self.current_edge[winners]
-             w_next = self.next_edge[winners]
-             
-             valid_rem = (w_curr >= 0)
 
-             # Update Occupancy
-             # Decrease: Already done in (A) when moving to buffer
-             # Increase: New edge
-             self.edge_occupancy += torch.bincount(w_next, minlength=self.num_edges)
-             
-             # Update State
-             self.status[winners] = 1 # Traveling
-             self.current_edge[winners] = w_next
-             
-             # Increment Pointer (only if was on edge)
-             self.path_ptr[winners[valid_rem]] += 1
-             
-             # Arrival Time
-             ff_times = self.ff_travel_time_steps[w_next]
-             
-             # Modify for First Link Start
-             # MATSim Logic : "vehicle enters traffic" on first link of their path, but don't traverse it.
-             
-             # w_curr (defined at start of block) holds previous edge index (if == -1, they are starting)
-             is_start = (w_curr == -1)
-             
-             arrival_times = self.current_step + ff_times
-             
-             if is_start.any():
-                 # Agents starting: arrival time = current step (instant arrival at end of link)
-                 arrival_times[is_start] = self.current_step
-             
-             self.arrival_time[winners] = arrival_times.int()
-             
-             # Wakeup Time
-             self.wakeup_time[winners] = arrival_times.int()
+            self.interactions += winners.numel() # Agents that interact with the next link (that pass)
 
-             # Remove 1.0 from flow accumulator for each winners that went through
-             ones = torch.ones(winners[valid_rem].size(0), device=self.device)
-             self.edge_capacity_accumulator.scatter_add_(0, w_curr[valid_rem].long(), -ones)
+            w_curr = self.current_edge[winners]
+            w_next = self.next_edge[winners]
+            
+            valid_rem = (w_curr >= 0)
+
+            # Update Occupancy
+            # Decrease: Already done in (A) when moving to buffer
+            # Increase: New edge
+            self.edge_occupancy += torch.bincount(w_next, minlength=self.num_edges)
+            
+            # Update State
+            self.status[winners] = 1 # Traveling
+            self.current_edge[winners] = w_next
+            
+            # Increment Pointer (only if was on edge)
+            self.path_ptr[winners[valid_rem]] += 1
+            
+            # Arrival Time
+            ff_times = self.ff_travel_time_steps[w_next]
+            
+            # Modify for First Link Start
+            # MATSim Logic : "vehicle enters traffic" on first link of their path, but don't traverse it.
+            
+            # w_curr (defined at start of block) holds previous edge index (if == -1, they are starting)
+            is_start = (w_curr == -1)
+            
+            arrival_times = self.current_step + ff_times
+            
+            if is_start.any():
+                # Agents starting: arrival time = current step (instant arrival at end of link)
+                arrival_times[is_start] = self.current_step
+            
+            self.arrival_time[winners] = arrival_times.int()
+            
+            # Wakeup Time
+            self.wakeup_time[winners] = arrival_times.int()
+
+            # Remove 1.0 from flow accumulator for each winners that went through
+            ones = torch.ones(winners[valid_rem].size(0), device=self.device)
+            self.edge_capacity_accumulator.scatter_add_(0, w_curr[valid_rem].long(), -ones)
 
     def step(self):
         self.current_step += 1
