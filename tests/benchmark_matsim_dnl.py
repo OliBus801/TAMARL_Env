@@ -10,7 +10,7 @@ import datetime
 import pandas as pd
 import pickle
 import gc
-from tamarl.core.dnl_matsim import TorchDNLMATSim
+from tamarl.core.dnl_matsim import TorchDNLMATSim, EVENT_TYPE_NAMES
 from tamarl.core.plot_histogram import plot_agent_status
 
 def sec_to_hms(seconds):
@@ -170,7 +170,7 @@ def get_memory_usage():
     mem_info = process.memory_info()
     return mem_info.rss / 1024 / 1024 # MB
 
-def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_factor=1.0, n_hours=24, save_pickle=False, load_pickle=True, save_paths=False, save_agents=False, output_folder="output"):
+def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_factor=1.0, n_hours=24, save_pickle=False, load_pickle=True, save_paths=False, save_agents=False, save_events=False, output_folder="output"):
     
     process = psutil.Process(os.getpid())
     def get_mem():
@@ -300,8 +300,10 @@ def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_facto
         
     # Free memory of raw data if possible?
     # We need edges_data and trips for tensor creation.
-    # link_id_to_idx is not needed afterwards if not used. 
-    del link_id_to_idx
+    # Keep link_id_to_idx if we need it for event export
+    if not save_events:
+        del link_id_to_idx
+        link_id_to_idx = None
     gc.collect()
 
     # 4. Prepare Data for DNL
@@ -354,7 +356,8 @@ def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_facto
         departure_times=departure_times, 
         dt=timestep, 
         stuck_threshold=10,
-        enable_profiling=True
+        enable_profiling=True,
+        track_events=save_events
     )
     
     # 5. Simulation Loop
@@ -469,6 +472,40 @@ def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_facto
     print("Generating Plot...")
     plot_agent_status(start_steps, arrival_steps, max_steps=step, bucket_size_sec=300, output_file=plot_file)
 
+    # Events CSV --------------
+    if save_events:
+        events = dnl.get_events()
+        print(f"Collected {len(events)} events. Exporting to CSV...")
+
+        # Build inverse mapping: edge_idx -> link_id
+        idx_to_link_id = {v: k for k, v in link_id_to_idx.items()}
+
+        events_rows = []
+        for (t, evt_type, agent_id, edge_id) in events:
+            evt_name = EVENT_TYPE_NAMES.get(evt_type, str(evt_type))
+            link_name = idx_to_link_id.get(edge_id, str(edge_id))
+            person_name = trip_metadata[agent_id]['agent_id'] if agent_id < len(trip_metadata) else f"agent_{agent_id}"
+            
+            # Extra info
+            extra = ''
+            if evt_type in (0, 7):  # actend / actstart
+                extra = 'h' if evt_type == 0 else 'w'
+            elif evt_type in (1, 6):  # departure / arrival
+                extra = 'car'
+            
+            events_rows.append({
+                'time': t * timestep,
+                'type': evt_name,
+                'person': person_name,
+                'link': link_name,
+                'extra': extra
+            })
+
+        df_events = pd.DataFrame(events_rows)
+        events_path = os.path.join(output_dir, "events.csv")
+        df_events.to_csv(events_path, index=False)
+        print(f"Saved {len(events_rows)} events to {events_path}")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -478,6 +515,7 @@ if __name__ == "__main__":
     parser.add_argument("--no_load_pickle", help="Force reparsing from XML even if pickle exists.", action="store_true")
     parser.add_argument("--save_paths", help="If set, exports paths.csv containing agent paths.", action="store_true")
     parser.add_argument("--save_agents", help="If set, exports agent_metrics.csv containing individual agent statistics.", action="store_true")
+    parser.add_argument("--save_events", help="If set, records and exports MATSim-style simulation events to events.csv.", action="store_true")
     parser.add_argument("--n_hours", help="If set, sets the number of hours the simulation needs to run for. By default 24h.", default=24)
     parser.add_argument("--scale_factor", help="If set, scales the storageCapacity and outflowCapacity of the network links. By default 1.0.", default=1.0)
     parser.add_argument("--timestep", help="Time step size of each simulation step, by default 1 second.", default=1)
@@ -489,4 +527,4 @@ if __name__ == "__main__":
     if not os.path.exists(args.root_folder):
         print(f"Root folder not found: {args.root_folder}")
     else:
-        run_benchmark(args.root_folder, args.population, timestep=float(args.timestep), scale_factor=float(args.scale_factor), n_hours=int(args.n_hours), save_pickle=args.save_pickle, load_pickle=not args.no_load_pickle, save_paths=args.save_paths, save_agents=args.save_agents, output_folder=args.output_folder)
+        run_benchmark(args.root_folder, args.population, timestep=float(args.timestep), scale_factor=float(args.scale_factor), n_hours=int(args.n_hours), save_pickle=args.save_pickle, load_pickle=not args.no_load_pickle, save_paths=args.save_paths, save_agents=args.save_agents, save_events=args.save_events, output_folder=args.output_folder)

@@ -7,6 +7,27 @@ import math
 import psutil
 import os
 
+# Event type constants
+EVT_ACTEND = 0
+EVT_DEPARTURE = 1
+EVT_ENTERS_TRAFFIC = 2
+EVT_LEFT_LINK = 3
+EVT_ENTERED_LINK = 4
+EVT_LEAVES_TRAFFIC = 5
+EVT_ARRIVAL = 6
+EVT_ACTSTART = 7
+
+EVENT_TYPE_NAMES = {
+    EVT_ACTEND: 'actend',
+    EVT_DEPARTURE: 'departure',
+    EVT_ENTERS_TRAFFIC: 'enters_traffic',
+    EVT_LEFT_LINK: 'left_link',
+    EVT_ENTERED_LINK: 'entered_link',
+    EVT_LEAVES_TRAFFIC: 'leaves_traffic',
+    EVT_ARRIVAL: 'arrival',
+    EVT_ACTSTART: 'actstart',
+}
+
 class TorchDNLMATSim:
     def __init__(self, 
                  edge_static: torch.Tensor, 
@@ -15,7 +36,8 @@ class TorchDNLMATSim:
                  departure_times: torch.Tensor = None,
                  stuck_threshold: int = 10,
                  dt: float = 1.0,
-                 enable_profiling: bool = False):
+                 enable_profiling: bool = False,
+                 track_events: bool = False):
         """
         Initialize the TorchDNLMATSim simulation engine.
         
@@ -27,6 +49,7 @@ class TorchDNLMATSim:
             stuck_threshold: Time in steps an agent waits in buffer before forcing entry.
             dt: Simulation time step in seconds.
             enable_profiling: If True, enables cProfile.
+            track_events: If True, records MATSim-style simulation events.
         """
         self.device = device
         self.stuck_threshold = stuck_threshold
@@ -37,6 +60,10 @@ class TorchDNLMATSim:
         if enable_profiling:
             self.profiler = cProfile.Profile()
             self.profiler.enable()
+
+        # Event tracking
+        self.track_events = track_events
+        self.events = [] if track_events else None
 
         # Test number of interactions
         self.interactions = 0
@@ -71,7 +98,7 @@ class TorchDNLMATSim:
         self.step_edge_limits = torch.zeros(self.num_edges, device=self.device, dtype=torch.float32)
 
         # Agent State - Structure of Arrays (SOA)
-        # 0: Waiting, 1: Traveling, 2: Buffer, 3: Done
+        # Status | 0: Waiting, 1: Traveling, 2: Buffer, 3: Done
         self.status = torch.zeros(self.num_agents, device=self.device, dtype=torch.uint8)
         self.current_edge = torch.full((self.num_agents,), -1, device=self.device, dtype=torch.int32)
         self.next_edge = torch.full((self.num_agents,), -1, device=self.device, dtype=torch.int32)
@@ -117,6 +144,8 @@ class TorchDNLMATSim:
         self.agent_metrics.fill_(0)
         self.wakeup_time.copy_(self.departure_times)
         self.current_step = 0
+        if self.track_events:
+            self.events = []
         
         if self.profiler:
             self.profiler.clear()
@@ -129,6 +158,16 @@ class TorchDNLMATSim:
         #torch.floor(self.edge_capacity_accumulator, out=self.step_edge_limits)
         #self.edge_capacity_accumulator -= self.step_edge_limits
         #self.edge_capacity_accumulator.clamp_(min=0.0)
+
+    def _record_events(self, event_type, agent_ids, edge_ids):
+        """Record events for the given agents. All tensors must be on CPU or will be moved."""
+        if not self.track_events:
+            return
+        t = self.current_step
+        a_ids = agent_ids.cpu().tolist()
+        e_ids = edge_ids.cpu().tolist()
+        for a, e in zip(a_ids, e_ids):
+            self.events.append((t, event_type, a, e))
 
     def _handle_arrivals_A(self, active_indices, statuses):
         # --- A. Handle Arrivals (Status 1 -> 2) ---
@@ -145,23 +184,8 @@ class TorchDNLMATSim:
             # Update Occupancy (MATSim logic: buffer is not part of link occupancy)
             finished_edges = self.current_edge[arrived_agents]
             self.edge_occupancy -= torch.bincount(finished_edges, minlength=self.num_edges)
-
-            # 2. Update Metrics
-            lengths = self.length[finished_edges]
             
-            # Only add length if not the first link (path_ptr > 0)
-            # MATSim logic: "vehicle enters traffic" on link, but don't traverse it.
-            
-            current_ptrs = self.path_ptr[arrived_agents]
-            mask_not_first = (current_ptrs > 0)
-            
-            if mask_not_first.any():
-                 # Only add lengths for non-first links
-                 agents_to_update = arrived_agents[mask_not_first]
-                 lengths_to_add = lengths[mask_not_first]
-                 self.agent_metrics[agents_to_update, 0] += lengths_to_add
-            
-            # 3. Update Pointers
+            # 2. Update Pointers
             curr_ptrs = self.path_ptr[arrived_agents]
             next_ptrs = curr_ptrs + 1
             
@@ -175,6 +199,16 @@ class TorchDNLMATSim:
                  next_edges[valid_ptr_mask] = self.paths[v_agents, v_next_ptrs]
             
             self.next_edge[arrived_agents] = next_edges
+
+            # 3. Update length metrics
+            # Event: left_link for agents moving to another link (not leaving traffic) as per MATSim logic
+            # MATSim logic : Only add length when "EVT_LEFT_LINK"
+            has_next = (next_edges != -1)
+
+            if has_next.any():
+                self.agent_metrics[has_next, 0] += self.length[finished_edges]
+                if self.track_events:
+                    self._record_events(EVT_LEFT_LINK, arrived_agents[has_next], finished_edges[has_next])
             
             newly_buffered_agents = arrived_agents
             
@@ -209,6 +243,13 @@ class TorchDNLMATSim:
             # Metrics
             start_times = self.start_time[exiting_agents]
             self.agent_metrics[exiting_agents, 1] = (self.current_step - start_times).float()
+
+            # Events: leaves_traffic, arrival, actstart
+            if self.track_events:
+                exit_edges = self.current_edge[exiting_agents]
+                self._record_events(EVT_LEAVES_TRAFFIC, exiting_agents, exit_edges)
+                self._record_events(EVT_ARRIVAL, exiting_agents, exit_edges)
+                self._record_events(EVT_ACTSTART, exiting_agents, exit_edges)
             
             candidates = candidates[~exit_mask]
             
@@ -296,6 +337,20 @@ class TorchDNLMATSim:
             
             valid_rem = (w_curr >= 0)
 
+            # Events: starting agents get actend + departure + enters_traffic
+            if self.track_events:
+                is_start_evt = (w_curr == -1)
+                if is_start_evt.any():
+                    starting = winners[is_start_evt]
+                    start_edges = w_next[is_start_evt]
+                    self._record_events(EVT_ACTEND, starting, start_edges)
+                    self._record_events(EVT_DEPARTURE, starting, start_edges)
+                    self._record_events(EVT_ENTERS_TRAFFIC, starting, start_edges)
+                # entered_link for non-starting agents only (first link uses enters_traffic)
+                non_start_mask = (w_curr >= 0)
+                if non_start_mask.any():
+                    self._record_events(EVT_ENTERED_LINK, winners[non_start_mask], w_next[non_start_mask])
+
             # Update Occupancy
             # Decrease: Already done in (A) when moving to buffer
             # Increase: New edge
@@ -333,14 +388,13 @@ class TorchDNLMATSim:
             self.edge_capacity_accumulator.scatter_add_(0, w_curr[valid_rem].long(), -ones)
 
     def step(self):
-        self.current_step += 1
-        
         self._update_flow_limits()
         
         # 1. Unified Active Agent Search
         active_mask = (self.wakeup_time <= self.current_step)
         
         if not active_mask.any():
+            self.current_step += 1
             return
 
         active_indices = torch.nonzero(active_mask, as_tuple=True)[0]
@@ -353,11 +407,14 @@ class TorchDNLMATSim:
         candidates = self._prepare_candidates_B(active_indices, statuses, newly_buffered_agents)
             
         if candidates.numel() == 0:
+            self.current_step += 1
             return
             
         candidates = self._handle_exits_C(candidates)
             
         self._process_link_moves_D(candidates)
+
+        self.current_step += 1
 
     def stop_profiling(self):
         if self.profiler:
@@ -434,3 +491,13 @@ class TorchDNLMATSim:
         pointers = self.path_ptr[en_route_mask]
         hist = torch.histc(pointers.float(), bins=self.max_path_len, min=0, max=self.max_path_len-1)
         return hist
+
+    def get_events(self):
+        """
+        Return the list of recorded events, sorted by time.
+        Each event is a tuple: (time, event_type_id, agent_id, edge_id).
+        Use EVENT_TYPE_NAMES to map type_id to string name.
+        """
+        if self.events is None:
+            return []
+        return sorted(self.events, key=lambda e: (e[0], e[1]))
