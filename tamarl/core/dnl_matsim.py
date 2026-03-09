@@ -16,6 +16,7 @@ EVT_ENTERED_LINK = 4
 EVT_LEAVES_TRAFFIC = 5
 EVT_ARRIVAL = 6
 EVT_ACTSTART = 7
+EVT_STUCKANDABORT = 8
 
 EVENT_TYPE_NAMES = {
     EVT_ACTEND: 'actend',
@@ -26,6 +27,7 @@ EVENT_TYPE_NAMES = {
     EVT_LEAVES_TRAFFIC: 'leaves_traffic',
     EVT_ARRIVAL: 'arrival',
     EVT_ACTSTART: 'actstart',
+    EVT_STUCKANDABORT: 'stuckAndAbort',
 }
 
 class TorchDNLMATSim:
@@ -34,6 +36,7 @@ class TorchDNLMATSim:
                  paths: torch.Tensor,
                  device: str = 'cuda',
                  departure_times: torch.Tensor = None,
+                 edge_endpoints: torch.Tensor = None,
                  stuck_threshold: int = 10,
                  dt: float = 1.0,
                  enable_profiling: bool = False,
@@ -46,6 +49,7 @@ class TorchDNLMATSim:
             paths: Tensor [A, MaxPathLen] -> Pre-calculated path indices for each agent.
             device: Device to run on ('cuda' or 'cpu').
             departure_times: Tensor [A] -> Departure times for each agent.
+            edge_endpoints: Tensor [E, 2] -> [from_node, to_node] for connectivity validation. Optional.
             stuck_threshold: Time in steps an agent waits in buffer before forcing entry.
             dt: Simulation time step in seconds.
             enable_profiling: If True, enables cProfile.
@@ -67,6 +71,12 @@ class TorchDNLMATSim:
 
         # Test number of interactions
         self.interactions = 0
+        self.stuck_count = 0
+
+        # Edge connectivity (needed for path validation)
+        if edge_endpoints is None:
+            raise ValueError("edge_endpoints is mandatory for path validation.")
+        self.edge_endpoints = edge_endpoints.to(device).int()
 
         # Move constants to device
         self.edge_static = edge_static.to(device)
@@ -88,7 +98,7 @@ class TorchDNLMATSim:
         self.flow_capacity_per_step = self.edge_static[:, 3]
         
         # Free flow travel time (steps)
-        self.ff_travel_time_steps = torch.ceil(self.edge_static[:, 4] / self.dt).long().contiguous()
+        self.ff_travel_time_steps = torch.floor(self.edge_static[:, 4] / self.dt).long().contiguous()
 
         # Edge Dynamic State [E]
         self.edge_occupancy = torch.zeros(self.num_edges, device=self.device, dtype=torch.int32)
@@ -144,20 +154,12 @@ class TorchDNLMATSim:
         self.agent_metrics.fill_(0)
         self.wakeup_time.copy_(self.departure_times)
         self.current_step = 0
+        self.stuck_count = 0
         if self.track_events:
             self.events = []
         
         if self.profiler:
             self.profiler.clear()
-
-    def _update_flow_limits(self):
-        # 0. Update Flow Capacity Limits
-        self.edge_capacity_accumulator += self.flow_capacity_per_step
-        # Avoid banking inflow to infinity if it's not used
-        torch.minimum(self.edge_capacity_accumulator, self.flow_capacity_per_step, out=self.edge_capacity_accumulator)
-        #torch.floor(self.edge_capacity_accumulator, out=self.step_edge_limits)
-        #self.edge_capacity_accumulator -= self.step_edge_limits
-        #self.edge_capacity_accumulator.clamp_(min=0.0)
 
     def _record_events(self, event_type, agent_ids, edge_ids):
         """Record events for the given agents. All tensors must be on CPU or will be moved."""
@@ -169,250 +171,339 @@ class TorchDNLMATSim:
         for a, e in zip(a_ids, e_ids):
             self.events.append((t, event_type, a, e))
 
-    def _handle_arrivals_A(self, active_indices, statuses):
-        # --- A. Handle Arrivals (Status 1 -> 2) ---
-        arrival_submask = (statuses == 1)
-        arrived_agents = active_indices[arrival_submask]
+    # =========================================================================
+    # A. Process Nodes (Capacity Buffer -> Downstream Spatial Buffer)
+    # =========================================================================
+    def _process_nodes_A(self):
+        """
+        Move agents from upstream capacity buffer (status=2) to downstream 
+        spatial buffer (status=1).
         
-        newly_buffered_agents = None
+        Constraints for capacity -> downstream:
+        - There is enough free-space (storage capacity) on downstream link
+        - If waiting_time > gridlock_threshold, force entry regardless of space
         
-        if arrived_agents.numel() > 0:
-            # 1. Update State -> Buffer (2)
-            self.status[arrived_agents] = 2
-            self.stuck_since[arrived_agents] = self.current_step
-            
-            # Update Occupancy (MATSim logic: buffer is not part of link occupancy)
-            finished_edges = self.current_edge[arrived_agents]
-            self.edge_occupancy -= torch.bincount(finished_edges, minlength=self.num_edges)
-            
-            # 2. Update Pointers
-            curr_ptrs = self.path_ptr[arrived_agents]
-            next_ptrs = curr_ptrs + 1
-            
-            # Check validity
-            next_edges = torch.full_like(curr_ptrs, -1, dtype=torch.int32)
-            valid_ptr_mask = next_ptrs < self.max_path_len
-            
-            if valid_ptr_mask.any():
-                 v_agents = arrived_agents[valid_ptr_mask]
-                 v_next_ptrs = next_ptrs[valid_ptr_mask]
-                 next_edges[valid_ptr_mask] = self.paths[v_agents, v_next_ptrs]
-            
-            self.next_edge[arrived_agents] = next_edges
+        Events emitted: left_link, entered_link
+        """
+        buffer_mask = (self.status == 2) & (self.wakeup_time <= self.current_step)
+        if not buffer_mask.any():
+            return
 
-            # 3. Update length metrics
-            # Event: left_link for agents moving to another link (not leaving traffic) as per MATSim logic
-            # MATSim logic : Only add length when "EVT_LEFT_LINK"
-            has_next = (next_edges != -1)
+        buffer_agents = torch.nonzero(buffer_mask, as_tuple=True)[0]
+        b_next = self.next_edge[buffer_agents]
 
-            if has_next.any():
-                self.agent_metrics[has_next, 0] += self.length[finished_edges]
-                if self.track_events:
-                    self._record_events(EVT_LEFT_LINK, arrived_agents[has_next], finished_edges[has_next])
-            
-            newly_buffered_agents = arrived_agents
-            
-        return newly_buffered_agents
+        # Process movers (next_edge != -1)
+        move_mask = (b_next != -1)
+        movers = buffer_agents[move_mask]
+        if movers.numel() == 0:
+            return
 
-    def _prepare_candidates_B(self, active_indices, statuses, newly_buffered_agents):
-        # --- B. Handle Departures (Status 0 & 2) ---
-        existing_mask = (statuses != 1) & (statuses != 3) 
-        existing_candidates = active_indices[existing_mask]
+        m_next = b_next[move_mask]
+        m_curr = self.current_edge[movers]
 
-        if newly_buffered_agents is not None:
-            candidates = torch.cat([existing_candidates, newly_buffered_agents])
-        else:
-            candidates = existing_candidates
-            
-        return candidates
+        # Dynamic connectivity check: to_node[curr] must equal from_node[next]
+        to_of_curr = self.edge_endpoints[m_curr.long(), 1]
+        from_of_next = self.edge_endpoints[m_next.long(), 0]
+        connected = (to_of_curr == from_of_next)
+        disconnected = ~connected
 
-    def _handle_exits_C(self, candidates):
-        # --- C. Handle Exits ---
-        c_next_edges = self.next_edge[candidates]
-        exit_mask = (c_next_edges == -1)
-        
-        if exit_mask.any():
-            exiting_agents = candidates[exit_mask]
-            
-            # Free Capacity
-            # MATSim logic: occupancy already removed when entering buffer (A)
-            
-            self.status[exiting_agents] = 3
-            self.wakeup_time[exiting_agents] = self.infinity 
-            
-            # Metrics
-            start_times = self.start_time[exiting_agents]
-            self.agent_metrics[exiting_agents, 1] = (self.current_step - start_times).float()
+        if disconnected.any():
+            stuck_agents = movers[disconnected]
+            num_stuck = stuck_agents.numel()
+            self.stuck_count += num_stuck
 
-            # Events: leaves_traffic, arrival, actstart
+            # stuckAndAbort: remove from network
+            self.status[stuck_agents] = 3
+            self.wakeup_time[stuck_agents] = self.infinity
+            start_times = self.start_time[stuck_agents]
+            self.agent_metrics[stuck_agents, 1] = (self.current_step - start_times).float()
+
             if self.track_events:
-                exit_edges = self.current_edge[exiting_agents]
-                self._record_events(EVT_LEAVES_TRAFFIC, exiting_agents, exit_edges)
-                self._record_events(EVT_ARRIVAL, exiting_agents, exit_edges)
-                self._record_events(EVT_ACTSTART, exiting_agents, exit_edges)
-            
-            candidates = candidates[~exit_mask]
-            
-        return candidates
+                self._record_events(EVT_STUCKANDABORT, stuck_agents, m_curr[disconnected])
 
-    def _process_link_moves_D(self, candidates):
-        
-        nb_candidates = candidates.numel() 
+            # Keep only connected movers
+            movers = movers[connected]
+            m_next = m_next[connected]
+            m_curr = m_curr[connected]
 
-        if nb_candidates == 0:
+        if movers.numel() == 0:
             return
-        
-        self.interactions += nb_candidates # All candidates are interactions
 
-        # --- D. Link Entry / Change ---
-        target_edges = self.next_edge[candidates]
-        current_edges = self.current_edge[candidates]
-        c_arrival_times = self.arrival_time[candidates]
-        
-        # 1. Sort Candidates (Flow Check Grouping + FIFO)
-        # Composite Key: (current_edge + 1) * SCALE + arrival_time
-        # Use large scale to ensure primary sort key dominance
-        sort_keys = (current_edges.long() + 1) * 1000000 + c_arrival_times.long()
-        sort_idx = torch.argsort(sort_keys, stable=True)
-        
-        candidates_sorted = candidates[sort_idx]
-        curr_sorted = current_edges[sort_idx]
-        targ_sorted = target_edges[sort_idx]
-        
-        # 2. Check Flow Capacity (Outflow)
-        unique_u, _, counts_u = torch.unique_consecutive(curr_sorted, return_counts=True, return_inverse=True)
-        unique_starts = torch.zeros_like(unique_u)
-        unique_starts[1:] = torch.cumsum(counts_u, dim=0)[:-1]
-        item_group_starts = torch.repeat_interleave(unique_starts, counts_u)
-        ranks = torch.arange(candidates_sorted.size(0), device=self.device) - item_group_starts
-        
-        limits = torch.zeros_like(curr_sorted, dtype=torch.float32)
-        valid_mask = (curr_sorted >= 0)
+        m_stuck = self.stuck_since[movers]
 
-        if valid_mask.any():
-            active_acc = self.edge_capacity_accumulator[curr_sorted[valid_mask]]
-            limits[valid_mask] = torch.ceil(torch.clamp(active_acc, min=0.0))
+        # Sort by target edge for storage capacity grouping
+        sort_idx = torch.argsort(m_next, stable=True)
+        movers_s = movers[sort_idx]
+        next_s = m_next[sort_idx]
+        curr_s = m_curr[sort_idx]
+        stuck_s = m_stuck[sort_idx]
 
-        limits[~valid_mask] = 999999 # Status 0: Infinite flow
-        
-        flow_pass_mask = (ranks < limits)
-        candidates_s2 = candidates_sorted[flow_pass_mask]
-        self.interactions += (~flow_pass_mask).sum().item() # Blocked agents
-        
-        if candidates_s2.numel() == 0:
-            return
-            
-        targ_s2 = targ_sorted[flow_pass_mask]
-        stuck_s2 = self.stuck_since[candidates_s2]
-        
-        # 3. Check Storage Capacity (Inflow)
-        sort_idx_2 = torch.argsort(targ_s2, stable=True)
-        c_final = candidates_s2[sort_idx_2]
-        t_final = targ_s2[sort_idx_2]
-        stuck_final = stuck_s2[sort_idx_2]
-        
-        unique_v, _, counts_v = torch.unique_consecutive(t_final, return_counts=True, return_inverse=True)
+        # Storage capacity check
+        unique_v, _, counts_v = torch.unique_consecutive(next_s, return_counts=True, return_inverse=True)
         v_starts = torch.zeros_like(unique_v)
         v_starts[1:] = torch.cumsum(counts_v, dim=0)[:-1]
         item_v_starts = torch.repeat_interleave(v_starts, counts_v)
-        inflow_ranks_final = torch.arange(c_final.size(0), device=self.device) - item_v_starts
-        
-        caps = self.storage_capacity[t_final]
-        occs = self.edge_occupancy[t_final]
+        inflow_ranks = torch.arange(movers_s.size(0), device=self.device) - item_v_starts
+
+        caps = self.storage_capacity[next_s]
+        occs = self.edge_occupancy[next_s]
         avail = caps - occs
-        
-        is_stuck = (self.current_step - stuck_final) > self.stuck_threshold
-        storage_pass = is_stuck | (inflow_ranks_final < avail)
 
-        self.interactions += (~storage_pass).sum().item() # Blocked agents cause of storage capacity
-        
-        winners = c_final[storage_pass]
-        
+        is_stuck = (self.current_step - stuck_s) > self.stuck_threshold
+        storage_pass = is_stuck | (inflow_ranks < avail)
+
+        winners = movers_s[storage_pass]
+
         if winners.numel() > 0:
+            w_curr = curr_s[storage_pass]
+            w_next = next_s[storage_pass]
 
-            self.interactions += winners.numel() # Agents that interact with the next link (that pass)
-
-            w_curr = self.current_edge[winners]
-            w_next = self.next_edge[winners]
-            
-            valid_rem = (w_curr >= 0)
-
-            # Events: starting agents get actend + departure + enters_traffic
+            # Events: left_link (leaving upstream link) + entered_link (entering downstream)
             if self.track_events:
-                is_start_evt = (w_curr == -1)
-                if is_start_evt.any():
-                    starting = winners[is_start_evt]
-                    start_edges = w_next[is_start_evt]
-                    self._record_events(EVT_ACTEND, starting, start_edges)
-                    self._record_events(EVT_DEPARTURE, starting, start_edges)
-                    self._record_events(EVT_ENTERS_TRAFFIC, starting, start_edges)
-                # entered_link for non-starting agents only (first link uses enters_traffic)
-                non_start_mask = (w_curr >= 0)
-                if non_start_mask.any():
-                    self._record_events(EVT_ENTERED_LINK, winners[non_start_mask], w_next[non_start_mask])
+                self._record_events(EVT_LEFT_LINK, winners, w_curr)
+                self._record_events(EVT_ENTERED_LINK, winners, w_next)
 
-            # Update Occupancy
-            # Decrease: Already done in (A) when moving to buffer
-            # Increase: New edge
+            # Update occupancy: add to downstream link
             self.edge_occupancy += torch.bincount(w_next, minlength=self.num_edges)
-            
-            # Update State
-            self.status[winners] = 1 # Traveling
+
+            # Update state
+            self.status[winners] = 1  # Traveling (spatial buffer of downstream link)
             self.current_edge[winners] = w_next
-            
-            # Increment Pointer (only if was on edge)
-            self.path_ptr[winners[valid_rem]] += 1
-            
-            # Arrival Time
+            self.path_ptr[winners] += 1
+
+            # Arrival time = current_step + freeflow_travel_time of downstream link
             ff_times = self.ff_travel_time_steps[w_next]
-            
-            # Modify for First Link Start
-            # MATSim Logic : "vehicle enters traffic" on first link of their path, but don't traverse it.
-            
-            # w_curr (defined at start of block) holds previous edge index (if == -1, they are starting)
-            is_start = (w_curr == -1)
-            
-            arrival_times = self.current_step + ff_times
-            
-            if is_start.any():
-                # Agents starting: arrival time = current step (instant arrival at end of link)
-                arrival_times[is_start] = self.current_step
-            
-            self.arrival_time[winners] = arrival_times.int()
-            
-            # Wakeup Time
-            self.wakeup_time[winners] = arrival_times.int()
+            arrival_times = (self.current_step + ff_times).int()
+            self.arrival_time[winners] = arrival_times
+            self.wakeup_time[winners] = arrival_times
 
-            # Remove 1.0 from flow accumulator for each winners that went through
-            ones = torch.ones(winners[valid_rem].size(0), device=self.device)
-            self.edge_capacity_accumulator.scatter_add_(0, w_curr[valid_rem].long(), -ones)
+    # =========================================================================
+    # B. Accumulate Flow + Process Links (Spatial -> Capacity) + Handle Arrivals
+    # =========================================================================
+    def _process_links_B(self):
+        """
+        MATSim "moveLinks" phase:
+        (a) Accumulate flow capacity on all edges.
+        (b) Move agents from spatial buffer (status=1) to capacity buffer (status=2)
+            if they satisfy freeflow_travel_time and flow capacity constraints.
+        (c) Handle arrivals: agents in buffer with next_edge == -1 exit the network.
+        """
+        # (a) Accumulate flow capacity (MATSim: updateFastFlowAccumulation)
+        # The ceiling is flow_cap_per_step MINUS the consumption of vehicles already in buffer
+        buffer_mask_all = (self.status == 2)
+        if buffer_mask_all.any():
+            buffer_edges = self.current_edge[buffer_mask_all].long()
+            buffer_counts = torch.bincount(buffer_edges, minlength=self.num_edges).float()
+        else:
+            buffer_counts = torch.zeros(self.num_edges, device=self.device)
+        
+        remaining_flow_cap = self.flow_capacity_per_step - buffer_counts
+        
+        self.edge_capacity_accumulator += self.flow_capacity_per_step
+        torch.minimum(self.edge_capacity_accumulator, remaining_flow_cap, out=self.edge_capacity_accumulator)
 
+        # (b) moveQueueToBuffer: spatial -> capacity
+        spatial_mask = (self.status == 1) & (self.wakeup_time <= self.current_step)
+        if spatial_mask.any():
+            arrived_agents = torch.nonzero(spatial_mask, as_tuple=True)[0]
+
+            # Sort by (current_edge, arrival_time) for FIFO per-link ordering
+            a_edges = self.current_edge[arrived_agents]
+            a_arrival = self.arrival_time[arrived_agents]
+            sort_keys = a_edges.long() * 1000000 + a_arrival.long()
+            sort_idx = torch.argsort(sort_keys, stable=True)
+
+            arrived_sorted = arrived_agents[sort_idx]
+            edges_sorted = a_edges[sort_idx]
+
+            # --- Shared computations (done ONCE for all candidates) ---
+            ptrs_sorted = self.path_ptr[arrived_sorted]
+            next_ptrs_sorted = ptrs_sorted + 1
+
+            # Determine exiter vs mover: exiter if next path step is beyond path or padding
+            is_exiter = (next_ptrs_sorted >= self.max_path_len)
+            if not is_exiter.all():
+                valid = ~is_exiter
+                path_next = self.paths[arrived_sorted[valid], next_ptrs_sorted[valid]]
+                is_exiter[valid] = (path_next == -1)
+            is_mover = ~is_exiter
+
+            # --- Per-link grouping ---
+            unique_e, _, counts_e = torch.unique_consecutive(
+                edges_sorted, return_counts=True, return_inverse=True)
+            e_starts = torch.zeros_like(unique_e)
+            e_starts[1:] = torch.cumsum(counts_e, dim=0)[:-1]
+            item_starts = torch.repeat_interleave(e_starts, counts_e)
+
+            # --- FIFO blocking: a failing mover blocks all agents behind it ---
+            # Grouped cumsum of is_mover → mover_rank (1-indexed per-link)
+            mover_int = is_mover.int()
+            global_cs_mover = torch.cumsum(mover_int, dim=0)
+            offset_mover = global_cs_mover[item_starts] - mover_int[item_starts]
+            mover_rank = global_cs_mover - offset_mover
+
+            # Flow limits per agent (from their edge)
+            flow_limits = torch.ceil(torch.clamp(
+                self.edge_capacity_accumulator[edges_sorted], min=0.0))
+
+            # A mover fails if its per-link rank exceeds the flow limit
+            mover_fails = is_mover & (mover_rank > flow_limits)
+
+            # Grouped cumsum of failures → blocked if any prior mover on same link failed
+            fails_int = mover_fails.int()
+            global_cs_fails = torch.cumsum(fails_int, dim=0)
+            offset_fails = global_cs_fails[item_starts] - fails_int[item_starts]
+            blocked = (global_cs_fails - offset_fails) > 0
+
+            processable = ~blocked
+            proc_exit_mask = processable & is_exiter
+            proc_win_mask = processable & is_mover
+
+            has_exiters = proc_exit_mask.any()
+            has_winners = proc_win_mask.any()
+
+            if has_exiters or has_winners:
+                # Common: remove all processable agents from link occupancy
+                all_proc_edges = edges_sorted[processable]
+                self.edge_occupancy -= torch.bincount(
+                    all_proc_edges, minlength=self.num_edges)
+
+                # Common: add distance for traversed links (path_ptr > 0)
+                all_proc_agents = arrived_sorted[processable]
+                all_proc_ptrs = ptrs_sorted[processable]
+                traversed = (all_proc_ptrs > 0)
+                if traversed.any():
+                    self.agent_metrics[all_proc_agents[traversed], 0] += \
+                        self.length[all_proc_edges[traversed]]
+
+            # --- Exiters: leave the network ---
+            if has_exiters:
+                exiters = arrived_sorted[proc_exit_mask]
+                self.status[exiters] = 3
+                self.wakeup_time[exiters] = self.infinity
+                self.agent_metrics[exiters, 1] = \
+                    (self.current_step - self.start_time[exiters]).float()
+
+                if self.track_events:
+                    exit_edges = edges_sorted[proc_exit_mask]
+                    self._record_events(EVT_LEAVES_TRAFFIC, exiters, exit_edges)
+                    self._record_events(EVT_ARRIVAL, exiters, exit_edges)
+                    self._record_events(EVT_ACTSTART, exiters, exit_edges)
+
+            # --- Winners: move to capacity buffer ---
+            if has_winners:
+                winners = arrived_sorted[proc_win_mask]
+                w_edges = edges_sorted[proc_win_mask]
+
+                # Consume flow capacity
+                ones = torch.ones(winners.size(0), device=self.device)
+                self.edge_capacity_accumulator.scatter_add_(0, w_edges.long(), -ones)
+
+                self.status[winners] = 2
+                self.stuck_since[winners] = self.current_step
+
+                # Compute next_edge (reusing pre-computed next_ptrs_sorted)
+                w_next_ptrs = next_ptrs_sorted[proc_win_mask]
+                next_edges = torch.full((winners.size(0),), -1,
+                                        device=self.device, dtype=torch.int32)
+                valid_ptr = w_next_ptrs < self.max_path_len
+                if valid_ptr.any():
+                    next_edges[valid_ptr] = self.paths[
+                        winners[valid_ptr], w_next_ptrs[valid_ptr]]
+                self.next_edge[winners] = next_edges
+
+    # =========================================================================
+    # C. Schedule Demand (New agents enter the network)
+    # =========================================================================
+    def _schedule_demand_C(self):
+        """
+        Process waiting agents (status=0) whose departure time has arrived.
+        They enter the network directly into the capacity buffer of their 
+        first link (no spatial traversal required).
+        
+        Constraints:
+        - Flow capacity of the first link must be available (FIFO order)
+        
+        Events emitted: actend, departure (at departure time), enters_traffic (when entering)
+        """
+        demand_mask = (self.status == 0) & (self.wakeup_time <= self.current_step)
+        if not demand_mask.any():
+            return
+
+        waiting_agents = torch.nonzero(demand_mask, as_tuple=True)[0]
+        first_edges = self.next_edge[waiting_agents]
+
+        # Events: actend + departure fire at exact departure_time (before flow check)
+        if self.track_events:
+            departing_now = (self.departure_times[waiting_agents] == self.current_step)
+            if departing_now.any():
+                dep_agents = waiting_agents[departing_now]
+                dep_edges = first_edges[departing_now]
+                self._record_events(EVT_ACTEND, dep_agents, dep_edges)
+                self._record_events(EVT_DEPARTURE, dep_agents, dep_edges)
+
+        # Sort by (first_edge, departure_time) for FIFO per-link ordering
+        dep_times = self.departure_times[waiting_agents]
+        sort_keys = first_edges.long() * 1000000 + dep_times.long()
+        sort_idx = torch.argsort(sort_keys, stable=True)
+
+        agents_sorted = waiting_agents[sort_idx]
+        edges_sorted = first_edges[sort_idx]
+
+        # Flow capacity check
+        unique_e, _, counts_e = torch.unique_consecutive(edges_sorted, return_counts=True, return_inverse=True)
+        e_starts = torch.zeros_like(unique_e)
+        e_starts[1:] = torch.cumsum(counts_e, dim=0)[:-1]
+        item_starts = torch.repeat_interleave(e_starts, counts_e)
+        ranks = torch.arange(agents_sorted.size(0), device=self.device) - item_starts
+
+        flow_limits = torch.ceil(torch.clamp(self.edge_capacity_accumulator[edges_sorted], min=0.0))
+        flow_pass = (ranks < flow_limits)
+
+        winners = agents_sorted[flow_pass]
+        if winners.numel() == 0:
+            return
+
+        w_edges = self.next_edge[winners]
+
+        # Consume flow capacity
+        ones = torch.ones(winners.size(0), device=self.device)
+        self.edge_capacity_accumulator.scatter_add_(0, w_edges.long(), -ones)
+
+        # Events: enters_traffic (only for agents that actually enter)
+        if self.track_events:
+            self._record_events(EVT_ENTERS_TRAFFIC, winners, w_edges)
+
+        # Enter capacity buffer directly (status=2, no spatial traversal)
+        self.status[winners] = 2
+        self.current_edge[winners] = w_edges
+        self.stuck_since[winners] = self.current_step
+
+        # Compute next_edge
+        next_ptrs = self.path_ptr[winners] + 1
+        next_edges = torch.full((winners.size(0),), -1, device=self.device, dtype=torch.int32)
+        valid_ptr_mask = next_ptrs < self.max_path_len
+        if valid_ptr_mask.any():
+            v_agents = winners[valid_ptr_mask]
+            v_next_ptrs = next_ptrs[valid_ptr_mask]
+            next_edges[valid_ptr_mask] = self.paths[v_agents, v_next_ptrs]
+        self.next_edge[winners] = next_edges
+
+        # Note: occupancy NOT added here (buffer is not part of link occupancy)
+        # Note: first link distance NOT added (agent didn't traverse spatial buffer)
+
+    # =========================================================================
+    # Step
+    # =========================================================================
     def step(self):
-        self._update_flow_limits()
-        
-        # 1. Unified Active Agent Search
-        active_mask = (self.wakeup_time <= self.current_step)
-        
-        if not active_mask.any():
-            self.current_step += 1
-            return
+        # A. Process Nodes (Capacity -> Downstream Spatial)
+        self._process_nodes_A()
 
-        active_indices = torch.nonzero(active_mask, as_tuple=True)[0]
-        
-        # Split by status
-        statuses = self.status[active_indices]
-        
-        newly_buffered_agents = self._handle_arrivals_A(active_indices, statuses)
-        
-        candidates = self._prepare_candidates_B(active_indices, statuses, newly_buffered_agents)
-            
-        if candidates.numel() == 0:
-            self.current_step += 1
-            return
-            
-        candidates = self._handle_exits_C(candidates)
-            
-        self._process_link_moves_D(candidates)
+        # B. Accumulate Flow + Process Links (Spatial -> Capacity) + Handle Arrivals
+        self._process_links_B()
+
+        # C. Schedule Demand (New agents enter network)
+        self._schedule_demand_C()
 
         self.current_step += 1
 
@@ -448,6 +539,9 @@ class TorchDNLMATSim:
         else:
             print("Profiling was not enabled.")
         
+        if self.stuck_count > 0:
+            print(f"⚠️  [WARNING] | {self.stuck_count} agents stuck/removed | Action: Verify paths/network")
+
         return compute_time, mem_mb, vram_mb
 
     def get_snapshot(self):

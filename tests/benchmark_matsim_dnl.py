@@ -310,6 +310,9 @@ def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_facto
     edge_static_list = [e['attr'] for e in edges_data]
     edge_static = torch.tensor(edge_static_list, dtype=torch.float32)
     
+    # Edge connectivity for path validation
+    edge_endpoints = torch.tensor([[e['u'], e['v']] for e in edges_data], dtype=torch.int32)
+    
     # Free edges_data
     del edges_data
     gc.collect()
@@ -354,6 +357,7 @@ def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_facto
         paths_tensor, 
         device=device, 
         departure_times=departure_times, 
+        edge_endpoints=edge_endpoints,
         dt=timestep, 
         stuck_threshold=10,
         enable_profiling=True,
