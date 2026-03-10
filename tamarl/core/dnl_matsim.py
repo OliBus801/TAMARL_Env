@@ -39,6 +39,7 @@ class TorchDNLMATSim:
                  edge_endpoints: torch.Tensor = None,
                  stuck_threshold: int = 10,
                  dt: float = 1.0,
+                 seed: int = None,
                  enable_profiling: bool = False,
                  track_events: bool = False):
         """
@@ -58,6 +59,14 @@ class TorchDNLMATSim:
         self.device = device
         self.stuck_threshold = stuck_threshold
         self.dt = dt
+        
+        # Random number generator for probabilistic upstream link selection
+        self.rng = torch.Generator(device=self.device)
+        self.seed = seed
+        if seed is not None:
+            self.rng.manual_seed(seed)
+        else:
+            self.rng.seed()
         
         # Profiling
         self.profiler = None
@@ -157,6 +166,8 @@ class TorchDNLMATSim:
         self.wakeup_time.copy_(self.departure_times)
         self.current_step = 0
         self.stuck_count = 0
+        if self.seed is not None:
+            self.rng.manual_seed(self.seed)
         if self.track_events:
             self.events = []
         
@@ -276,8 +287,34 @@ class TorchDNLMATSim:
 
         m_stuck = self.stuck_since[movers]
 
-        # Sort by target edge for storage capacity grouping
-        sort_idx = torch.argsort(m_next, stable=True)
+        # MATSim: emptyBufferAfterBufferRandomDistribution
+        # Upstream links feeding the same node are randomly prioritized (weighted by capacity)
+        # Then all agents from the selected upstream link are processed before the next.
+        # 
+        # Vectorized approach: assign a random priority per unique upstream link,
+        # such that links with higher capacity have higher priority on average.
+        # Sort movers by (downstream_link, upstream_random_priority) so the
+        # randomly-selected link's agents come first in the storage capacity check.
+        
+        # Random priority per unique upstream link: rand() * capacity (weighted random)
+        unique_curr = torch.unique(m_curr)
+        rand_vals = torch.rand(unique_curr.size(0), generator=self.rng)
+        weighted_rand = rand_vals * self.flow_capacity_per_step[unique_curr.long()]
+        
+        # Map random priority back to each mover via their current_edge
+        # Create a lookup: edge_idx -> weighted_rand value
+        edge_priority = torch.zeros(self.num_edges, device=self.device)
+        edge_priority[unique_curr.long()] = weighted_rand.to(self.device)
+        mover_priority = edge_priority[m_curr.long()]
+
+        # Sort by (downstream_link, -upstream_priority, stuck_time) 
+        # Higher priority links come first (negate for ascending sort)
+        # Within same upstream link, process agents in order (by agent id for stability)
+        sort_keys = (m_next.long() * 10000000000
+                     - (mover_priority * 1000000).long() * 10000
+                     + torch.arange(movers.size(0), device=self.device))
+        sort_idx = torch.argsort(sort_keys, stable=True)
+
         movers_s = movers[sort_idx]
         next_s = m_next[sort_idx]
         curr_s = m_curr[sort_idx]

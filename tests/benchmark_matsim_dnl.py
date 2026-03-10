@@ -170,7 +170,7 @@ def get_memory_usage():
     mem_info = process.memory_info()
     return mem_info.rss / 1024 / 1024 # MB
 
-def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_factor=1.0, n_hours=24, save_pickle=False, load_pickle=True, save_paths=False, save_agents=False, save_events=False, output_folder="output"):
+def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_factor=1.0, n_hours=24, save_pickle=False, load_pickle=True, save_paths=False, save_agents=False, save_events=False, output_folder="output", seed=None):
     
     process = psutil.Process(os.getpid())
     def get_mem():
@@ -358,7 +358,8 @@ def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_facto
         device=device, 
         departure_times=departure_times, 
         edge_endpoints=edge_endpoints,
-        dt=timestep, 
+        dt=timestep,
+        seed=seed, 
         stuck_threshold=10,
         enable_profiling=True,
         track_events=save_events
@@ -524,6 +525,7 @@ if __name__ == "__main__":
     parser.add_argument("--scale_factor", help="If set, scales the storageCapacity and outflowCapacity of the network links. By default 1.0.", default=1.0)
     parser.add_argument("--timestep", help="Time step size of each simulation step, by default 1 second.", default=1)
     parser.add_argument("--output_folder", help="Output folder for results.", default="output")
+    parser.add_argument("--seed", help="Seed for random number generator. Used in priority calculation", default=None)
 
 
     args = parser.parse_args()
@@ -531,4 +533,4 @@ if __name__ == "__main__":
     if not os.path.exists(args.root_folder):
         print(f"Root folder not found: {args.root_folder}")
     else:
-        run_benchmark(args.root_folder, args.population, timestep=float(args.timestep), scale_factor=float(args.scale_factor), n_hours=int(args.n_hours), save_pickle=args.save_pickle, load_pickle=not args.no_load_pickle, save_paths=args.save_paths, save_agents=args.save_agents, save_events=args.save_events, output_folder=args.output_folder)
+        run_benchmark(args.root_folder, args.population, timestep=float(args.timestep), scale_factor=float(args.scale_factor), n_hours=int(args.n_hours), save_pickle=args.save_pickle, load_pickle=not args.no_load_pickle, save_paths=args.save_paths, save_agents=args.save_agents, save_events=args.save_events, output_folder=args.output_folder, seed=int(args.seed))
