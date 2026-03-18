@@ -63,7 +63,8 @@ class TorchDNLMATSim:
         self.dt = dt
         
         # Random number generator for probabilistic upstream link selection
-        self.rng = torch.Generator(device=self.device)
+        # Using a CPU generator, but need to monitor performance impact. -OB 
+        self.rng = torch.Generator(device='cpu')
         self.seed = seed
         if seed is not None:
             self.rng.manual_seed(seed)
@@ -304,7 +305,7 @@ class TorchDNLMATSim:
         
         # Random priority per unique upstream link: rand() * capacity (weighted random)
         unique_curr = torch.unique(m_curr)
-        rand_vals = torch.rand(unique_curr.size(0), generator=self.rng)
+        rand_vals = torch.rand(unique_curr.size(0), generator=self.rng).to(self.device)
         weighted_rand = rand_vals * self.flow_capacity_per_step[unique_curr.long()]
         
         # Map random priority back to each mover via their current_edge
