@@ -8,7 +8,7 @@ import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from tamarl.core.dnl import TorchDNL
-from tamarl.core.plot_histogram import plot_agent_status
+from tamarl.visualisation.plot_histogram import plot_agent_status_from_arrays as plot_agent_status
 
 def run_benchmark():
     # Setup

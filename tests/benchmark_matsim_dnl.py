@@ -11,7 +11,7 @@ import pandas as pd
 import pickle
 import gc
 from tamarl.core.dnl_matsim import TorchDNLMATSim, EVENT_TYPE_NAMES
-from tamarl.core.plot_histogram import plot_agent_status
+from tamarl.visualisation.plot_histogram import plot_leg_histogram, export_leg_histogram_csv
 
 def sec_to_hms(seconds):
     """Convert seconds to HH:MM:SS format."""
@@ -170,7 +170,7 @@ def get_memory_usage():
     mem_info = process.memory_info()
     return mem_info.rss / 1024 / 1024 # MB
 
-def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_factor=1.0, n_hours=24, save_pickle=False, load_pickle=True, save_paths=False, save_agents=False, save_events=False, output_folder="output", seed=None):
+def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_factor=1.0, start_hour=0, end_hour=24, save_pickle=False, load_pickle=True, save_paths=False, save_agents=False, save_events=False, track_events=True, output_folder="output", seed=None):
     
     process = psutil.Process(os.getpid())
     def get_mem():
@@ -352,6 +352,9 @@ def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_facto
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Running Simulation on {device}...")
     
+    # If save_events is requested, we must track events
+    effective_track_events = track_events or save_events
+    
     dnl = TorchDNLMATSim(
         edge_static, 
         paths_tensor, 
@@ -362,17 +365,20 @@ def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_facto
         seed=seed, 
         stuck_threshold=10,
         enable_profiling=True,
-        track_events=save_events
+        track_events=effective_track_events
     )
     
     # 5. Simulation Loop
-    max_steps = n_hours * 3600 
+    max_steps = int(end_hour * 3600)
+    start_step = int(start_hour * 3600)
+    
+    dnl.current_step = start_step
     
     sim_start = time.time()
-    step = 0
+    step = start_step
     active = True
     
-    print("Starting simulation loop...")
+    print(f"Starting simulation loop... ({start_hour}h -> {end_hour}h)")
     t0 = time.time()
     while active and step < max_steps:
         dnl.step()
@@ -391,7 +397,7 @@ def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_facto
             interactions = dnl.interactions
             dnl.interactions = 0
 
-            print(f"Hour {step//3600} | En Route: {en_route} | Speed: {ms_per_step:.2f} ms/step | Interactions: {interactions} | Elapsed time : {dt:.2f}s")
+            print(f"Hour {step//3600} ({step//3600}h) | En Route: {en_route} | Speed: {ms_per_step:.2f} ms/step | Interactions: {interactions} | Elapsed time : {dt:.2f}s")
             t0 = time.time()
             
         if step % 100 == 0:
@@ -463,23 +469,20 @@ def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_facto
     avg_metrics.to_csv(os.path.join(output_dir, "average_metrics.csv"), index=False)
     print(f"Saved average metrics to {os.path.join(output_dir, 'average_metrics.csv')}")
     
-    # Plot --------------
-    start_steps = dnl.start_time.cpu().numpy()
-    status_cpu = dnl.status.cpu().numpy()
-    
-    travel_times = metrics[:, 1]
-    arrival_steps = start_steps + travel_times
-    
-    unfinished = (status_cpu != 3)
-    arrival_steps[unfinished] = -1
-    
-    plot_file = os.path.join(output_dir, "agent_status.png")
-    print("Generating Plot...")
-    plot_agent_status(start_steps, arrival_steps, max_steps=step, bucket_size_sec=300, output_file=plot_file)
+    # Plot (only if events were tracked) --------------
+    if effective_track_events:
+        events = dnl.get_events()
+        plot_file = os.path.join(output_dir, "leg_histogram.png")
+        print("Generating Plot...")
+        plot_leg_histogram(events, max_steps=step, dt=timestep, bucket_size_sec=300, output_file=plot_file)
+        csv_file = os.path.join(output_dir, "leg_histogram.csv")
+        export_leg_histogram_csv(events, max_steps=step, dt=timestep, bucket_size_sec=300, output_file=csv_file)
 
     # Events CSV --------------
     if save_events:
-        events = dnl.get_events()
+        # events is already fetched above (save_events implies effective_track_events)
+        if not events:
+            events = dnl.get_events()
         print(f"Collected {len(events)} events. Exporting to CSV...")
 
         # Build inverse mapping: edge_idx -> link_id
@@ -520,8 +523,9 @@ if __name__ == "__main__":
     parser.add_argument("--no_load_pickle", help="Force reparsing from XML even if pickle exists.", action="store_true")
     parser.add_argument("--save_paths", help="If set, exports paths.csv containing agent paths.", action="store_true")
     parser.add_argument("--save_agents", help="If set, exports agent_metrics.csv containing individual agent statistics.", action="store_true")
-    parser.add_argument("--save_events", help="If set, records and exports MATSim-style simulation events to events.csv.", action="store_true")
-    parser.add_argument("--n_hours", help="If set, sets the number of hours the simulation needs to run for. By default 24h.", default=24)
+    parser.add_argument("--save_events", help="If set, exports MATSim-style simulation events to events.csv.", action="store_true")
+    parser.add_argument("--track_events", help="Track simulation events in memory (needed for leg_histogram plot). Default: True.", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--hours", nargs=2, type=float, metavar=("START", "END"), help="Start and end hours for the simulation (e.g. --hours 7 7.5 for 7h00 to 7h30). Default: 0 24.", default=[0, 24])
     parser.add_argument("--scale_factor", help="If set, scales the storageCapacity and outflowCapacity of the network links. By default 1.0.", default=1.0)
     parser.add_argument("--timestep", help="Time step size of each simulation step, by default 1 second.", default=1)
     parser.add_argument("--output_folder", help="Output folder for results.", default="output")
@@ -533,4 +537,4 @@ if __name__ == "__main__":
     if not os.path.exists(args.root_folder):
         print(f"Root folder not found: {args.root_folder}")
     else:
-        run_benchmark(args.root_folder, args.population, timestep=float(args.timestep), scale_factor=float(args.scale_factor), n_hours=int(args.n_hours), save_pickle=args.save_pickle, load_pickle=not args.no_load_pickle, save_paths=args.save_paths, save_agents=args.save_agents, save_events=args.save_events, output_folder=args.output_folder, seed=int(args.seed) if args.seed is not None else None)
+        run_benchmark(args.root_folder, args.population, timestep=float(args.timestep), scale_factor=float(args.scale_factor), start_hour=args.hours[0], end_hour=args.hours[1], save_pickle=args.save_pickle, load_pickle=not args.no_load_pickle, save_paths=args.save_paths, save_agents=args.save_agents, save_events=args.save_events, track_events=args.track_events, output_folder=args.output_folder, seed=int(args.seed) if args.seed is not None else None)

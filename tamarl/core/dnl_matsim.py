@@ -148,6 +148,9 @@ class TorchDNLMATSim:
         self.wakeup_time = self.departure_times.clone()
         self.infinity = 2**30
 
+        # Track whether actend/departure events have been emitted (for track_events)
+        self._departure_emitted = torch.zeros(self.num_agents, device=self.device, dtype=torch.bool)
+
         self.current_step = 0
 
     def reset(self):
@@ -166,6 +169,7 @@ class TorchDNLMATSim:
         
         self.agent_metrics.fill_(0)
         self.wakeup_time.copy_(self.departure_times)
+        self._departure_emitted.fill_(False)
         self.current_step = 0
         self.stuck_count = 0
         if self.seed is not None:
@@ -517,14 +521,18 @@ class TorchDNLMATSim:
         waiting_agents = torch.nonzero(demand_mask, as_tuple=True)[0]
         first_edges = self.next_edge[waiting_agents]
 
-        # Events: actend + departure fire at exact departure_time (before flow check)
+        # Events: actend + departure fire once per agent when their departure time has been reached.
+        # Uses _departure_emitted flag to avoid re-emitting for agents that fail flow check
+        # and are re-processed on subsequent steps.
         if self.track_events:
-            departing_now = (self.departure_times[waiting_agents] == self.current_step)
+            not_yet_emitted = ~self._departure_emitted[waiting_agents]
+            departing_now = not_yet_emitted & (self.departure_times[waiting_agents] <= self.current_step)
             if departing_now.any():
                 dep_agents = waiting_agents[departing_now]
                 dep_edges = first_edges[departing_now]
                 self._record_events(EVT_ACTEND, dep_agents, dep_edges)
                 self._record_events(EVT_DEPARTURE, dep_agents, dep_edges)
+                self._departure_emitted[dep_agents] = True
 
         # Sort by (first_edge, departure_time) for FIFO per-link ordering
         dep_times = self.departure_times[waiting_agents]

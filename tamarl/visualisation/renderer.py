@@ -365,6 +365,8 @@ def _compute_agent_positions(agent_ids, timelines, timestep, nodes, links):
         })
 
     # Fan out overlapping agents perpendicular to the link
+    # Cap at N_MAX_STACK visible dots; show overflow with "×N" label
+    N_MAX_STACK = 3
     pos_groups = defaultdict(list)
     for p in raw_positions:
         key = (round(p['x'], 4), round(p['y'], 4))
@@ -383,12 +385,21 @@ def _compute_agent_positions(agent_ids, timelines, timestep, nodes, links):
             link = links[link_id]
             x0, y0, x1, y1 = _link_geometry(nodes, link)
 
-            for i, p in enumerate(group):
-                offset = (i - (n - 1) / 2.0) * spacing
+            # Cap visible dots
+            visible = group[:N_MAX_STACK]
+            overflow = n - N_MAX_STACK if n > N_MAX_STACK else 0
+            nv = len(visible)
+
+            for i, p in enumerate(visible):
+                offset = (i - (nv - 1) / 2.0) * spacing
                 ox, oy = _perpendicular_offset(x0, y0, x1, y1, offset)
                 p['x'] += ox
                 p['y'] += oy
                 result.append(p)
+
+            # Tag last visible dot with overflow count
+            if overflow > 0:
+                visible[-1]['overflow'] = n
 
     return result
 
@@ -486,6 +497,16 @@ def _draw_frame(ax, nodes, links, agent_ids, timelines, timestep,
                     fontsize=agent_fontsize, color='white',
                     ha='center', va='center', fontweight='bold',
                     zorder=11)
+
+        # Draw overflow count label (×N) next to the dot
+        if 'overflow' in p:
+            overflow_fontsize = max(6, agent_size * 0.4) * scale_factor
+            ax.text(p['x'], p['y'] + agent_size * 0.08 * scale_factor,
+                    f"×{p['overflow']}", fontsize=overflow_fontsize,
+                    color='white', ha='center', va='bottom',
+                    fontweight='bold', zorder=12,
+                    bbox=dict(boxstyle='round,pad=0.15', facecolor='#1a1a2e',
+                              edgecolor='white', alpha=0.8, linewidth=0.5))
 
     # ─── HUD (multi-color, rendered with fig.text) ──────────────────────────
     stats = per_step_stats[timestep] if timestep < len(per_step_stats) else {}

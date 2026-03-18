@@ -8,7 +8,7 @@ import scipy.spatial as spatial
 import matplotlib.pyplot as plt
 import time
 from tamarl.core.dnl_matsim import TorchDNLMATSim
-from tamarl.core.plot_histogram import plot_agent_status
+from tamarl.visualisation.plot_histogram import plot_agent_status_from_arrays as plot_agent_status
 
 def parse_network(network_file):
     print(f"Parsing Network: {network_file}")

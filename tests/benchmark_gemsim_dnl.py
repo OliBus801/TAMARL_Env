@@ -11,7 +11,7 @@ import pandas as pd
 import pickle
 import gc
 from tamarl.core.dnl_gemsim import TorchDNLGEMSim
-from tamarl.core.plot_histogram import plot_agent_status
+from tamarl.visualisation.plot_histogram import plot_agent_status_from_arrays as plot_agent_status
 
 def sec_to_hms(seconds):
     """Convert seconds to HH:MM:SS format."""
