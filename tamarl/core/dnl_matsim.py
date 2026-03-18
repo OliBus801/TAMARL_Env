@@ -214,49 +214,37 @@ class TorchDNLMATSim:
             self._event_buffer = new_buf
         
         buf = self._event_buffer
-        buf[self._event_count:needed, 0] = self.current_step
-        buf[self._event_count:needed, 1] = event_type
-        buf[self._event_count:needed, 2] = agent_ids.int()
-        buf[self._event_count:needed, 3] = edge_ids.int()
+        s = self._event_count
+        buf[s:needed, 0] = self.current_step
+        buf[s:needed, 1] = event_type
+        buf[s:needed, 2] = agent_ids  # implicit int64→int32 cast, avoids .int() overhead
+        buf[s:needed, 3] = edge_ids
         self._event_count = needed
 
     # =========================================================================
     # Flow Accumulation (MATSim: updateFastFlowAccumulation)
     # =========================================================================
-    def _update_flow_accumulation(self, edges):
+    def _update_all_flow_accumulation(self):
         """
-        Lazy on-demand flow accumulation for the specified edges.
-        Matches MATSim's updateFastFlowAccumulation: computes elapsed time since
-        last update, accumulates flow_per_step * elapsed, caps at remaining
-        capacity (flow_per_step - buffer_count).
+        Global flow accumulation for ALL edges, once per step.
         
-        Only updates edges where: last_updated < now AND acc < remaining.
-        
-        OPT: Uses pre-maintained self.buffer_counts instead of recomputing bincount.
+        OPT: Replaces the lazy per-edge _update_flow_accumulation (71k calls)
+        with a single vectorized O(E) operation. Mathematically equivalent
+        because accumulation is linear in elapsed time.
         """
-        unique_edges = torch.unique(edges)
-        e = unique_edges.long()
-        
-        # OPT: Use pre-maintained buffer_counts instead of recomputing
-        remaining = self.flow_capacity_per_step[e] - self.buffer_counts[e]
-        
-        # Condition: last_updated < now AND acc < remaining
-        last_updated = self.flow_accumulator_last_updated[e]
-        acc = self.edge_capacity_accumulator[e]
-        should_update = (last_updated < self.current_step) & (acc < remaining)
+        remaining = self.flow_capacity_per_step - self.buffer_counts
+        should_update = (self.flow_accumulator_last_updated < self.current_step) & \
+                        (self.edge_capacity_accumulator < remaining)
         
         if should_update.any():
-            upd_idx = e[should_update]
-            upd_last = last_updated[should_update]
-            upd_acc = acc[should_update]
-            upd_remaining = remaining[should_update]
-            
-            elapsed = (self.current_step - upd_last).float()
-            accumulated = elapsed * self.flow_capacity_per_step[upd_idx]
-            new_acc = torch.minimum(upd_acc + accumulated, upd_remaining)
-            
-            self.edge_capacity_accumulator[upd_idx] = new_acc
-            self.flow_accumulator_last_updated[upd_idx] = self.current_step
+            elapsed = (self.current_step - self.flow_accumulator_last_updated[should_update]).float()
+            accumulated = elapsed * self.flow_capacity_per_step[should_update]
+            new_acc = torch.minimum(
+                self.edge_capacity_accumulator[should_update] + accumulated,
+                remaining[should_update]
+            )
+            self.edge_capacity_accumulator[should_update] = new_acc
+            self.flow_accumulator_last_updated[should_update] = self.current_step
 
     # =========================================================================
     # A. Process Nodes (Capacity Buffer -> Downstream Spatial Buffer)
@@ -356,11 +344,14 @@ class TorchDNLMATSim:
         stuck_s = m_stuck[sort_idx]
 
         # Storage capacity check
-        unique_v, _, counts_v = torch.unique_consecutive(next_s, return_counts=True, return_inverse=True)
-        v_starts = torch.zeros_like(unique_v)
-        v_starts[1:] = torch.cumsum(counts_v, dim=0)[:-1]
-        item_v_starts = torch.repeat_interleave(v_starts, counts_v)
-        inflow_ranks = torch.arange(movers_s.size(0), device=self.device) - item_v_starts
+        # OPT: cummax-based group ranks (replaces unique_consecutive + repeat_interleave)
+        n_movers = movers_s.size(0)
+        positions = torch.arange(n_movers, device=self.device)
+        boundary_pos = torch.zeros(n_movers, device=self.device, dtype=torch.long)
+        if n_movers > 1:
+            boundary_pos[1:] = (next_s[1:] != next_s[:-1]).long() * positions[1:]
+        group_starts_v, _ = torch.cummax(boundary_pos, dim=0)
+        inflow_ranks = positions - group_starts_v
 
         caps = self.storage_capacity[next_s]
         occs = self.edge_occupancy[next_s]
@@ -385,7 +376,7 @@ class TorchDNLMATSim:
                 -torch.ones(winners.size(0), device=self.device))
 
             # Update occupancy: add to downstream link
-            self.edge_occupancy += torch.bincount(w_next.int(), minlength=self.num_edges)
+            self.edge_occupancy += torch.bincount(w_next, minlength=self.num_edges).to(self.edge_occupancy.dtype)
 
             # Update state
             self.status[winners] = 1  # Traveling (spatial buffer of downstream link)
@@ -418,9 +409,7 @@ class TorchDNLMATSim:
         if arrived_agents.numel() == 0:
             return
 
-        # (a) Lazy flow accumulation: only update edges that have spatial candidates
-        candidate_edges = self.current_edge[arrived_agents]
-        self._update_flow_accumulation(candidate_edges)
+        # (a) Flow accumulation already done globally in step()
 
         # (b) moveQueueToBuffer: spatial -> capacity
 
@@ -446,11 +435,13 @@ class TorchDNLMATSim:
         is_mover = ~is_exiter
 
         # --- Per-link grouping ---
-        unique_e, _, counts_e = torch.unique_consecutive(
-            edges_sorted, return_counts=True, return_inverse=True)
-        e_starts = torch.zeros_like(unique_e)
-        e_starts[1:] = torch.cumsum(counts_e, dim=0)[:-1]
-        item_starts = torch.repeat_interleave(e_starts, counts_e)
+        # OPT: cummax-based group starts (replaces unique_consecutive + repeat_interleave)
+        n_arrived = arrived_sorted.size(0)
+        positions_b = torch.arange(n_arrived, device=self.device)
+        boundary_pos_b = torch.zeros(n_arrived, device=self.device, dtype=torch.long)
+        if n_arrived > 1:
+            boundary_pos_b[1:] = (edges_sorted[1:] != edges_sorted[:-1]).long() * positions_b[1:]
+        item_starts, _ = torch.cummax(boundary_pos_b, dim=0)
 
         # --- FIFO blocking: a failing mover blocks all agents behind it ---
         # Grouped cumsum of is_mover → mover_rank (1-indexed per-link)
@@ -484,7 +475,7 @@ class TorchDNLMATSim:
             # Common: remove all processable agents from link occupancy
             all_proc_edges = edges_sorted[processable]
             self.edge_occupancy -= torch.bincount(
-                all_proc_edges.int(), minlength=self.num_edges)
+                all_proc_edges, minlength=self.num_edges).to(self.edge_occupancy.dtype)
 
             # Common: add distance for traversed links (path_ptr > 0)
             all_proc_agents = arrived_sorted[processable]
@@ -580,15 +571,17 @@ class TorchDNLMATSim:
         agents_sorted = waiting_agents[sort_idx]
         edges_sorted = first_edges[sort_idx]
 
-        # Lazy flow accumulation for edges with waiting agents
-        self._update_flow_accumulation(edges_sorted)
+        # Flow accumulation already done globally in step()
 
         # Flow capacity check
-        unique_e, _, counts_e = torch.unique_consecutive(edges_sorted, return_counts=True, return_inverse=True)
-        e_starts = torch.zeros_like(unique_e)
-        e_starts[1:] = torch.cumsum(counts_e, dim=0)[:-1]
-        item_starts = torch.repeat_interleave(e_starts, counts_e)
-        ranks = torch.arange(agents_sorted.size(0), device=self.device) - item_starts
+        # OPT: cummax-based group ranks (replaces unique_consecutive + repeat_interleave)
+        n_waiting = agents_sorted.size(0)
+        positions_c = torch.arange(n_waiting, device=self.device)
+        boundary_pos_c = torch.zeros(n_waiting, device=self.device, dtype=torch.long)
+        if n_waiting > 1:
+            boundary_pos_c[1:] = (edges_sorted[1:] != edges_sorted[:-1]).long() * positions_c[1:]
+        group_starts_c, _ = torch.cummax(boundary_pos_c, dim=0)
+        ranks = positions_c - group_starts_c
 
         flow_limits = torch.ceil(torch.clamp(self.edge_capacity_accumulator[edges_sorted] - 1e-6, min=0.0))
         flow_pass = (ranks < flow_limits)
@@ -637,7 +630,10 @@ class TorchDNLMATSim:
         # A. Process Nodes (Capacity -> Downstream Spatial)
         self._process_nodes_A()
 
-        # B. Accumulate Flow + Process Links (Spatial -> Capacity) + Handle Arrivals
+        # OPT: Global flow accumulation once per step (replaces 71k lazy calls)
+        self._update_all_flow_accumulation()
+
+        # B. Process Links (Spatial -> Capacity) + Handle Arrivals
         self._process_links_B()
 
         # C. Schedule Demand (New agents enter network)
