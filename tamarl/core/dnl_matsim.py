@@ -77,9 +77,9 @@ class TorchDNLMATSim:
             self.profiler = cProfile.Profile()
             self.profiler.enable()
 
-        # Event tracking
+        # Event tracking -- uses a pre-allocated GPU tensor buffer instead of Python list
         self.track_events = track_events
-        self.events = [] if track_events else None
+        self._init_event_buffer()
 
         # Test number of interactions
         self.interactions = 0
@@ -92,20 +92,18 @@ class TorchDNLMATSim:
 
         # Move constants to device
         self.edge_static = edge_static.to(device)
-        self.paths = paths.to(device).int()
+        self.paths = paths.to(device).long()  # OPT: store as int64 to avoid .long() conversions
         
         self.num_edges = self.edge_static.shape[0]
         self.num_agents = self.paths.shape[0]
         self.max_path_len = self.paths.shape[1]
 
         # Edge Attributes
-        # Using contiguous arrays for potential speedup
         self.length = self.edge_static[:, 0].contiguous()
         self.free_speed = self.edge_static[:, 1].contiguous()
         self.storage_capacity = self.edge_static[:, 2].contiguous()
         
         # Flow capacity is usually veh/hour. Convert to veh/step.
-        #self.flow_capacity_per_step = (self.edge_static[:, 3] / 3600.0) * self.dt
         # We set the flow_capacity to veh/timestep already
         self.flow_capacity_per_step = self.edge_static[:, 3]
         
@@ -120,12 +118,16 @@ class TorchDNLMATSim:
         self.flow_accumulator_last_updated = torch.zeros(self.num_edges, device=self.device, dtype=torch.int32)
         self.step_edge_limits = torch.zeros(self.num_edges, device=self.device, dtype=torch.float32)
 
+        # OPT: Incremental buffer counts (avoids recomputing bincount on all agents)
+        self.buffer_counts = torch.zeros(self.num_edges, device=self.device, dtype=torch.float32)
+
         # Agent State - Structure of Arrays (SOA)
         # Status | 0: Waiting, 1: Traveling, 2: Buffer, 3: Done
         self.status = torch.zeros(self.num_agents, device=self.device, dtype=torch.uint8)
-        self.current_edge = torch.full((self.num_agents,), -1, device=self.device, dtype=torch.int32)
-        self.next_edge = torch.full((self.num_agents,), -1, device=self.device, dtype=torch.int32)
-        self.path_ptr = torch.zeros(self.num_agents, device=self.device, dtype=torch.int32)
+        # OPT: Use int64 (long) for edge/ptr indices to avoid repeated .long() conversions
+        self.current_edge = torch.full((self.num_agents,), -1, device=self.device, dtype=torch.long)
+        self.next_edge = torch.full((self.num_agents,), -1, device=self.device, dtype=torch.long)
+        self.path_ptr = torch.zeros(self.num_agents, device=self.device, dtype=torch.long)
         self.arrival_time = torch.zeros(self.num_agents, device=self.device, dtype=torch.int32)
         self.stuck_since = torch.zeros(self.num_agents, device=self.device, dtype=torch.int32)
         self.start_time = torch.zeros(self.num_agents, device=self.device, dtype=torch.int32)
@@ -152,13 +154,28 @@ class TorchDNLMATSim:
         # Track whether actend/departure events have been emitted (for track_events)
         self._departure_emitted = torch.zeros(self.num_agents, device=self.device, dtype=torch.bool)
 
+        # OPT: Pre-allocate reusable scratch tensors
+        self._edge_priority_scratch = torch.zeros(self.num_edges, device=self.device, dtype=torch.float32)
+
         self.current_step = 0
+
+    def _init_event_buffer(self):
+        """Initialize event buffer as a pre-allocated tensor (or None if not tracking)."""
+        if self.track_events:
+            # Pre-allocate for ~100k events, will grow as needed
+            initial_cap = 100_000
+            self._event_buffer = torch.empty((initial_cap, 4), device=self.device, dtype=torch.int32)
+            self._event_count = 0
+        else:
+            self._event_buffer = None
+            self._event_count = 0
 
     def reset(self):
         self.edge_occupancy.fill_(0)
         self.edge_capacity_accumulator.copy_(self.flow_capacity_per_step)
         self.flow_accumulator_last_updated.fill_(0)
         self.step_edge_limits.fill_(0)
+        self.buffer_counts.fill_(0)
         
         self.status.fill_(0)
         self.current_edge.fill_(-1)
@@ -175,21 +192,33 @@ class TorchDNLMATSim:
         self.stuck_count = 0
         if self.seed is not None:
             self.rng.manual_seed(self.seed)
-        if self.track_events:
-            self.events = []
+        self._init_event_buffer()
         
         if self.profiler:
             self.profiler.clear()
 
     def _record_events(self, event_type, agent_ids, edge_ids):
-        """Record events for the given agents. All tensors must be on CPU or will be moved."""
+        """Record events using a pre-allocated tensor buffer. All data stays on device."""
         if not self.track_events:
             return
-        t = self.current_step
-        a_ids = agent_ids.cpu().tolist()
-        e_ids = edge_ids.cpu().tolist()
-        for a, e in zip(a_ids, e_ids):
-            self.events.append((t, event_type, a, e))
+        n = agent_ids.size(0)
+        if n == 0:
+            return
+        # Grow buffer if needed (doubling strategy)
+        needed = self._event_count + n
+        if needed > self._event_buffer.size(0):
+            new_cap = max(self._event_buffer.size(0) * 2, needed)
+            new_buf = torch.empty((new_cap, 4), device=self.device, dtype=torch.int32)
+            if self._event_count > 0:
+                new_buf[:self._event_count] = self._event_buffer[:self._event_count]
+            self._event_buffer = new_buf
+        
+        buf = self._event_buffer
+        buf[self._event_count:needed, 0] = self.current_step
+        buf[self._event_count:needed, 1] = event_type
+        buf[self._event_count:needed, 2] = agent_ids.int()
+        buf[self._event_count:needed, 3] = edge_ids.int()
+        self._event_count = needed
 
     # =========================================================================
     # Flow Accumulation (MATSim: updateFastFlowAccumulation)
@@ -202,19 +231,14 @@ class TorchDNLMATSim:
         capacity (flow_per_step - buffer_count).
         
         Only updates edges where: last_updated < now AND acc < remaining.
+        
+        OPT: Uses pre-maintained self.buffer_counts instead of recomputing bincount.
         """
         unique_edges = torch.unique(edges)
         e = unique_edges.long()
         
-        # Compute remaining flow cap (flow_per_step - buffer_count on these edges)
-        buffer_mask = (self.status == 2)
-        if buffer_mask.any():
-            buffer_edges = self.current_edge[buffer_mask].long()
-            buffer_counts = torch.bincount(buffer_edges, minlength=self.num_edges).float()
-        else:
-            buffer_counts = torch.zeros(self.num_edges, device=self.device)
-        
-        remaining = self.flow_capacity_per_step[e] - buffer_counts[e]
+        # OPT: Use pre-maintained buffer_counts instead of recomputing
+        remaining = self.flow_capacity_per_step[e] - self.buffer_counts[e]
         
         # Condition: last_updated < now AND acc < remaining
         last_updated = self.flow_accumulator_last_updated[e]
@@ -249,10 +273,11 @@ class TorchDNLMATSim:
         Events emitted: left_link, entered_link
         """
         buffer_mask = (self.status == 2) & (self.wakeup_time <= self.current_step)
-        if not buffer_mask.any():
+        # OPT: Skip nonzero + numel check instead of .any() (avoids GPU sync)
+        buffer_agents = torch.nonzero(buffer_mask, as_tuple=True)[0]
+        if buffer_agents.numel() == 0:
             return
 
-        buffer_agents = torch.nonzero(buffer_mask, as_tuple=True)[0]
         b_next = self.next_edge[buffer_agents]
 
         # Process movers (next_edge != -1)
@@ -265,8 +290,8 @@ class TorchDNLMATSim:
         m_curr = self.current_edge[movers]
 
         # Dynamic connectivity check: to_node[curr] must equal from_node[next]
-        to_of_curr = self.edge_endpoints[m_curr.long(), 1]
-        from_of_next = self.edge_endpoints[m_next.long(), 0]
+        to_of_curr = self.edge_endpoints[m_curr, 1]
+        from_of_next = self.edge_endpoints[m_next, 0]
         connected = (to_of_curr == from_of_next)
         disconnected = ~connected
 
@@ -280,6 +305,9 @@ class TorchDNLMATSim:
             self.wakeup_time[stuck_agents] = self.infinity
             start_times = self.start_time[stuck_agents]
             self.agent_metrics[stuck_agents, 1] = (self.current_step - start_times).float()
+            # OPT: Update buffer_counts for agents leaving buffer
+            self.buffer_counts.scatter_add_(0, m_curr[disconnected],
+                -torch.ones(num_stuck, device=self.device))
 
             if self.track_events:
                 self._record_events(EVT_STUCKANDABORT, stuck_agents, m_curr[disconnected])
@@ -306,18 +334,18 @@ class TorchDNLMATSim:
         # Random priority per unique upstream link: rand() * capacity (weighted random)
         unique_curr = torch.unique(m_curr)
         rand_vals = torch.rand(unique_curr.size(0), generator=self.rng).to(self.device)
-        weighted_rand = rand_vals * self.flow_capacity_per_step[unique_curr.long()]
+        weighted_rand = rand_vals * self.flow_capacity_per_step[unique_curr]
         
-        # Map random priority back to each mover via their current_edge
-        # Create a lookup: edge_idx -> weighted_rand value
-        edge_priority = torch.zeros(self.num_edges, device=self.device)
-        edge_priority[unique_curr.long()] = weighted_rand.to(self.device)
-        mover_priority = edge_priority[m_curr.long()]
+        # OPT: Reuse pre-allocated scratch tensor instead of allocating new one
+        edge_priority = self._edge_priority_scratch
+        edge_priority.zero_()
+        edge_priority[unique_curr] = weighted_rand
+        mover_priority = edge_priority[m_curr]
 
         # Sort by (downstream_link, -upstream_priority, stuck_time) 
         # Higher priority links come first (negate for ascending sort)
         # Within same upstream link, process agents in order (by agent id for stability)
-        sort_keys = (m_next.long() * 10000000000
+        sort_keys = (m_next * 10000000000
                      - (mover_priority * 1000000).long() * 10000
                      + torch.arange(movers.size(0), device=self.device))
         sort_idx = torch.argsort(sort_keys, stable=True)
@@ -352,8 +380,12 @@ class TorchDNLMATSim:
                 self._record_events(EVT_LEFT_LINK, winners, w_curr)
                 self._record_events(EVT_ENTERED_LINK, winners, w_next)
 
+            # OPT: Update buffer_counts (agents leaving buffer)
+            self.buffer_counts.scatter_add_(0, w_curr,
+                -torch.ones(winners.size(0), device=self.device))
+
             # Update occupancy: add to downstream link
-            self.edge_occupancy += torch.bincount(w_next, minlength=self.num_edges)
+            self.edge_occupancy += torch.bincount(w_next.int(), minlength=self.num_edges)
 
             # Update state
             self.status[winners] = 1  # Traveling (spatial buffer of downstream link)
@@ -381,125 +413,129 @@ class TorchDNLMATSim:
 
         # Check if there are edges with spatial candidates
         spatial_mask = (self.status == 1) & (self.wakeup_time <= self.current_step)
-        if spatial_mask.any():
+        # OPT: Compute nonzero directly, check numel (avoids .any() GPU sync)
+        arrived_agents = torch.nonzero(spatial_mask, as_tuple=True)[0]
+        if arrived_agents.numel() == 0:
+            return
 
-            # (a) Lazy flow accumulation: only update edges that have spatial candidates
-            candidate_edges = self.current_edge[spatial_mask]
-            self._update_flow_accumulation(candidate_edges)
+        # (a) Lazy flow accumulation: only update edges that have spatial candidates
+        candidate_edges = self.current_edge[arrived_agents]
+        self._update_flow_accumulation(candidate_edges)
 
-            # (b) moveQueueToBuffer: spatial -> capacity
-            arrived_agents = torch.nonzero(spatial_mask, as_tuple=True)[0]
+        # (b) moveQueueToBuffer: spatial -> capacity
 
-            # Sort by (current_edge, arrival_time) for FIFO per-link ordering
-            a_edges = self.current_edge[arrived_agents]
-            a_arrival = self.arrival_time[arrived_agents]
-            sort_keys = a_edges.long() * 1000000 + a_arrival.long()
-            sort_idx = torch.argsort(sort_keys, stable=True)
+        # Sort by (current_edge, arrival_time) for FIFO per-link ordering
+        a_edges = self.current_edge[arrived_agents]
+        a_arrival = self.arrival_time[arrived_agents]
+        sort_keys = a_edges * 1000000 + a_arrival.long()
+        sort_idx = torch.argsort(sort_keys, stable=True)
 
-            arrived_sorted = arrived_agents[sort_idx]
-            edges_sorted = a_edges[sort_idx]
+        arrived_sorted = arrived_agents[sort_idx]
+        edges_sorted = a_edges[sort_idx]
 
-            # --- Shared computations (done ONCE for all candidates) ---
-            ptrs_sorted = self.path_ptr[arrived_sorted]
-            next_ptrs_sorted = ptrs_sorted + 1
+        # --- Shared computations (done ONCE for all candidates) ---
+        ptrs_sorted = self.path_ptr[arrived_sorted]
+        next_ptrs_sorted = ptrs_sorted + 1
 
-            # Determine exiter vs mover: exiter if next path step is beyond path or padding
-            is_exiter = (next_ptrs_sorted >= self.max_path_len)
-            if not is_exiter.all():
-                valid = ~is_exiter
-                path_next = self.paths[arrived_sorted[valid], next_ptrs_sorted[valid]]
-                is_exiter[valid] = (path_next == -1)
-            is_mover = ~is_exiter
+        # Determine exiter vs mover: exiter if next path step is beyond path or padding
+        is_exiter = (next_ptrs_sorted >= self.max_path_len)
+        if not is_exiter.all():
+            valid = ~is_exiter
+            path_next = self.paths[arrived_sorted[valid], next_ptrs_sorted[valid]]
+            is_exiter[valid] = (path_next == -1)
+        is_mover = ~is_exiter
 
-            # --- Per-link grouping ---
-            unique_e, _, counts_e = torch.unique_consecutive(
-                edges_sorted, return_counts=True, return_inverse=True)
-            e_starts = torch.zeros_like(unique_e)
-            e_starts[1:] = torch.cumsum(counts_e, dim=0)[:-1]
-            item_starts = torch.repeat_interleave(e_starts, counts_e)
+        # --- Per-link grouping ---
+        unique_e, _, counts_e = torch.unique_consecutive(
+            edges_sorted, return_counts=True, return_inverse=True)
+        e_starts = torch.zeros_like(unique_e)
+        e_starts[1:] = torch.cumsum(counts_e, dim=0)[:-1]
+        item_starts = torch.repeat_interleave(e_starts, counts_e)
 
-            # --- FIFO blocking: a failing mover blocks all agents behind it ---
-            # Grouped cumsum of is_mover → mover_rank (1-indexed per-link)
-            mover_int = is_mover.int()
-            global_cs_mover = torch.cumsum(mover_int, dim=0)
-            offset_mover = global_cs_mover[item_starts] - mover_int[item_starts]
-            mover_rank = global_cs_mover - offset_mover
+        # --- FIFO blocking: a failing mover blocks all agents behind it ---
+        # Grouped cumsum of is_mover → mover_rank (1-indexed per-link)
+        mover_int = is_mover.int()
+        global_cs_mover = torch.cumsum(mover_int, dim=0)
+        offset_mover = global_cs_mover[item_starts] - mover_int[item_starts]
+        mover_rank = global_cs_mover - offset_mover
 
-            # Flow limits per agent (from their edge)
-            # Subtract epsilon before ceil to avoid float32 precision artifacts
-            # (e.g. -0.1+0.1 = 1.5e-8 in float32, ceil would give 1 instead of 0)
-            flow_limits = torch.ceil(torch.clamp(self.edge_capacity_accumulator[edges_sorted] - 1e-6, min=0.0))
+        # Flow limits per agent (from their edge)
+        # Subtract epsilon before ceil to avoid float32 precision artifacts
+        # (e.g. -0.1+0.1 = 1.5e-8 in float32, ceil would give 1 instead of 0)
+        flow_limits = torch.ceil(torch.clamp(self.edge_capacity_accumulator[edges_sorted] - 1e-6, min=0.0))
 
-            # A mover fails if its per-link rank exceeds the flow limit
-            mover_fails = is_mover & (mover_rank > flow_limits)
+        # A mover fails if its per-link rank exceeds the flow limit
+        mover_fails = is_mover & (mover_rank > flow_limits)
 
-            # Grouped cumsum of failures → blocked if any prior mover on same link failed
-            fails_int = mover_fails.int()
-            global_cs_fails = torch.cumsum(fails_int, dim=0)
-            offset_fails = global_cs_fails[item_starts] - fails_int[item_starts]
-            blocked = (global_cs_fails - offset_fails) > 0
+        # Grouped cumsum of failures → blocked if any prior mover on same link failed
+        fails_int = mover_fails.int()
+        global_cs_fails = torch.cumsum(fails_int, dim=0)
+        offset_fails = global_cs_fails[item_starts] - fails_int[item_starts]
+        blocked = (global_cs_fails - offset_fails) > 0
 
-            processable = ~blocked
-            proc_exit_mask = processable & is_exiter
-            proc_win_mask = processable & is_mover
+        processable = ~blocked
+        proc_exit_mask = processable & is_exiter
+        proc_win_mask = processable & is_mover
 
-            has_exiters = proc_exit_mask.any()
-            has_winners = proc_win_mask.any()
+        has_exiters = proc_exit_mask.any()
+        has_winners = proc_win_mask.any()
 
-            if has_exiters or has_winners:
-                # Common: remove all processable agents from link occupancy
-                all_proc_edges = edges_sorted[processable]
-                self.edge_occupancy -= torch.bincount(
-                    all_proc_edges, minlength=self.num_edges)
+        if has_exiters or has_winners:
+            # Common: remove all processable agents from link occupancy
+            all_proc_edges = edges_sorted[processable]
+            self.edge_occupancy -= torch.bincount(
+                all_proc_edges.int(), minlength=self.num_edges)
 
-                # Common: add distance for traversed links (path_ptr > 0)
-                all_proc_agents = arrived_sorted[processable]
-                all_proc_ptrs = ptrs_sorted[processable]
-                traversed = (all_proc_ptrs > 0)
-                if traversed.any():
-                    self.agent_metrics[all_proc_agents[traversed], 0] += \
-                        self.length[all_proc_edges[traversed]]
+            # Common: add distance for traversed links (path_ptr > 0)
+            all_proc_agents = arrived_sorted[processable]
+            all_proc_ptrs = ptrs_sorted[processable]
+            traversed = (all_proc_ptrs > 0)
+            if traversed.any():
+                self.agent_metrics[all_proc_agents[traversed], 0] += \
+                    self.length[all_proc_edges[traversed]]
 
-            # --- Exiters: leave the network ---
-            if has_exiters:
-                exiters = arrived_sorted[proc_exit_mask]
-                self.status[exiters] = 3
-                self.wakeup_time[exiters] = self.infinity
-                self.agent_metrics[exiters, 1] = \
-                    (self.current_step - self.start_time[exiters]).float()
+        # --- Exiters: leave the network ---
+        if has_exiters:
+            exiters = arrived_sorted[proc_exit_mask]
+            self.status[exiters] = 3
+            self.wakeup_time[exiters] = self.infinity
+            self.agent_metrics[exiters, 1] = \
+                (self.current_step - self.start_time[exiters]).float()
 
-                if self.track_events:
-                    exit_edges = edges_sorted[proc_exit_mask]
-                    self._record_events(EVT_LEAVES_TRAFFIC, exiters, exit_edges)
-                    self._record_events(EVT_ARRIVAL, exiters, exit_edges)
-                    self._record_events(EVT_ACTSTART, exiters, exit_edges)
+            if self.track_events:
+                exit_edges = edges_sorted[proc_exit_mask]
+                self._record_events(EVT_LEAVES_TRAFFIC, exiters, exit_edges)
+                self._record_events(EVT_ARRIVAL, exiters, exit_edges)
+                self._record_events(EVT_ACTSTART, exiters, exit_edges)
 
-            # --- Winners: move to capacity buffer ---
-            if has_winners:
-                winners = arrived_sorted[proc_win_mask]
-                w_edges = edges_sorted[proc_win_mask]
+        # --- Winners: move to capacity buffer ---
+        if has_winners:
+            winners = arrived_sorted[proc_win_mask]
+            w_edges = edges_sorted[proc_win_mask]
 
-                # Consume flow capacity (and mark consumption time for lazy accumulation)
-                ones = torch.ones(winners.size(0), device=self.device)
-                self.edge_capacity_accumulator.scatter_add_(0, w_edges.long(), -ones)
-                self.flow_accumulator_last_updated[w_edges.long()] = self.current_step
+            # Consume flow capacity (and mark consumption time for lazy accumulation)
+            ones = torch.ones(winners.size(0), device=self.device)
+            self.edge_capacity_accumulator.scatter_add_(0, w_edges, -ones)
+            self.flow_accumulator_last_updated[w_edges] = self.current_step
 
-                # Event: entered_buffer (spatial → capacity buffer)
-                if self.track_events:
-                    self._record_events(EVT_ENTERED_BUFFER, winners, w_edges)
+            # Event: entered_buffer (spatial → capacity buffer)
+            if self.track_events:
+                self._record_events(EVT_ENTERED_BUFFER, winners, w_edges)
 
-                self.status[winners] = 2
-                self.stuck_since[winners] = self.current_step
+            self.status[winners] = 2
+            self.stuck_since[winners] = self.current_step
 
-                # Compute next_edge (reusing pre-computed next_ptrs_sorted)
-                w_next_ptrs = next_ptrs_sorted[proc_win_mask]
-                next_edges = torch.full((winners.size(0),), -1,
-                                        device=self.device, dtype=torch.int32)
-                valid_ptr = w_next_ptrs < self.max_path_len
-                if valid_ptr.any():
-                    next_edges[valid_ptr] = self.paths[
-                        winners[valid_ptr], w_next_ptrs[valid_ptr]]
-                self.next_edge[winners] = next_edges
+            # OPT: Update buffer_counts (agents entering buffer)
+            self.buffer_counts.scatter_add_(0, w_edges, ones)
+
+            # Compute next_edge (reusing pre-computed next_ptrs_sorted)
+            w_next_ptrs = next_ptrs_sorted[proc_win_mask]
+            # OPT: Set to -1 first, then overwrite valid entries
+            self.next_edge[winners] = -1
+            valid_ptr = w_next_ptrs < self.max_path_len
+            if valid_ptr.any():
+                self.next_edge[winners[valid_ptr]] = self.paths[
+                    winners[valid_ptr], w_next_ptrs[valid_ptr]]
 
     # =========================================================================
     # C. Schedule Demand (New agents enter the network)
@@ -516,10 +552,11 @@ class TorchDNLMATSim:
         Events emitted: actend, departure (at departure time), enters_traffic (when entering)
         """
         demand_mask = (self.status == 0) & (self.wakeup_time <= self.current_step)
-        if not demand_mask.any():
+        # OPT: Direct nonzero + numel check instead of .any()
+        waiting_agents = torch.nonzero(demand_mask, as_tuple=True)[0]
+        if waiting_agents.numel() == 0:
             return
 
-        waiting_agents = torch.nonzero(demand_mask, as_tuple=True)[0]
         first_edges = self.next_edge[waiting_agents]
 
         # Events: actend + departure fire once per agent when their departure time has been reached.
@@ -537,7 +574,7 @@ class TorchDNLMATSim:
 
         # Sort by (first_edge, departure_time) for FIFO per-link ordering
         dep_times = self.departure_times[waiting_agents]
-        sort_keys = first_edges.long() * 1000000 + dep_times.long()
+        sort_keys = first_edges * 1000000 + dep_times.long()
         sort_idx = torch.argsort(sort_keys, stable=True)
 
         agents_sorted = waiting_agents[sort_idx]
@@ -565,8 +602,8 @@ class TorchDNLMATSim:
 
         # Consume flow capacity (and mark consumption time for lazy accumulation)
         ones = torch.ones(winners.size(0), device=self.device)
-        self.edge_capacity_accumulator.scatter_add_(0, w_edges.long(), -ones)
-        self.flow_accumulator_last_updated[w_edges.long()] = self.current_step
+        self.edge_capacity_accumulator.scatter_add_(0, w_edges, -ones)
+        self.flow_accumulator_last_updated[w_edges] = self.current_step
 
         # Events: enters_traffic (only for agents that actually enter)
         if self.track_events:
@@ -577,15 +614,18 @@ class TorchDNLMATSim:
         self.current_edge[winners] = w_edges
         self.stuck_since[winners] = self.current_step
 
+        # OPT: Update buffer_counts (agents entering buffer)
+        self.buffer_counts.scatter_add_(0, w_edges, ones)
+
         # Compute next_edge
         next_ptrs = self.path_ptr[winners] + 1
-        next_edges = torch.full((winners.size(0),), -1, device=self.device, dtype=torch.int32)
+        # OPT: Set to -1 first, then overwrite valid entries
+        self.next_edge[winners] = -1
         valid_ptr_mask = next_ptrs < self.max_path_len
         if valid_ptr_mask.any():
             v_agents = winners[valid_ptr_mask]
             v_next_ptrs = next_ptrs[valid_ptr_mask]
-            next_edges[valid_ptr_mask] = self.paths[v_agents, v_next_ptrs]
-        self.next_edge[winners] = next_edges
+            self.next_edge[v_agents] = self.paths[v_agents, v_next_ptrs]
 
         # Note: occupancy NOT added here (buffer is not part of link occupancy)
         # Note: first link distance NOT added (agent didn't traverse spatial buffer)
@@ -689,7 +729,21 @@ class TorchDNLMATSim:
         Return the list of recorded events, sorted by time.
         Each event is a tuple: (time, event_type_id, agent_id, edge_id).
         Use EVENT_TYPE_NAMES to map type_id to string name.
+        
+        OPT: Events are stored as a GPU tensor, sorted with torch.argsort,
+        then converted to list of tuples only at export time.
         """
-        if self.events is None:
+        if self._event_buffer is None or self._event_count == 0:
             return []
-        return sorted(self.events, key=lambda e: (e[0], e[1]))
+        
+        # Slice to actual events
+        events_tensor = self._event_buffer[:self._event_count]
+        
+        # Sort by (time, event_type)
+        sort_keys = events_tensor[:, 0].long() * 100 + events_tensor[:, 1].long()
+        sort_idx = torch.argsort(sort_keys, stable=True)
+        events_sorted = events_tensor[sort_idx]
+        
+        # Convert to list of tuples (on CPU)
+        events_cpu = events_sorted.cpu().tolist()
+        return [tuple(row) for row in events_cpu]
