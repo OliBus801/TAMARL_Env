@@ -17,6 +17,7 @@ EVT_LEAVES_TRAFFIC = 5
 EVT_ARRIVAL = 6
 EVT_ACTSTART = 7
 EVT_STUCKANDABORT = 8
+EVT_ENTERED_BUFFER = 9
 
 EVENT_TYPE_NAMES = {
     EVT_ACTEND: 'actend',
@@ -28,6 +29,7 @@ EVENT_TYPE_NAMES = {
     EVT_ARRIVAL: 'arrival',
     EVT_ACTSTART: 'actstart',
     EVT_STUCKANDABORT: 'stuckAndAbort',
+    EVT_ENTERED_BUFFER: 'entered_buffer',
 }
 
 class TorchDNLMATSim:
@@ -477,6 +479,10 @@ class TorchDNLMATSim:
                 self.edge_capacity_accumulator.scatter_add_(0, w_edges.long(), -ones)
                 self.flow_accumulator_last_updated[w_edges.long()] = self.current_step
 
+                # Event: entered_buffer (spatial → capacity buffer)
+                if self.track_events:
+                    self._record_events(EVT_ENTERED_BUFFER, winners, w_edges)
+
                 self.status[winners] = 2
                 self.stuck_since[winners] = self.current_step
 
@@ -542,6 +548,7 @@ class TorchDNLMATSim:
         flow_pass = (ranks < flow_limits)
 
         winners = agents_sorted[flow_pass]
+
         if winners.numel() == 0:
             return
 

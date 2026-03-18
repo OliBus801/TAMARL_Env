@@ -20,6 +20,7 @@ __pycache__/
 *.bmp
 *.tiff
 *.webp
+*.mp4
 
 # MATSim scenarios data
 *.xml
