@@ -162,13 +162,15 @@ class TorchDNLMATSim:
     def _init_event_buffer(self):
         """Initialize event buffer as a pre-allocated tensor (or None if not tracking)."""
         if self.track_events:
-            # Pre-allocate for ~100k events, will grow as needed
-            initial_cap = 100_000
-            self._event_buffer = torch.empty((initial_cap, 4), device=self.device, dtype=torch.int32)
+            # Pre-allocate for ~5M events on GPU, periodically flush to CPU
+            self._event_chunk_size = 5_000_000
+            self._event_buffer = torch.empty((self._event_chunk_size, 4), device=self.device, dtype=torch.int32)
             self._event_count = 0
+            self._cpu_events_blocks = []
         else:
             self._event_buffer = None
             self._event_count = 0
+            self._cpu_events_blocks = []
 
     def reset(self):
         self.edge_occupancy.fill_(0)
@@ -197,21 +199,32 @@ class TorchDNLMATSim:
         if self.profiler:
             self.profiler.clear()
 
+    def _flush_events(self):
+        """Move the current GPU event buffer to CPU RAM and reset counter."""
+        if self._event_count > 0:
+            self._cpu_events_blocks.append(self._event_buffer[:self._event_count].cpu())
+            self._event_count = 0
+
     def _record_events(self, event_type, agent_ids, edge_ids):
-        """Record events using a pre-allocated tensor buffer. All data stays on device."""
+        """Record events using a pre-allocated tensor buffer. Flushes to CPU locally."""
         if not self.track_events:
             return
         n = agent_ids.size(0)
         if n == 0:
             return
-        # Grow buffer if needed (doubling strategy)
+            
         needed = self._event_count + n
         if needed > self._event_buffer.size(0):
-            new_cap = max(self._event_buffer.size(0) * 2, needed)
-            new_buf = torch.empty((new_cap, 4), device=self.device, dtype=torch.int32)
-            if self._event_count > 0:
-                new_buf[:self._event_count] = self._event_buffer[:self._event_count]
-            self._event_buffer = new_buf
+            if n > self._event_buffer.size(0):
+                # Exceptional burst: grow the GPU buffer
+                new_cap = max(self._event_buffer.size(0) * 2, needed)
+                new_buf = torch.empty((new_cap, 4), device=self.device, dtype=torch.int32)
+                if self._event_count > 0:
+                    new_buf[:self._event_count] = self._event_buffer[:self._event_count]
+                self._event_buffer = new_buf
+            else:
+                self._flush_events()
+                needed = self._event_count + n
         
         buf = self._event_buffer
         s = self._event_count
@@ -723,23 +736,24 @@ class TorchDNLMATSim:
     def get_events(self):
         """
         Return the list of recorded events, sorted by time.
-        Each event is a tuple: (time, event_type_id, agent_id, edge_id).
-        Use EVENT_TYPE_NAMES to map type_id to string name.
-        
-        OPT: Events are stored as a GPU tensor, sorted with torch.argsort,
-        then converted to list of tuples only at export time.
+        Events are processed on CPU to avoid CUDA OOM for large scenarios.
         """
-        if self._event_buffer is None or self._event_count == 0:
+        if not self.track_events:
             return []
+            
+        self._flush_events()
         
-        # Slice to actual events
-        events_tensor = self._event_buffer[:self._event_count]
+        if len(self._cpu_events_blocks) == 0:
+            return []
+            
+        # Concatenate all CPU blocks
+        events_tensor = torch.cat(self._cpu_events_blocks, dim=0)
         
-        # Sort by (time, event_type)
+        # Sort on CPU to save VRAM
         sort_keys = events_tensor[:, 0].long() * 100 + events_tensor[:, 1].long()
         sort_idx = torch.argsort(sort_keys, stable=True)
         events_sorted = events_tensor[sort_idx]
         
-        # Convert to list of tuples (on CPU)
-        events_cpu = events_sorted.cpu().tolist()
+        # Convert to list of tuples
+        events_cpu = events_sorted.tolist()
         return [tuple(row) for row in events_cpu]
