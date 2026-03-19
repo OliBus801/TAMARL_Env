@@ -281,7 +281,6 @@ class TorchDNLMATSim:
         Events emitted: left_link, entered_link
         """
         buffer_mask = (self.status == 2) & (self.wakeup_time <= self.current_step)
-        # OPT: Skip nonzero + numel check instead of .any() (avoids GPU sync)
         buffer_agents = torch.nonzero(buffer_mask, as_tuple=True)[0]
         if buffer_agents.numel() == 0:
             return
@@ -423,7 +422,6 @@ class TorchDNLMATSim:
         
         # Check if there are edges with spatial candidates
         spatial_mask = (self.status == 1) & (self.wakeup_time <= self.current_step)
-        # OPT: Compute nonzero directly, check numel (avoids .any() GPU sync)
         arrived_agents = torch.nonzero(spatial_mask, as_tuple=True)[0]
         if arrived_agents.numel() == 0:
             return
