@@ -3,11 +3,47 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# Agent
+.agent/
+
+# Scripts
+*.sh
+
+# Agent
+.agent/
+
+# Images
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.tiff
+*.webp
+*.mp4
+
+# MATSim scenarios data
+*.xml
+*.pkl
+
+# output Data
+graphs/
+output/
+*.csv
+
+
 # C extensions
 *.so
 
 # Vsual Studio Code
 .vscode/
+
+# Bebug file
+test.py
+
+# Notebooks
+.ipynb_checkpoints
+*.ipynb
 
 # Distribution / packaging
 .Python
