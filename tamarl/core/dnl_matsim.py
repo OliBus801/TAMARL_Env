@@ -115,7 +115,6 @@ class TorchDNLMATSim:
         
         # Flow Capacity Accumulator (MATSim lazy on-demand model)
         self.edge_capacity_accumulator = self.flow_capacity_per_step.clone().to(device=self.device, dtype=torch.float32)
-        self.flow_accumulator_last_updated = torch.zeros(self.num_edges, device=self.device, dtype=torch.int32)
         self.step_edge_limits = torch.zeros(self.num_edges, device=self.device, dtype=torch.float32)
 
         # OPT: Incremental buffer counts (avoids recomputing bincount on all agents)
@@ -175,7 +174,6 @@ class TorchDNLMATSim:
     def reset(self):
         self.edge_occupancy.fill_(0)
         self.edge_capacity_accumulator.copy_(self.flow_capacity_per_step)
-        self.flow_accumulator_last_updated.fill_(0)
         self.step_edge_limits.fill_(0)
         self.buffer_counts.fill_(0)
         
@@ -240,30 +238,12 @@ class TorchDNLMATSim:
     def _update_all_flow_accumulation(self):
         """
         Global flow accumulation for ALL edges, once per step.
-        
-        OPT: Replaces the lazy per-edge _update_flow_accumulation (71k calls)
-        with a single vectorized O(E) operation. Mathematically equivalent
-        because accumulation is linear in elapsed time.
         """
         remaining = self.flow_capacity_per_step - self.buffer_counts
-        elapsed = (self.current_step - self.flow_accumulator_last_updated).float()
-
-        accumulated = elapsed * self.flow_capacity_per_step
-        new_acc = torch.minimum(self.edge_capacity_accumulator + accumulated, remaining)
-
-        should_update = (elapsed > 0) & (self.edge_capacity_accumulator < remaining)
-
-        self.edge_capacity_accumulator = torch.where(
-            should_update, 
-            new_acc, 
-            self.edge_capacity_accumulator
-        )
-
-        current_step_tensor = torch.full_like(self.flow_accumulator_last_updated, self.current_step)
-        self.flow_accumulator_last_updated = torch.where(
-            should_update, 
-            current_step_tensor, 
-            self.flow_accumulator_last_updated
+        
+        self.edge_capacity_accumulator = torch.minimum(
+            self.edge_capacity_accumulator + self.flow_capacity_per_step, 
+            remaining
         )
 
     # =========================================================================
@@ -510,10 +490,9 @@ class TorchDNLMATSim:
         winners = arrived_sorted[proc_win_mask]
         w_edges = edges_sorted[proc_win_mask]
 
-        # Consume flow capacity (and mark consumption time for lazy accumulation)
+        # Consume flow capacity
         ones = torch.ones(winners.size(0), device=self.device)
         self.edge_capacity_accumulator.scatter_add_(0, w_edges, -ones)
-        self.flow_accumulator_last_updated[w_edges] = self.current_step
 
         # Event: entered_buffer (spatial → capacity buffer)
         if self.track_events:
@@ -593,10 +572,9 @@ class TorchDNLMATSim:
         winners = agents_sorted[flow_pass]
         w_edges = self.next_edge[winners]
 
-        # Consume flow capacity (and mark consumption time for lazy accumulation)
+        # Consume flow capacity
         ones = torch.ones(winners.size(0), device=self.device)
         self.edge_capacity_accumulator.scatter_add_(0, w_edges, -ones)
-        self.flow_accumulator_last_updated[w_edges] = self.current_step
 
         # Events: enters_traffic (only for agents that actually enter)
         if self.track_events:
@@ -628,7 +606,7 @@ class TorchDNLMATSim:
         # A. Process Nodes (Capacity -> Downstream Spatial)
         self._process_nodes_A()
 
-        # OPT: Global flow accumulation once per step (replaces 71k lazy calls)
+        # OPT: Global flow accumulation once per step
         self._update_all_flow_accumulation()
 
         # B. Process Links (Spatial -> Capacity) + Handle Arrivals
