@@ -35,7 +35,7 @@ EVENT_TYPE_NAMES = {
 class TorchDNLMATSim:
     def __init__(self, 
                  edge_static: torch.Tensor, 
-                 paths: torch.Tensor,
+                 paths: torch.Tensor = None,
                  device: str = 'cuda',
                  departure_times: torch.Tensor = None,
                  edge_endpoints: torch.Tensor = None,
@@ -43,20 +43,24 @@ class TorchDNLMATSim:
                  dt: float = 1.0,
                  seed: int = None,
                  enable_profiling: bool = False,
-                 track_events: bool = False):
+                 track_events: bool = False,
+                 first_edges: torch.Tensor = None,
+                 destinations: torch.Tensor = None):
         """
         Initialize the TorchDNLMATSim simulation engine.
         
         Args:
             edge_static: Tensor [E, 5] -> [length, free_flow_speed, capacity_storage (c_e), capacity_flow (D_e per hour), ff_travel_time]
-            paths: Tensor [A, MaxPathLen] -> Pre-calculated path indices for each agent.
+            paths: Tensor [A, MaxPathLen] -> Pre-calculated path indices for each agent. None for RL mode.
             device: Device to run on ('cuda' or 'cpu').
             departure_times: Tensor [A] -> Departure times for each agent.
-            edge_endpoints: Tensor [E, 2] -> [from_node, to_node] for connectivity validation. Optional.
+            edge_endpoints: Tensor [E, 2] -> [from_node, to_node] for connectivity validation.
             stuck_threshold: Time in steps an agent waits in buffer before forcing entry.
             dt: Simulation time step in seconds.
             enable_profiling: If True, enables cProfile.
             track_events: If True, records MATSim-style simulation events.
+            first_edges: Tensor [A] -> First edge for each agent (RL mode only).
+            destinations: Tensor [A] -> Destination node for each agent (RL mode only).
         """
         self.device = device
         self.stuck_threshold = stuck_threshold
@@ -92,11 +96,22 @@ class TorchDNLMATSim:
 
         # Move constants to device
         self.edge_static = edge_static.to(device)
-        self.paths = paths.to(device).long()  # OPT: store as int64 to avoid .long() conversions
+        
+        # RL mode: paths is None, routes are decided dynamically by the environment
+        self.rl_mode = (paths is None)
+        
+        if not self.rl_mode:
+            self.paths = paths.to(device).long()
+            self.num_agents = self.paths.shape[0]
+            self.max_path_len = self.paths.shape[1]
+        else:
+            self.paths = None
+            if departure_times is None:
+                raise ValueError("departure_times is mandatory in RL mode (paths=None).")
+            self.num_agents = departure_times.shape[0]
+            self.max_path_len = 0  # Not used in RL mode
         
         self.num_edges = self.edge_static.shape[0]
-        self.num_agents = self.paths.shape[0]
-        self.max_path_len = self.paths.shape[1]
 
         # Edge Attributes
         self.length = self.edge_static[:, 0].contiguous()
@@ -140,7 +155,24 @@ class TorchDNLMATSim:
         self.start_time.copy_(self.departure_times)
         
         # Pre-set first edge as next_edge for waiting agents
-        self.next_edge[:] = self.paths[:, 0]
+        if not self.rl_mode:
+            self.next_edge[:] = self.paths[:, 0]
+        else:
+            # RL mode: first_edges must be provided
+            if first_edges is not None:
+                self._first_edges = first_edges.to(device).long()
+            else:
+                raise ValueError("first_edges is mandatory in RL mode (paths=None).")
+            self.next_edge[:] = self._first_edges
+            
+            # Destinations for observation building
+            if destinations is not None:
+                self.destinations = destinations.to(device).long()
+            else:
+                self.destinations = None
+            
+            # Build outgoing-edges-per-node lookup for action masking
+            self._build_node_out_edges()
         
         # Agent Metrics [A, 2] -> [accumulated_distance, final_travel_time]
         self.agent_metrics = torch.zeros((self.num_agents, 2), device=self.device, dtype=torch.float32)
@@ -171,6 +203,34 @@ class TorchDNLMATSim:
             self._event_count = 0
             self._cpu_events_blocks = []
 
+    def _build_node_out_edges(self):
+        """Build outgoing-edges-per-node lookup from edge_endpoints.
+        
+        Creates:
+            self.num_nodes: int
+            self.max_out_degree: int
+            self.node_out_edges: Tensor [N, max_out_degree] padded with -1
+            self.node_out_degree: Tensor [N] actual number of outgoing edges per node
+        """
+        from_nodes = self.edge_endpoints[:, 0].long()
+        to_nodes = self.edge_endpoints[:, 1].long()
+        self.num_nodes = max(from_nodes.max().item(), to_nodes.max().item()) + 1
+        
+        # Count outgoing edges per node
+        out_count = torch.zeros(self.num_nodes, device=self.device, dtype=torch.long)
+        out_count.scatter_add_(0, from_nodes.to(self.device), torch.ones(self.num_edges, device=self.device, dtype=torch.long))
+        self.max_out_degree = out_count.max().item()
+        self.node_out_degree = out_count
+        
+        # Build padded lookup: node_out_edges[node, local_idx] = edge_id
+        self.node_out_edges = torch.full((self.num_nodes, self.max_out_degree), -1, device=self.device, dtype=torch.long)
+        fill_idx = torch.zeros(self.num_nodes, device=self.device, dtype=torch.long)
+        for e in range(self.num_edges):
+            n = from_nodes[e].item()
+            idx = fill_idx[n].item()
+            self.node_out_edges[n, idx] = e
+            fill_idx[n] += 1
+
     def reset(self):
         self.edge_occupancy.fill_(0)
         self.edge_capacity_accumulator.copy_(self.flow_capacity_per_step)
@@ -179,7 +239,10 @@ class TorchDNLMATSim:
         
         self.status.fill_(0)
         self.current_edge.fill_(-1)
-        self.next_edge[:] = self.paths[:, 0]
+        if not self.rl_mode:
+            self.next_edge[:] = self.paths[:, 0]
+        else:
+            self.next_edge[:] = self._first_edges
         self.path_ptr.fill_(0)
         self.arrival_time.fill_(0)
         self.stuck_since.fill_(0)
@@ -422,11 +485,18 @@ class TorchDNLMATSim:
         ptrs_sorted = self.path_ptr[arrived_sorted]
         next_ptrs_sorted = ptrs_sorted + 1
 
-        # Determine exiter vs mover: exiter if next path step is beyond path or padding
-        is_exiter = (next_ptrs_sorted >= self.max_path_len)
-        valid = ~is_exiter
-        path_next = self.paths[arrived_sorted[valid], next_ptrs_sorted[valid]]
-        is_exiter[valid] = (path_next == -1)
+        # Determine exiter vs mover
+        if not self.rl_mode:
+            # Path-based: exiter if next path step is beyond path or padding
+            is_exiter = (next_ptrs_sorted >= self.max_path_len)
+            valid = ~is_exiter
+            path_next = self.paths[arrived_sorted[valid], next_ptrs_sorted[valid]]
+            is_exiter[valid] = (path_next == -1)
+        else:
+            # RL mode: exiter if current edge's to_node == agent's destination
+            curr_to_nodes = self.edge_endpoints[edges_sorted, 1].long()
+            agent_dests = self.destinations[arrived_sorted]
+            is_exiter = (curr_to_nodes == agent_dests)
         is_mover = ~is_exiter
 
         # --- Per-link grouping ---
@@ -504,13 +574,14 @@ class TorchDNLMATSim:
         self.buffer_counts.scatter_add_(0, w_edges, ones)
 
         # Compute next_edge
-        w_next_ptrs = next_ptrs_sorted[proc_win_mask]
-        self.next_edge[winners] = -1
-        valid_ptr = w_next_ptrs < self.max_path_len
-        
-        valid_winners = winners[valid_ptr]
-        valid_w_next_ptrs = w_next_ptrs[valid_ptr]
-        self.next_edge[valid_winners] = self.paths[valid_winners, valid_w_next_ptrs]
+        self.next_edge[winners] = -1  # Default: needs decision (RL) or end-of-path
+        if not self.rl_mode:
+            w_next_ptrs = next_ptrs_sorted[proc_win_mask]
+            valid_ptr = w_next_ptrs < self.max_path_len
+            valid_winners = winners[valid_ptr]
+            valid_w_next_ptrs = w_next_ptrs[valid_ptr]
+            self.next_edge[valid_winners] = self.paths[valid_winners, valid_w_next_ptrs]
+        # In RL mode, next_edge stays -1 → environment will set it before next step()
 
     # =========================================================================
     # C. Schedule Demand (New agents enter the network)
@@ -588,13 +659,14 @@ class TorchDNLMATSim:
         self.buffer_counts.scatter_add_(0, w_edges, ones)
 
         # Compute next_edge
-        next_ptrs = self.path_ptr[winners] + 1
-        self.next_edge[winners] = -1
-        valid_ptr_mask = next_ptrs < self.max_path_len
-
-        v_agents = winners[valid_ptr_mask]
-        v_next_ptrs = next_ptrs[valid_ptr_mask]
-        self.next_edge[v_agents] = self.paths[v_agents, v_next_ptrs]
+        self.next_edge[winners] = -1  # Default: needs decision (RL) or end-of-path
+        if not self.rl_mode:
+            next_ptrs = self.path_ptr[winners] + 1
+            valid_ptr_mask = next_ptrs < self.max_path_len
+            v_agents = winners[valid_ptr_mask]
+            v_next_ptrs = next_ptrs[valid_ptr_mask]
+            self.next_edge[v_agents] = self.paths[v_agents, v_next_ptrs]
+        # In RL mode, next_edge stays -1 → environment will set it before next step()
 
         # Note: occupancy NOT added here (buffer is not part of link occupancy)
         # Note: first link distance NOT added (agent didn't traverse spatial buffer)
