@@ -263,7 +263,7 @@ class TorchDNLMATSim:
     def _flush_events(self):
         """Move the current GPU event buffer to CPU RAM and reset counter."""
         if self._event_count > 0:
-            self._cpu_events_blocks.append(self._event_buffer[:self._event_count].cpu())
+            self._cpu_events_blocks.append(self._event_buffer[:self._event_count].cpu().clone())
             self._event_count = 0
 
     def _record_events(self, event_type, agent_ids, edge_ids):
