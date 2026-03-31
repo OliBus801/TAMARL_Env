@@ -45,6 +45,7 @@ class DTAMarkovGameEnv(ParallelEnv):
         device: str = "cpu",
         seed: Optional[int] = None,
         stuck_threshold: int = 10,
+        track_events: bool = False,
     ):
         """Initialize the DTA Markov Game environment.
         
@@ -89,6 +90,7 @@ class DTAMarkovGameEnv(ParallelEnv):
             seed=seed,
             first_edges=self._scenario.first_edges,
             destinations=self._scenario.destinations,
+            track_events=track_events,
         )
         
         # Components
