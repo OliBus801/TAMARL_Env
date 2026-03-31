@@ -80,10 +80,18 @@ def parse_network(network_file, scale_factor=1.0, timestep=1.0):
     return node_id_to_idx, edges, link_id_to_idx
 
 def parse_population(pop_file, link_id_to_idx):
+    """Parse population XML into one agent per person with multi-leg support.
+    
+    Returns:
+        agents: list of dicts per person with keys:
+            - agent_id, dep_time, legs (list of path index lists),
+            - act_end_times, act_durations (per intermediate activity)
+        agent_metadata: list of dicts with agent_id for export
+    """
     print(f"Parsing Population: {pop_file}")
     
-    trips = []
-    trip_metadata = []
+    agents = []
+    agent_metadata = []
     
     count = 0
     skipped_no_path = 0
@@ -98,11 +106,7 @@ def parse_population(pop_file, link_id_to_idx):
         if elem.tag == "person":
             person_id = elem.get('id')
             
-            # Simple assumption: first selected plan or first plan
             selected_plan = None
-            
-            # Since we get "person" END event, all children (plan) are processed.
-            # We iterate over children of 'person' element
             for child in elem:
                 if child.tag == 'plan':
                     if child.get('selected') == 'yes':
@@ -112,18 +116,51 @@ def parse_population(pop_file, link_id_to_idx):
                         selected_plan = child
             
             if selected_plan is not None:
-                current_act_end_time = 0
-                trip_counter = 0
+                # Collect all elements in order
+                elements = list(selected_plan)
                 
-                for el in selected_plan:
+                # First pass: collect legs and intermediate activity attributes
+                first_dep_time = 0
+                person_legs = []       # list of path index lists
+                act_end_times = []     # per intermediate activity
+                act_durations = []     # per intermediate activity
+                
+                # Parse first activity end_time
+                first_act = True
+                pending_act_end = -1   # absolute end_time for next intermediate act
+                pending_act_dur = -1   # duration for next intermediate act
+                
+                for el in elements:
                     if el.tag in ['act', 'activity']:
                         end_time_str = el.get('end_time')
+                        dur_str = el.get('dur')
+                        max_dur_str = el.get('max_dur')
+                        
+                        # Compute absolute end_time
+                        act_end = -1
                         if end_time_str:
-                            current_act_end_time = time_to_sec(end_time_str)
+                            act_end = time_to_sec(end_time_str)
+                        
+                        # Compute duration: min(dur, max_dur) if both set
+                        act_dur = -1
+                        if dur_str and max_dur_str:
+                            act_dur = min(time_to_sec(dur_str), time_to_sec(max_dur_str))
+                        elif dur_str:
+                            act_dur = time_to_sec(dur_str)
+                        elif max_dur_str:
+                            act_dur = time_to_sec(max_dur_str)
+                        
+                        if first_act:
+                            # First activity: its end_time is the first departure time
+                            if act_end >= 0:
+                                first_dep_time = act_end
+                            elif act_dur >= 0:
+                                first_dep_time = act_dur
+                            first_act = False
                         else:
-                            max_dur = el.get('max_dur')
-                            if max_dur:
-                                current_act_end_time += time_to_sec(max_dur)
+                            # Intermediate or final activity
+                            act_end_times.append(act_end)
+                            act_durations.append(act_dur)
                     
                     elif el.tag == 'leg':
                         mode = el.get('mode')
@@ -144,26 +181,35 @@ def parse_population(pop_file, link_id_to_idx):
                                         break
                                 
                                 if valid_path and len(path_indices) > 0:
-                                    trips.append({
-                                        'dep_time': current_act_end_time,
-                                        'path': path_indices
-                                    })
-                                    trip_metadata.append({
-                                        'agent_id': person_id,
-                                        'trip_number': trip_counter,
-                                        'path_str': route_str
-                                    })
-                                    trip_counter += 1
+                                    person_legs.append(path_indices)
                                 else:
                                     skipped_no_path += 1
                             else:
                                 skipped_no_path += 1
+                
+                if len(person_legs) > 0:
+                    # Trim act_end_times/act_durations to match number of leg boundaries
+                    # We have len(person_legs) - 1 intermediate activities
+                    num_boundaries = len(person_legs) - 1
+                    act_end_times = act_end_times[:num_boundaries]
+                    act_durations = act_durations[:num_boundaries]
+                    
+                    agents.append({
+                        'dep_time': first_dep_time,
+                        'legs': person_legs,
+                        'act_end_times': act_end_times,
+                        'act_durations': act_durations,
+                    })
+                    agent_metadata.append({
+                        'agent_id': person_id,
+                    })
             
             count += 1
-            elem.clear() # Clear person element from memory
+            elem.clear()
             
-    print(f"Parsed {count} persons. Skipped {skipped_no_path} legs. Total trips: {len(trips)}")
-    return trips, trip_metadata
+    total_legs = sum(len(a['legs']) for a in agents)
+    print(f"Parsed {count} persons. Skipped {skipped_no_path} legs. Total agents: {len(agents)}, Total legs: {total_legs}")
+    return agents, agent_metadata
 
 def get_memory_usage():
     process = psutil.Process(os.getpid())
@@ -317,22 +363,49 @@ def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_facto
     del edges_data
     gc.collect()
     
-    departure_times = torch.tensor([t['dep_time'] for t in trips], dtype=torch.int32)
+    # Note: `trips` in parsing is now `agents`
+    agents_data = trips
+    departure_times = torch.tensor([a['dep_time'] for a in agents_data], dtype=torch.int32)
     
-    lengths = [len(t['path']) for t in trips]
-    max_len = max(lengths)
-    num_agents = len(trips)
+    num_agents = len(agents_data)
     
-    print(f"Packing {num_agents} paths (max len {max_len})...")
-    paths_tensor = torch.full((num_agents, max_len), -1, dtype=torch.int32)
+    # Calculate max lengths
+    max_path_len = 0
+    max_acts = 0
+    for a in agents_data:
+        # lengths of individual legs + sentinels (-2) between them
+        total_len = sum(len(leg) for leg in a['legs']) + len(a['legs']) - 1
+        max_path_len = max(max_path_len, total_len)
+        max_acts = max(max_acts, len(a['act_end_times']))
+
+    print(f"Packing {num_agents} paths (max len {max_path_len}, max int_acts {max_acts})...")
+    paths_tensor = torch.full((num_agents, max_path_len), -1, dtype=torch.int32)
+    act_end_times_tensor = torch.full((num_agents, max_acts), -1, dtype=torch.int32)
+    act_durations_tensor = torch.full((num_agents, max_acts), -1, dtype=torch.int32)
+    num_legs_tensor = torch.zeros(num_agents, dtype=torch.int32)
     
-    for i, t in enumerate(trips):
-        p = t['path']
-        paths_tensor[i, :len(p)] = torch.tensor(p, dtype=torch.int32)
+    for i, a in enumerate(agents_data):
+        legs = a['legs']
+        num_legs_tensor[i] = len(legs)
+        
+        # Build concatenated path with -2 sentinels
+        ptr = 0
+        for leg_idx, leg in enumerate(legs):
+            leg_len = len(leg)
+            paths_tensor[i, ptr:ptr+leg_len] = torch.tensor(leg, dtype=torch.int32)
+            ptr += leg_len
+            if leg_idx < len(legs) - 1:
+                paths_tensor[i, ptr] = -2  # sentinel
+                ptr += 1
+                
+        # Fill act times
+        n_acts = len(a['act_end_times'])
+        if n_acts > 0:
+            act_end_times_tensor[i, :n_acts] = torch.tensor(a['act_end_times'], dtype=torch.int32)
+            act_durations_tensor[i, :n_acts] = torch.tensor(a['act_durations'], dtype=torch.int32)
     
-    # We can free 'trips' list now if we don't need it later?
-    # We only need trip_metadata for final CSVs.
     del trips
+    agents_data = None
     gc.collect()
 
     # Object Sizes
@@ -361,12 +434,16 @@ def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_facto
         device=device, 
         departure_times=departure_times, 
         edge_endpoints=edge_endpoints,
+        act_end_times=act_end_times_tensor,
+        act_durations=act_durations_tensor,
+        num_legs=num_legs_tensor,
         dt=timestep,
         seed=seed, 
         stuck_threshold=10,
         enable_profiling=True,
         track_events=effective_track_events
     )
+
     
     # 5. Simulation Loop
     max_steps = int(end_hour * 3600)
@@ -426,6 +503,8 @@ def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_facto
     
     dep_times_np = departure_times.cpu().numpy()
     
+    # Note: trip_metadata was renamed to agent_metadata in parse_population
+    # but the variable returned is still captured as trip_metadata in run_benchmark
     df_metrics = pd.DataFrame(trip_metadata)
     
     # Format times as HH:MM:SS
@@ -435,7 +514,7 @@ def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_facto
     df_metrics['traveled_distance'] = metrics[:, 0]
     
     # Reorder columns as requested
-    df_metrics = df_metrics[['agent_id', 'trip_number', 'departure_time', 'travel_time', 'traveled_distance']]
+    df_metrics = df_metrics[['agent_id', 'departure_time', 'travel_time', 'traveled_distance']]
     
     # agents_metrics.csv --------------
     if save_agents:
@@ -446,8 +525,9 @@ def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_facto
     # paths.csv --------------
     if save_paths:
         df_paths = pd.DataFrame(trip_metadata)
-        df_paths.rename(columns={'path_str': 'path'}, inplace=True)
-        df_paths = df_paths[['agent_id', 'trip_number', 'path']]
+        # Note: 'path_str' is no longer stored since we have multiple legs per agent
+        # We can just ignore the path export or export a simplified version
+        df_paths = df_paths[['agent_id']]
         
         paths_out_path = os.path.join(output_dir, "paths.csv")
         df_paths.to_csv(paths_out_path, index=False)
