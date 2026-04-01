@@ -216,7 +216,7 @@ def get_memory_usage():
     mem_info = process.memory_info()
     return mem_info.rss / 1024 / 1024 # MB
 
-def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_factor=1.0, start_hour=0, end_hour=24, save_pickle=False, load_pickle=True, save_paths=False, save_agents=False, save_events=False, track_events=True, output_folder="output", seed=None):
+def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_factor=1.0, start_hour=0, end_hour=24, save_pickle=False, load_pickle=True, save_paths=False, save_legs=False, save_events=False, track_events=True, output_folder="output", seed=None):
     
     process = psutil.Process(os.getpid())
     def get_mem():
@@ -489,38 +489,55 @@ def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_facto
     # 6. Post-process & Export
     
     # Metrics: [traveled_distance, travel_time]
-    metrics = dnl.agent_metrics.cpu().numpy()
+    leg_metrics = dnl.leg_metrics.cpu().numpy()
+    leg_dep_times = dnl.leg_departure_times.cpu().numpy()
 
-    print(f"--- Average Agents Metrics ---")
-    print(f"Average Traveled Distance: {metrics[:, 0].mean():.2f}")
-    if metrics[:, 1].mean() > 0:
-        print(f"Average Travel Time: {metrics[:, 1].mean():.2f}")
-        print(f"Average Travel Speed: {metrics[:, 0].mean() / metrics[:, 1].mean():.2f}")
+    # Flatten leg metrics and filter out invalid (travel time == 0)
+    valid_mask = leg_metrics[:, :, 1] > 0
+    valid_metrics = leg_metrics[valid_mask]
+
+    print(f"--- Average Legs Metrics ---")
+    if len(valid_metrics) > 0:
+        avg_dist = valid_metrics[:, 0].mean()
+        avg_tt = valid_metrics[:, 1].mean()
+        print(f"Average Traveled Distance: {avg_dist:.2f}")
+        print(f"Average Travel Time: {avg_tt:.2f}")
+        print(f"Average Travel Speed: {avg_dist / avg_tt:.2f}")
     else:
+        avg_dist = 0.0
+        avg_tt = 0.0
+        print("Average Traveled Distance: 0.00")
         print("Average Travel Time: 0.00")
         print("Average Travel Speed: N/A")
     print("-----------------------")
     
-    dep_times_np = departure_times.cpu().numpy()
-    
+    rows = []
+    num_legs_arr = dnl.num_legs.cpu().numpy()
     # Note: trip_metadata was renamed to agent_metadata in parse_population
-    # but the variable returned is still captured as trip_metadata in run_benchmark
-    df_metrics = pd.DataFrame(trip_metadata)
+    # but the variable returned is captured as trip_metadata in run_benchmark
+    for i, t in enumerate(trip_metadata):
+        agent_id = t['agent_id']
+        num_legs = num_legs_arr[i]
+        for leg_idx in range(num_legs):
+            dep_t = leg_dep_times[i, leg_idx]
+            dist = leg_metrics[i, leg_idx, 0]
+            tt = leg_metrics[i, leg_idx, 1]
+            rows.append({
+                'agent_id': agent_id,
+                'leg_id': leg_idx,
+                'departure_time': sec_to_hms(dep_t),
+                'travel_time': sec_to_hms(tt),
+                'traveled_distance': dist
+            })
+            
+    df_metrics = pd.DataFrame(rows)
+    df_metrics = df_metrics[['agent_id', 'leg_id', 'departure_time', 'travel_time', 'traveled_distance']]
     
-    # Format times as HH:MM:SS
-    df_metrics['departure_time'] = [sec_to_hms(t) for t in dep_times_np]
-    df_metrics['travel_time'] = [sec_to_hms(t) for t in metrics[:, 1]]
-    
-    df_metrics['traveled_distance'] = metrics[:, 0]
-    
-    # Reorder columns as requested
-    df_metrics = df_metrics[['agent_id', 'departure_time', 'travel_time', 'traveled_distance']]
-    
-    # agents_metrics.csv --------------
-    if save_agents:
-        metrics_path = os.path.join(output_dir, "agent_metrics.csv")
+    # legs_metrics.csv --------------
+    if save_legs:
+        metrics_path = os.path.join(output_dir, "legs_metrics.csv")
         df_metrics.to_csv(metrics_path, index=False)
-        print(f"Saved metrics to {metrics_path}")
+        print(f"Saved leg metrics to {metrics_path}")
     
     # paths.csv --------------
     if save_paths:
@@ -534,12 +551,11 @@ def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_facto
         print(f"Saved paths to {paths_out_path}")
 
     # average_metrics.csv --------------
-    avg_trav_time = metrics[:, 1].mean()
-    avg_speed = metrics[:, 0].mean() / avg_trav_time if avg_trav_time > 0 else 0
+    avg_speed = avg_dist / avg_tt if avg_tt > 0 else 0
     
     avg_metrics = pd.DataFrame({
-        'avg_trav_dist': [metrics[:, 0].mean()],
-        'avg_trav_time': [avg_trav_time],
+        'avg_trav_dist': [avg_dist],
+        'avg_trav_time': [avg_tt],
         'avg_trav_speed': [avg_speed],
         'compute_time': [compute_time],
         'peak_memory': [peak_mem],
@@ -602,7 +618,7 @@ if __name__ == "__main__":
     parser.add_argument("--save_pickle", help="If set, saves parsed network and population to .pkl files for faster loading next time.", action="store_true")
     parser.add_argument("--no_load_pickle", help="Force reparsing from XML even if pickle exists.", action="store_true")
     parser.add_argument("--save_paths", help="If set, exports paths.csv containing agent paths.", action="store_true")
-    parser.add_argument("--save_agents", help="If set, exports agent_metrics.csv containing individual agent statistics.", action="store_true")
+    parser.add_argument("--save_legs", help="If set, exports legs_metrics.csv containing individual agent statistics.", action="store_true")
     parser.add_argument("--save_events", help="If set, exports MATSim-style simulation events to events.csv.", action="store_true")
     parser.add_argument("--track_events", help="Track simulation events in memory (needed for leg_histogram plot). Default: True.", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--hours", nargs=2, type=float, metavar=("START", "END"), help="Start and end hours for the simulation (e.g. --hours 7 7.5 for 7h00 to 7h30). Default: 0 24.", default=[0, 24])
@@ -617,4 +633,4 @@ if __name__ == "__main__":
     if not os.path.exists(args.root_folder):
         print(f"Root folder not found: {args.root_folder}")
     else:
-        run_benchmark(args.root_folder, args.population, timestep=float(args.timestep), scale_factor=float(args.scale_factor), start_hour=args.hours[0], end_hour=args.hours[1], save_pickle=args.save_pickle, load_pickle=not args.no_load_pickle, save_paths=args.save_paths, save_agents=args.save_agents, save_events=args.save_events, track_events=args.track_events, output_folder=args.output_folder, seed=int(args.seed) if args.seed is not None else None)
+        run_benchmark(args.root_folder, args.population, timestep=float(args.timestep), scale_factor=float(args.scale_factor), start_hour=args.hours[0], end_hour=args.hours[1], save_pickle=args.save_pickle, load_pickle=not args.no_load_pickle, save_paths=args.save_paths, save_legs=args.save_legs, save_events=args.save_events, track_events=args.track_events, output_folder=args.output_folder, seed=int(args.seed) if args.seed is not None else None)

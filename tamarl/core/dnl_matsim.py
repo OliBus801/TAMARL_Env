@@ -123,6 +123,8 @@ class TorchDNLMATSim:
         else:
             self.num_legs = torch.ones(self.num_agents, device=device, dtype=torch.long)
             
+        self.max_legs_count = self.num_legs.max().item() if self.num_agents > 0 else 1
+        
         if act_end_times is not None:
             self.act_end_times = act_end_times.to(device).int()
         else:
@@ -201,8 +203,10 @@ class TorchDNLMATSim:
             # Build outgoing-edges-per-node lookup for action masking
             self._build_node_out_edges()
         
-        # Agent Metrics [A, 2] -> [accumulated_distance, final_travel_time]
-        self.agent_metrics = torch.zeros((self.num_agents, 2), device=self.device, dtype=torch.float32)
+        # Leg Metrics [A, MaxLegs, 2] -> [accumulated_distance, final_travel_time]
+        self.leg_metrics = torch.zeros((self.num_agents, self.max_legs_count, 2), device=self.device, dtype=torch.float32)
+        # Leg departure times [A, MaxLegs] -> Actual step when agent departed for that leg
+        self.leg_departure_times = torch.zeros((self.num_agents, self.max_legs_count), device=self.device, dtype=torch.int32)
 
         # Optimization: Wakeup Time [A]
         # Unified scheduler: agents are only processed if current_step >= wakeup_time
@@ -280,7 +284,8 @@ class TorchDNLMATSim:
         self.stuck_since.fill_(0)
         self.start_time.copy_(self.departure_times)
         
-        self.agent_metrics.fill_(0)
+        self.leg_metrics.fill_(0)
+        self.leg_departure_times.fill_(0)
         self.wakeup_time.copy_(self.departure_times)
         self._departure_emitted.fill_(False)
         self.current_step = 0
@@ -323,7 +328,7 @@ class TorchDNLMATSim:
         s = self._event_count
         buf[s:needed, 0] = self.current_step
         buf[s:needed, 1] = event_type
-        buf[s:needed, 2] = agent_ids  # implicit int64→int32 cast, avoids .int() overhead
+        buf[s:needed, 2] = agent_ids
         buf[s:needed, 3] = edge_ids
         self._event_count = needed
 
@@ -574,7 +579,9 @@ class TorchDNLMATSim:
         all_proc_agents = arrived_sorted[processable]
         all_proc_ptrs = ptrs_sorted[processable]
         traversed = (all_proc_ptrs > 0)
-        self.agent_metrics[all_proc_agents[traversed], 0] += self.length[all_proc_edges[traversed]]
+        trav_agents = all_proc_agents[traversed]
+        trav_c_legs = self.current_leg[trav_agents]
+        self.leg_metrics[trav_agents, trav_c_legs, 0] += self.length[all_proc_edges[traversed]]
 
         # --- Exiters: leave the network (waiting for next leg dispatch) ---
         exiters = arrived_sorted[proc_exit_mask]
@@ -639,12 +646,20 @@ class TorchDNLMATSim:
             if done_agents.numel() > 0:
                 self.status[done_agents] = 3
                 self.wakeup_time[done_agents] = self.infinity
-                self.agent_metrics[done_agents, 1] = (self.current_step - self.start_time[done_agents]).float()
+                
+                # Travel time for the final leg
+                done_c_legs = self.current_leg[done_agents]
+                dep_times = self.leg_departure_times[done_agents, done_c_legs]
+                self.leg_metrics[done_agents, done_c_legs, 1] = (self.current_step - dep_times).float()
             
             # 1b. Agents with more legs
             cont_agents = exiters[has_more]
             if cont_agents.numel() > 0:
                 c_legs_cont = c_legs[has_more]
+                
+                # Travel time for the completed intermediate leg
+                dep_times_cont = self.leg_departure_times[cont_agents, c_legs_cont]
+                self.leg_metrics[cont_agents, c_legs_cont, 1] = (self.current_step - dep_times_cont).float()
                 
                 # Fetch activity durations and end times (-1 if missing)
                 end_t = self.act_end_times[cont_agents, c_legs_cont]
@@ -711,6 +726,10 @@ class TorchDNLMATSim:
             
             dep_agents = waiting_agents[departing_now]
             dep_edges = first_edges[departing_now]
+            
+            # Record departure time for the leg
+            dep_c_legs = self.current_leg[dep_agents]
+            self.leg_departure_times[dep_agents, dep_c_legs] = self.current_step
             
             # The activity link is recorded as the downstream link they are departing towards.
             # MATSim uses the previous link for the actend, but we don't store it reliably across 
@@ -832,8 +851,8 @@ class TorchDNLMATSim:
         Return dict with:
         - arrived_count
         - en_route_count
-        - avg_travel_time (arrived)
-        - avg_travel_dist (arrived)
+        - avg_travel_time (completed legs)
+        - avg_travel_dist (completed legs)
         """
         done_mask = (self.status == 3)
         # En route: Status 1 (Traveling) or 2 (Buffer)
@@ -845,9 +864,13 @@ class TorchDNLMATSim:
         avg_time = 0.0
         avg_dist = 0.0
         
-        if arrived_count > 0:
-            avg_time = self.agent_metrics[done_mask, 1].mean().item()
-            avg_dist = self.agent_metrics[done_mask, 0].mean().item()
+        # Valid legs have travel time > 0
+        leg_m = self.leg_metrics.view(-1, 2)
+        valid_legs = leg_m[:, 1] > 0
+        
+        if valid_legs.sum().item() > 0:
+            avg_time = leg_m[valid_legs, 1].mean().item()
+            avg_dist = leg_m[valid_legs, 0].mean().item()
             
         return {
             "arrived_count": arrived_count,
