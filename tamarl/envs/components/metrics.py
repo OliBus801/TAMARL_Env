@@ -16,7 +16,9 @@ def compute_tstt(dnl: TorchDNLMATSim) -> float:
     """
     done_mask = (dnl.status == 3)
     if done_mask.any():
-        return dnl.agent_metrics[done_mask, 1].sum().item() * dnl.dt
+        valid_legs = dnl.leg_metrics[done_mask, :, 1] > 0
+        if valid_legs.any():
+            return dnl.leg_metrics[done_mask, :, 1][valid_legs].sum().item() * dnl.dt
     return 0.0
 
 
@@ -24,7 +26,9 @@ def compute_mean_travel_time(dnl: TorchDNLMATSim) -> float:
     """Compute mean travel time across arrived agents."""
     done_mask = (dnl.status == 3)
     if done_mask.any():
-        return dnl.agent_metrics[done_mask, 1].mean().item() * dnl.dt
+        valid_legs = dnl.leg_metrics[done_mask, :, 1] > 0
+        if valid_legs.any():
+            return dnl.leg_metrics[done_mask, :, 1][valid_legs].mean().item() * dnl.dt
     return 0.0
 
 
@@ -56,7 +60,11 @@ def compute_travel_time_stats(dnl: TorchDNLMATSim) -> Dict[str, float]:
     if not done_mask.any():
         return {k: 0.0 for k in ['mean', 'std', 'min', 'max', 'median', 'p90', 'p95']}
     
-    tt = dnl.agent_metrics[done_mask, 1].cpu().float() * dnl.dt
+    valid_legs = dnl.leg_metrics[done_mask, :, 1] > 0
+    if not valid_legs.any():
+        return {k: 0.0 for k in ['mean', 'std', 'min', 'max', 'median', 'p90', 'p95']}
+        
+    tt = dnl.leg_metrics[done_mask, :, 1][valid_legs].cpu().float() * dnl.dt
     tt_np = tt.numpy()
     
     return {
@@ -170,10 +178,11 @@ def _run_episode_get_travel_times(env, policy) -> Dict[str, float]:
     travel_times = {}
     done_mask = (env.dnl.status == 3)
     if done_mask.any():
-        tt_tensor = env.dnl.agent_metrics[:, 1].cpu() * env.dnl.dt
         for i in range(env.dnl.num_agents):
             if env.dnl.status[i].item() == 3:
-                travel_times[f"agent_{i}"] = float(tt_tensor[i])
+                agent_tt = env.dnl.leg_metrics[i, :, 1]
+                valid_tt = agent_tt[agent_tt > 0]
+                travel_times[f"agent_{i}"] = float(valid_tt.sum().item() * env.dnl.dt)
     
     return travel_times
 
@@ -200,5 +209,7 @@ def _run_episode_with_deviation(env, policy, deviant_agent: str, rng) -> Optiona
     # Get deviant's travel time
     agent_idx = int(deviant_agent.split("_")[-1])
     if env.dnl.status[agent_idx].item() == 3:
-        return float(env.dnl.agent_metrics[agent_idx, 1].item() * env.dnl.dt)
+        agent_tt = env.dnl.leg_metrics[agent_idx, :, 1]
+        valid_tt = agent_tt[agent_tt > 0]
+        return float(valid_tt.sum().item() * env.dnl.dt)
     return None

@@ -133,22 +133,17 @@ def parse_population(pop_file, link_id_to_idx):
                 for el in elements:
                     if el.tag in ['act', 'activity']:
                         end_time_str = el.get('end_time')
-                        dur_str = el.get('dur')
-                        max_dur_str = el.get('max_dur')
+                        duration_str = el.get('duration')
                         
                         # Compute absolute end_time
                         act_end = -1
                         if end_time_str:
                             act_end = time_to_sec(end_time_str)
                         
-                        # Compute duration: min(dur, max_dur) if both set
+                        # Compute duration
                         act_dur = -1
-                        if dur_str and max_dur_str:
-                            act_dur = min(time_to_sec(dur_str), time_to_sec(max_dur_str))
-                        elif dur_str:
-                            act_dur = time_to_sec(dur_str)
-                        elif max_dur_str:
-                            act_dur = time_to_sec(max_dur_str)
+                        if duration_str:
+                            act_dur = time_to_sec(duration_str)
                         
                         if first_act:
                             # First activity: its end_time is the first departure time

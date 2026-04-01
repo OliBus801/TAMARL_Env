@@ -390,8 +390,9 @@ class TorchDNLMATSim:
             # stuckAndAbort: remove from network
             self.status[stuck_agents] = 3
             self.wakeup_time[stuck_agents] = self.infinity
-            start_times = self.start_time[stuck_agents]
-            self.agent_metrics[stuck_agents, 1] = (self.current_step - start_times).float()
+            c_legs_stuck = self.current_leg[stuck_agents]
+            dep_times = self.leg_departure_times[stuck_agents, c_legs_stuck]
+            self.leg_metrics[stuck_agents, c_legs_stuck, 1] = (self.current_step - dep_times).float()
             # OPT: Update buffer_counts for agents leaving buffer
             self.buffer_counts.scatter_add_(0, m_curr[disconnected],
                 -torch.ones(num_stuck, device=self.device))
@@ -665,27 +666,29 @@ class TorchDNLMATSim:
                 end_t = self.act_end_times[cont_agents, c_legs_cont]
                 dur_t = self.act_durations[cont_agents, c_legs_cont]
                 
-                # Priority: end_time > dur/max_dur
-                # Wait: wakeup = min(end_time, current_step + dur) based on which are set
-                # If neither are set (both -1), wakeup = current_step (leave immediately)
+                # Priority: duration > end_time
+                # "Un agent qui arrive à destination doit *au moins* attendre jusqu'à la fin de la duration."
+                # "Si seulement end_time est spécifié, alors l'agent quitteras ... au end_time (ou après s'il arrive en retard)."
                 wakeup = torch.full_like(end_t, self.infinity)
                 
                 has_end = end_t >= 0
                 has_dur = dur_t >= 0
                 
-                # If both, take min
                 both = has_end & has_dur
-                wakeup[both] = torch.minimum(end_t[both], (self.current_step + dur_t[both]).int())
-                
-                # If only one
                 only_end = has_end & ~has_dur
-                wakeup[only_end] = end_t[only_end]
-                
                 only_dur = has_dur & ~has_end
+                neither = ~has_end & ~has_dur
+                
+                # If both: wait at least duration. If end_time is later, wait until end_time.
+                wakeup[both] = torch.maximum(end_t[both], (self.current_step + dur_t[both]).int())
+                
+                # If only end_time: wait until end_time, clamp to current_step if already late
+                wakeup[only_end] = torch.clamp(end_t[only_end], min=self.current_step)
+                
+                # If only duration: wait exactly duration
                 wakeup[only_dur] = (self.current_step + dur_t[only_dur]).int()
                 
                 # Neither
-                neither = ~has_end & ~has_dur
                 wakeup[neither] = self.current_step
                 
                 # Transition to waiting/activity status
