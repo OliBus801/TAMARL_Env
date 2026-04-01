@@ -9,6 +9,7 @@ import functools
 from typing import Dict, Optional, Set, Tuple
 
 import numpy as np
+import torch
 from gymnasium import spaces
 from pettingzoo import ParallelEnv
 
@@ -90,6 +91,9 @@ class DTAMarkovGameEnv(ParallelEnv):
             seed=seed,
             first_edges=self._scenario.first_edges,
             destinations=self._scenario.destinations,
+            num_legs=self._scenario.num_legs,
+            act_end_times=self._scenario.act_end_times,
+            act_durations=self._scenario.act_durations,
             track_events=track_events,
         )
         
@@ -199,12 +203,14 @@ class DTAMarkovGameEnv(ParallelEnv):
         terminations = {}
         truncations = {}
         
-        for agent_id in current_agents:
-            agent_idx = int(agent_id.split("_")[-1])
-            status = self.dnl.status[agent_idx].item()
+        if current_agents:
+            active_indices = [int(a.split("_")[-1]) for a in current_agents]
+            active_tensor = torch.tensor(active_indices, device=self.dnl.device, dtype=torch.long)
+            statuses = self.dnl.status[active_tensor].cpu().numpy()
             
-            terminations[agent_id] = (status == 3)  # Arrived at destination
-            truncations[agent_id] = False
+            for i, agent_id in enumerate(current_agents):
+                terminations[agent_id] = bool(statuses[i] == 3)  # Arrived at destination
+                truncations[agent_id] = False
         
         # Check max steps truncation
         if self.dnl.current_step >= self._max_steps:
@@ -229,20 +235,34 @@ class DTAMarkovGameEnv(ParallelEnv):
         observations = self._obs_builder.build_observations(deciding)
         
         # For non-deciding remaining agents, build a current obs
-        for agent_id in self.agents:
-            if agent_id not in observations:
-                agent_idx = int(agent_id.split("_")[-1])
-                status = self.dnl.status[agent_idx].item()
-                if status in (1, 2):  # traveling or in buffer
-                    curr_edge = self.dnl.current_edge[agent_idx].item()
-                    node = self.dnl.edge_endpoints[curr_edge, 1].item()
-                    dest = self.dnl.destinations[agent_idx].item()
+        if self.agents:
+            agent_indices = np.array([int(a.split("_")[-1]) for a in self.agents])
+            idx_tensor = torch.from_numpy(agent_indices).to(self.dnl.device)
+            statuses = self.dnl.status[idx_tensor].cpu().numpy()
+            
+            needs_obs_mask = np.array([a not in observations for a in self.agents])
+            valid_mask = needs_obs_mask & ((statuses == 1) | (statuses == 2))
+            
+            if valid_mask.any():
+                valid_idx_tensor = torch.from_numpy(agent_indices[valid_mask]).to(self.dnl.device)
+                curr_edges = self.dnl.current_edge[valid_idx_tensor]
+                nodes = self.dnl.edge_endpoints[curr_edges, 1].cpu().numpy()
+                c_legs = self.dnl.current_leg[valid_idx_tensor]
+                dests = self.dnl.destinations[valid_idx_tensor, c_legs].cpu().numpy()
+                norm_time = self.dnl.current_step / self._max_steps
+                
+                valid_agent_ids = [self.agents[i] for i in np.where(valid_mask)[0]]
+                for i, agent_id in enumerate(valid_agent_ids):
                     obs = np.zeros(self._obs_builder.obs_size, dtype=np.float32)
-                    obs[0] = float(node)
-                    obs[1] = float(dest)
-                    obs[2] = self.dnl.current_step / self._max_steps
+                    obs[0] = float(nodes[i])
+                    obs[1] = float(dests[i])
+                    obs[2] = norm_time
                     observations[agent_id] = obs
-                else:
+                    
+            zero_mask = needs_obs_mask & ~valid_mask
+            if zero_mask.any():
+                zero_agent_ids = [self.agents[i] for i in np.where(zero_mask)[0]]
+                for agent_id in zero_agent_ids:
                     observations[agent_id] = np.zeros(self._obs_builder.obs_size, dtype=np.float32)
         
         # 8. Build infos with action masks

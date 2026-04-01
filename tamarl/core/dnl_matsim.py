@@ -195,8 +195,7 @@ class TorchDNLMATSim:
             
             # Destinations for observation building
             if destinations is not None:
-                self._all_destinations = destinations.to(device).long()
-                self.destinations = self._all_destinations[:, 0]
+                self.destinations = destinations.to(device).long()
             else:
                 self.destinations = None
             
@@ -275,8 +274,6 @@ class TorchDNLMATSim:
             self.next_edge[:] = self.paths[:, 0]
         else:
             self._first_edges = self._all_first_edges[:, 0]
-            if self.destinations is not None:
-                self.destinations = self._all_destinations[:, 0]
             self.next_edge[:] = self._first_edges
             
         self.path_ptr.fill_(0)
@@ -533,7 +530,8 @@ class TorchDNLMATSim:
         else:
             # RL mode: exiter if current edge's to_node == agent's destination
             curr_to_nodes = self.edge_endpoints[edges_sorted, 1].long()
-            agent_dests = self.destinations[arrived_sorted]
+            c_legs = self.current_leg[arrived_sorted]
+            agent_dests = self.destinations[arrived_sorted, c_legs]
             is_exiter = (curr_to_nodes == agent_dests)
         is_mover = ~is_exiter
 
@@ -709,8 +707,6 @@ class TorchDNLMATSim:
                     self.next_edge[cont_agents] = self.paths[cont_agents, next_ptrs]
                 else:
                     self.next_edge[cont_agents] = self._all_first_edges[cont_agents, new_legs]
-                    if self.destinations is not None:
-                        self.destinations[cont_agents] = self._all_destinations[cont_agents, new_legs]
 
         # --- Phase 2: Process Waiting Agents (status=0) ---
         demand_mask = (self.status == 0) & (self.wakeup_time <= self.current_step)

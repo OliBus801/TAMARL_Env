@@ -96,13 +96,9 @@ class QLearningAgent:
         occupancies = obs[occ_start:occ_end]
 
         # Bin occupancies into discrete levels
-        bin_edges = np.linspace(0.0, 1.0, self.n_congestion_bins + 1)
-        binned = tuple(
-            max(0, min(int(np.digitize(o, bin_edges) - 1), self.n_congestion_bins - 1))
-            for o in occupancies
-        )
+        binned = np.clip((occupancies * self.n_congestion_bins).astype(int), 0, self.n_congestion_bins - 1)
 
-        return (current_node, destination, *binned)
+        return (current_node, destination, *binned.tolist())
 
     # ── Action Selection ─────────────────────────────────────────────────
 

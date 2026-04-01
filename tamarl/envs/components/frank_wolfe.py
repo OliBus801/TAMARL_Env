@@ -156,16 +156,16 @@ def _extract_od_demand(scenario: ScenarioData) -> List[Tuple[int, int, float]]:
     first_edges = scenario.first_edges.numpy()
     destinations = scenario.destinations.numpy()
     
-    # Get origin nodes from first_edges
-    origins = edge_endpoints[first_edges, 0]
-    
-    # Aggregate OD pairs
+    # Aggregate OD pairs across all agents and all their legs
     od_counts: Dict[Tuple[int, int], float] = {}
-    for i in range(len(origins)):
-        o = int(origins[i])
-        d = int(destinations[i])
-        key = (o, d)
-        od_counts[key] = od_counts.get(key, 0.0) + 1.0
+    for i in range(first_edges.shape[0]):
+        for leg in range(first_edges.shape[1]):
+            fe = first_edges[i, leg]
+            if fe >= 0:  # valid leg
+                o = int(edge_endpoints[fe, 0])
+                d = int(destinations[i, leg])
+                key = (o, d)
+                od_counts[key] = od_counts.get(key, 0.0) + 1.0
     
     return [(o, d, count) for (o, d), count in od_counts.items()]
 
