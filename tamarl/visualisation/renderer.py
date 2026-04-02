@@ -597,7 +597,7 @@ def render_animation(scenario_folder: str, output_folder: str,
                      output_path: str = None, fmt: str = 'gif', scale_factor: float = 1.0,
                      text_scale_factor: float = 1.0, show_labels: bool = True,
                      fps: int = 5, dpi: int = 150, fade_steps: int = 5,
-                     time_range: tuple = None):
+                     time_range: tuple = None, speed: int = 1):
     """Generate a GIF or MP4 animation of a simulation.
 
     Args:
@@ -609,6 +609,7 @@ def render_animation(scenario_folder: str, output_folder: str,
         dpi: Resolution
         fade_steps: (unused, kept for CLI compat)
         time_range: Optional (start_sec, end_sec) tuple to filter events
+        speed: Render 1 out of every `speed` frames (speed up factor)
     """
     matplotlib.use('Agg')  # Non-interactive backend for file rendering
 
@@ -668,17 +669,21 @@ def render_animation(scenario_folder: str, output_folder: str,
     # 4. Create animation
     fig, ax = plt.subplots(figsize=(fig_w, fig_h), facecolor='#1a1a2e')
 
-    pbar = tqdm(total=total_steps, desc='🎞️  Rendering', unit='frame',
+    frames_to_render = range(0, total_steps, speed)
+    num_frames = len(frames_to_render)
+
+    pbar = tqdm(total=num_frames, desc='🎞️  Rendering', unit='frame',
                 bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]')
 
-    def animate(frame):
+    def animate(i):
+        frame = frames_to_render[i]
         _draw_frame(ax, nodes, links, agent_ids, timelines, frame,
                     per_step_stats, node_size, agent_size, scale_factor,
                     text_scale_factor, show_labels)
         pbar.update(1)
 
-    print(f"\n🎞️  Rendering {total_steps} frames at {fps} FPS...")
-    anim = FuncAnimation(fig, animate, frames=total_steps, interval=1000 // fps)
+    print(f"\n🎞️  Rendering {num_frames} frames (speed {speed}x) at {fps} FPS...")
+    anim = FuncAnimation(fig, animate, frames=num_frames, interval=1000 // fps)
 
     if fmt == 'gif':
         print("💾 Saving as GIF...")

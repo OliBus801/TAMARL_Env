@@ -67,6 +67,7 @@ class QLearningAgent:
         # Transition buffer: stores (state, action) per agent for TD update
         self._prev_state: Dict[str, Tuple] = {}
         self._prev_action: Dict[str, int] = {}
+        self._accumulated_reward: Dict[str, float] = defaultdict(float)
 
         # Stats
         self.total_updates = 0
@@ -158,50 +159,56 @@ class QLearningAgent:
         truncations: Dict[str, bool],
         infos: Dict[str, dict],
     ):
-        """Perform per-agent Q-learning updates.
-
-        Q(s, a) ← Q(s, a) + α * [r + γ * max_a' Q(s', a') - Q(s, a)]
+        """Perform per-agent Q-learning updates natively handling SMDP multi-step transitions.
+        
+        Rewards are accumulated while the agent travels. The Q-table is updated 
+        only when the agent reaches the next decision event or terminates.
         """
         for agent_id, reward in rewards.items():
             if agent_id not in self._prev_state:
                 continue
 
+            # Accumulate reward over the link traversal
+            self._accumulated_reward[agent_id] += reward
+
+            done = terminations.get(agent_id, False) or truncations.get(agent_id, False)
+            info = infos.get(agent_id, {})
+            mask_next = info.get("action_mask")
+            is_deciding = mask_next is not None and mask_next.sum() > 0
+
+            # Only perform TD update if the agent makes a new decision or is done
+            if not done and not is_deciding:
+                continue
+
             s = self._prev_state[agent_id]
             a = self._prev_action[agent_id]
             q_table = self._get_q_table(agent_id)
-
-            done = terminations.get(agent_id, False) or truncations.get(agent_id, False)
+            accum_r = self._accumulated_reward[agent_id]
 
             if done:
-                target = reward
+                target = accum_r
             else:
                 obs_next = observations.get(agent_id)
                 if obs_next is not None:
                     s_next = self._discretise_obs(obs_next)
-                    mask_next = infos.get(agent_id, {}).get("action_mask")
-
                     q_next = q_table[s_next]
-                    if mask_next is not None and mask_next.sum() > 0:
-                        valid_next = np.where(mask_next > 0)[0]
-                        max_q_next = float(q_next[valid_next].max())
-                    else:
-                        max_q_next = float(q_next.max())
-
-                    target = reward + self.gamma * max_q_next
+                    valid_next = np.where(mask_next > 0)[0]
+                    max_q_next = float(q_next[valid_next].max())
+                    target = accum_r + self.gamma * max_q_next
                 else:
-                    target = reward
+                    target = accum_r
 
             # Q-learning update on this agent's own table
             q_table[s][a] += self.alpha * (target - q_table[s][a])
             self.total_updates += 1
 
-        # Clean up terminated agents' transition buffers
-        for agent_id in list(self._prev_state.keys()):
-            done = terminations.get(agent_id, False) or truncations.get(agent_id, False)
+            # Reset accumulated reward for the next link
+            self._accumulated_reward[agent_id] = 0.0
+
             if done:
                 del self._prev_state[agent_id]
-                if agent_id in self._prev_action:
-                    del self._prev_action[agent_id]
+                del self._prev_action[agent_id]
+                del self._accumulated_reward[agent_id]
 
     # ── Epsilon Decay ────────────────────────────────────────────────────
 

@@ -120,6 +120,9 @@ def train(
     # Render
     render: Optional[str] = None,
     render_format: str = 'gif',
+    render_fps: int = 5,
+    render_hours: Optional[tuple] = None,
+    render_speed: int = 1,
     # W&B
     wandb_enabled: bool = False,
     wandb_project: str = "tamarl",
@@ -336,6 +339,10 @@ def train(
                     idx_to_link_id=idx_to_link_id,
                     episode=ep + 1,
                     fmt=render_format,
+                    render_fps=render_fps,
+                    render_hours=render_hours,
+                    render_speed=render_speed,
+                    filename=wandb_run_name if wandb_run_name else None,
                 )
 
             window_stats = []
@@ -380,6 +387,10 @@ def train(
             idx_to_link_id=idx_to_link_id,
             episode=n_episodes,
             fmt=render_format,
+            render_fps=render_fps,
+            render_hours=render_hours,
+            render_speed=render_speed,
+            filename=wandb_run_name if wandb_run_name else None,
         )
 
     env.close()
@@ -430,6 +441,10 @@ if __name__ == "__main__":
                         help="Render episodes: 'interval' (at each log_interval) or 'end' (final episode)")
     parser.add_argument("--render_format", default="gif", choices=["gif", "mp4", "live"],
                         help="Render format: gif, mp4, or live")
+    parser.add_argument("--render_fps", type=int, default=5, help="FPS for rendered animation (default: 5)")
+    parser.add_argument("--render_hours", type=float, nargs=2, default=None,
+                        help="Start and end hours for rendering (e.g. --render_hours 0 0.15)")
+    parser.add_argument("--render_speed", type=int, default=1, help="Speed factor for rendering (default: 1)")
 
     args = parser.parse_args()
 
@@ -451,6 +466,9 @@ if __name__ == "__main__":
         log_interval=args.log_interval,
         render=args.render,
         render_format=args.render_format,
+        render_fps=args.render_fps,
+        render_hours=args.render_hours,
+        render_speed=args.render_speed,
         wandb_enabled=args.wandb,
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run_name,

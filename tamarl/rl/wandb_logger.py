@@ -39,6 +39,11 @@ class WandbLogger:
                 tags=tags,
                 reinit=True,
             )
+            
+            # Use 'episode' as the custom x-axis for all metrics plotted
+            self._wandb.define_metric("episode")
+            self._wandb.define_metric("*", step_metric="episode")
+            
             print(f"📊 W&B run: {self._run.url}")
         except ImportError:
             print("⚠️  wandb not installed, logging disabled")

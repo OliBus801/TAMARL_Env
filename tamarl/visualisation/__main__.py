@@ -122,6 +122,7 @@ def main():
             fps=args.fps,
             dpi=args.dpi,
             time_range=time_range,
+            speed=args.speed,
         )
 
 if __name__ == "__main__":
