@@ -32,14 +32,6 @@ def compute_mean_travel_time(dnl: TorchDNLMATSim) -> float:
     return 0.0
 
 
-def compute_normalized_score(tstt_rl: float, tstt_analytical: float) -> float:
-    """Normalized performance score: 1 - (TSTT_RL - TSTT_analytical) / TSTT_analytical.
-    
-    Higher is better. 1.0 = matches analytical optimum.
-    """
-    if tstt_analytical <= 0:
-        return float('-inf')
-    return 1.0 - (tstt_rl - tstt_analytical) / tstt_analytical
 
 
 def compute_arrival_rate(dnl: TorchDNLMATSim) -> float:

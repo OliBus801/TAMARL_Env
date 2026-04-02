@@ -14,10 +14,9 @@ from tqdm import tqdm
 from tamarl.envs.dta_markov_game_parallel import DTAMarkovGameEnv
 from tamarl.envs.components.metrics import (
     compute_tstt, compute_mean_travel_time, compute_arrival_rate,
-    compute_travel_time_stats, compute_normalized_score,
+    compute_travel_time_stats,
     compute_mean_episode_reward, compute_reward_stats,
 )
-from tamarl.envs.components.frank_wolfe import solve_static_tap
 from tamarl.envs.scenario_loader import load_scenario
 from tamarl.rl.wandb_logger import WandbLogger
 from tamarl.rl.render_helper import render_episode
@@ -89,7 +88,7 @@ def _aggregate_stats(window: List[Dict]) -> Dict[str, float]:
     """Aggregate stats over a window of episodes."""
     keys = ['tstt', 'mean_travel_time', 'arrival_rate', 'mean_reward',
             'episode_length', 'n_decisions', 'tt_p90', 'tt_p95',
-            'normalized_score', 'wall_time']
+            'wall_time']
     agg = {}
     for k in keys:
         vals = [s[k] for s in window if k in s]
@@ -237,20 +236,10 @@ def train(
         'max_out_degree': env.dnl.max_out_degree,
     })
 
-    # ── Analytical baseline via Frank-Wolfe ──
-    print("Computing analytical baseline (Frank-Wolfe)...")
+    # Load scenario data (required for rendering)
     scenario_data = load_scenario(
         scenario_path, population_filter=population_filter, timestep=timestep
     )
-    fw_result = solve_static_tap(
-        scenario_data, alpha=bpr_alpha, beta=bpr_beta, verbose=True
-    )
-    tstt_analytical = fw_result.tstt
-    print(f"  ✓ Analytical TSTT = {tstt_analytical:.1f}s "
-          f"({'converged' if fw_result.converged else 'NOT converged'}, "
-          f"{fw_result.iterations} iters)\n")
-
-    logger.log_analytical_baseline(tstt_analytical, fw_result)
 
     # Build reverse link ID map for rendering (now that scenario_data is loaded)
     idx_to_link_id = None
@@ -268,18 +257,13 @@ def train(
         stats = run_episode(env, agent)
         wall_time = time.time() - t0
 
-        # Normalized score: 1.0 = matches analytical
-        norm_score = compute_normalized_score(stats['tstt'], tstt_analytical)
-        stats['normalized_score'] = norm_score
         stats['wall_time'] = wall_time
 
         all_stats.append(stats)
         window_stats.append(stats)
 
-        # Update tqdm postfix with latest values
         postfix = {
             'TSTT': f"{stats['tstt']:.0f}",
-            'Score': f"{norm_score:.3f}",
             'Arr': f"{stats['arrival_rate']*100:.0f}%",
         }
         if 'epsilon' in stats:
@@ -298,7 +282,6 @@ def train(
                 f"({len(window_stats)} eps) ───────────────────────"
             )
             tqdm.write(f"  │ TSTT:       {agg['tstt_mean']:.0f} ± {agg['tstt_std']:.0f}")
-            tqdm.write(f"  │ Score:      {agg['normalized_score_mean']:.3f} ± {agg['normalized_score_std']:.3f}")
             tqdm.write(f"  │ Mean TT:    {agg['mean_travel_time_mean']:.1f} ± {agg['mean_travel_time_std']:.1f}")
             tqdm.write(f"  │ p95:        {agg.get('tt_p95_mean', 0):.1f} ± {agg.get('tt_p95_std', 0):.1f}")
             tqdm.write(f"  │ Arrival:    {agg['arrival_rate_mean']*100:.1f}%")
@@ -308,11 +291,9 @@ def train(
             # W&B logging: log aggregated metrics into folders
             wandb_metrics = {
                 'metrics/TSTT': agg['tstt_mean'],
-                'metrics/Normalized Score': agg['normalized_score_mean'],
                 'metrics/Mean TT': agg['mean_travel_time_mean'],
                 'metrics/Arrival Rate': agg['arrival_rate_mean'],
                 'metrics/Mean Reward': agg['mean_reward_mean'],
-                'charts/Analytical TSTT': tstt_analytical,
             }
 
             # Agent-specific metrics
@@ -322,7 +303,7 @@ def train(
                 wandb_metrics['charts/Q-Table Size'] = agg['q_table_size_mean']
 
             for k, v in agg.items():
-                if k not in ['tstt_mean', 'normalized_score_mean', 'mean_travel_time_mean',
+                if k not in ['tstt_mean', 'mean_travel_time_mean',
                              'arrival_rate_mean', 'mean_reward_mean', 'epsilon_mean',
                              'q_table_size_mean']:
                     nice_name = k.replace('_', ' ').title().replace('Tstt', 'TSTT').replace('Tt ', 'TT ')
@@ -357,12 +338,10 @@ def train(
         return f"{np.mean(vals):.1f} ± {np.std(vals):.1f}"
 
     print(f"  TSTT:             {_fmt('tstt')}")
-    print(f"  Normalized Score: {_fmt('normalized_score')}")
     print(f"  Mean TT:          {_fmt('mean_travel_time')}")
     print(f"  TT p95:           {_fmt('tt_p95')}")
     print(f"  Arrival:          {np.mean([s['arrival_rate'] for s in all_stats])*100:.1f}%")
     print(f"  Mean Reward:      {_fmt('mean_reward')}")
-    print(f"  Analytical TSTT:  {tstt_analytical:.1f}")
     print(f"{'='*65}")
 
     # Log summary to W&B
@@ -370,10 +349,8 @@ def train(
     logger.log_summary({
         'metrics/TSTT Mean': float(np.mean(tstt_vals)),
         'charts/TSTT Std': float(np.std(tstt_vals)),
-        'metrics/Normalized Score Mean': float(np.mean([s['normalized_score'] for s in all_stats])),
         'metrics/Arrival Rate Mean': float(np.mean([s['arrival_rate'] for s in all_stats])),
         'metrics/Mean Reward Mean': float(np.mean([s['mean_reward'] for s in all_stats])),
-        'charts/Analytical TSTT': tstt_analytical,
     })
 
     logger.finish()
