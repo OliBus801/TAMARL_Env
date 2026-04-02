@@ -22,6 +22,7 @@ from tamarl.rl.wandb_logger import WandbLogger
 from tamarl.rl.render_helper import render_episode
 from tamarl.rl_models.random_agent import RandomAgent
 from tamarl.rl_models.q_learning import QLearningAgent
+from tamarl.rl_models.msa_agent import MSAAgent
 
 
 def run_episode(env: DTAMarkovGameEnv, agent):
@@ -102,7 +103,7 @@ def train(
     scenario_path: str,
     population_filter: Optional[str] = None,
     n_episodes: int = 5,
-    max_steps: int = 3600,
+    max_steps: int = 86400,
     timestep: float = 1.0,
     device: str = "cpu",
     seed: Optional[int] = None,
@@ -114,6 +115,10 @@ def train(
     ql_epsilon_end: float = 0.05,
     ql_epsilon_decay: float = 0.995,
     ql_n_bins: int = 5,
+    # MSA
+    msa_alpha_max: float = 1.0,
+    msa_alpha_min: float = 0.05,
+    msa_decay: float = 0.05,
     # Logging
     log_interval: int = 100,
     # Render
@@ -175,6 +180,12 @@ def train(
             'ql_epsilon_decay': ql_epsilon_decay,
             'ql_n_bins': ql_n_bins,
         })
+    elif agent_type == 'msa':
+        config.update({
+            'msa_alpha_max': msa_alpha_max,
+            'msa_alpha_min': msa_alpha_min,
+            'msa_decay': msa_decay,
+        })
 
     print(f"{'='*65}")
     print(f"  DTA Markov Game — Training Runner")
@@ -187,6 +198,8 @@ def train(
     print(f"  Device:        {device} | Seed: {seed}")
     if agent_type == 'qlearning':
         print(f"  Q-Learning:    α={ql_alpha}, γ={ql_gamma}, ε={ql_epsilon_start}→{ql_epsilon_end} (decay={ql_epsilon_decay})")
+    elif agent_type == 'msa':
+        print(f"  S-MSA:         α_max={msa_alpha_max}, α_min={msa_alpha_min}, decay={msa_decay}")
     print(f"  BPR:           α={bpr_alpha}, β={bpr_beta}")
     print(f"  W&B:           {'enabled' if wandb_enabled else 'disabled'}")
     print(f"{'='*65}\n")
@@ -224,6 +237,19 @@ def train(
             n_congestion_bins=ql_n_bins,
             seed=seed,
         )
+    elif agent_type == 'msa':
+        agent = MSAAgent(
+            num_agents=env.dnl.num_agents,
+            num_nodes=env.dnl.num_nodes,
+            num_edges=env.dnl.num_edges,
+            edge_endpoints=env.dnl.edge_endpoints,
+            ff_times=env.dnl.ff_travel_time_steps,
+            dt=env.dnl.dt,
+            alpha_max=msa_alpha_max,
+            alpha_min=msa_alpha_min,
+            alpha_decay=msa_decay,
+            seed=seed,
+        )
     else:
         agent = RandomAgent(seed=seed)
 
@@ -249,6 +275,10 @@ def train(
     if need_events:
         idx_to_link_id = {v: k for k, v in scenario_data.link_id_to_idx.items()}
 
+    if agent_type == 'msa':
+        print("\n  Initializing S-MSA agent routing with FF times...")
+        agent.end_episode(env.dnl, is_init=True)
+
     # ── Training loop ──
     all_stats = []
     window_stats = []  # stats accumulated between log intervals
@@ -259,8 +289,9 @@ def train(
         # Determine if this episode requires full metric logging
         is_log_step = ((ep + 1) % log_interval == 0) or (ep == n_episodes - 1)
         
-        # Configure env to collect metric if RGap is enabled
-        if relative_gap and is_log_step:
+        # Configure env to collect metric if RGap is enabled or if using MSA
+        needs_tt = (relative_gap and is_log_step) or (agent_type == 'msa')
+        if needs_tt:
             env.dnl.collect_link_tt = True
             if getattr(env.dnl, 'interval_tt_sum', None) is None:
                 env.dnl.max_intervals = 100
@@ -279,6 +310,9 @@ def train(
             stats['relative_gap'] = rgap
 
         stats['wall_time'] = wall_time
+        
+        if agent_type == 'msa':
+            agent.end_episode(env.dnl, is_init=False)
 
         all_stats.append(stats)
         window_stats.append(stats)
@@ -414,8 +448,8 @@ if __name__ == "__main__":
     parser.add_argument("--population", default=None, help="Population file filter (e.g. '100')")
 
     # Agent
-    parser.add_argument("--agent", default="random", choices=["random", "qlearning"],
-                        help="Agent type: 'random' or 'qlearning'")
+    parser.add_argument("--agent", default="random", choices=["random", "qlearning", "msa"],
+                        help="Agent type: 'random', 'qlearning' or 'msa'")
 
     # Training
     parser.add_argument("--episodes", type=int, default=5, help="Number of episodes")
@@ -435,6 +469,11 @@ if __name__ == "__main__":
     parser.add_argument("--ql_epsilon_end", type=float, default=0.05, help="Final epsilon")
     parser.add_argument("--ql_epsilon_decay", type=float, default=0.995, help="Epsilon decay per episode")
     parser.add_argument("--ql_n_bins", type=int, default=5, help="Congestion discretisation bins")
+
+    # MSA parameters
+    parser.add_argument("--msa_alpha_max", type=float, default=1.0, help="Initial MSA update probability")
+    parser.add_argument("--msa_alpha_min", type=float, default=0.05, help="Minimum MSA update probability")
+    parser.add_argument("--msa_decay", type=float, default=0.05, help="MSA exponential decay lambda")
 
     # BPR parameters
     parser.add_argument("--bpr_alpha", type=float, default=0.15, help="BPR alpha (default: 0.15)")
@@ -476,6 +515,9 @@ if __name__ == "__main__":
         ql_epsilon_end=args.ql_epsilon_end,
         ql_epsilon_decay=args.ql_epsilon_decay,
         ql_n_bins=args.ql_n_bins,
+        msa_alpha_max=args.msa_alpha_max,
+        msa_alpha_min=args.msa_alpha_min,
+        msa_decay=args.msa_decay,
         log_interval=args.log_interval,
         render=args.render,
         render_format=args.render_format,

@@ -139,6 +139,7 @@ class DTAMarkovGameEnv(ParallelEnv):
         self.agents = list(self.possible_agents)
         self._cumulative_rewards = {a: 0.0 for a in self.agents}
         self._ticks_since_last_step = 0
+        self._rewarder.reset()
         
         # Advance simulation until first decision occurs
         # (agents need to depart, enter first link, traverse it, then decide at buffer)
@@ -166,6 +167,9 @@ class DTAMarkovGameEnv(ParallelEnv):
             else:
                 # Not deciding yet — provide all-zeros mask
                 info["action_mask"] = np.zeros(self.dnl.max_out_degree, dtype=np.int8)
+            
+            idx = int(agent_id.split("_")[-1])
+            info["curr_leg"] = int(self.dnl.current_leg[idx].item())
             infos[agent_id] = info
         
         return observations, infos
@@ -274,6 +278,9 @@ class DTAMarkovGameEnv(ParallelEnv):
                 info["action_mask"] = action_masks[agent_id]
             else:
                 info["action_mask"] = np.zeros(self.dnl.max_out_degree, dtype=np.int8)
+            
+            idx = int(agent_id.split("_")[-1])
+            info["curr_leg"] = int(self.dnl.current_leg[idx].item())
             infos[agent_id] = info
         
         return observations, rewards, terminations, truncations, infos

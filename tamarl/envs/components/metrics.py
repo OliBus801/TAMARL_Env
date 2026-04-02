@@ -271,7 +271,7 @@ def compute_relative_gap(dnl: TorchDNLMATSim, link_tt_interval: float = 300.0) -
     dests_np = np.array(destinations_list, dtype=np.int32)
     
     adj = build_adjacency_list(dnl.num_nodes, edge_endpoints)
-    t_sp = compute_td_shortest_paths(
+    t_sp, _ = compute_td_shortest_paths(
         adj=adj,
         start_times=start_times_np,
         origin_nodes=origins_np,

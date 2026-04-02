@@ -20,7 +20,7 @@ def compute_td_shortest_paths(
     destination_nodes: np.ndarray,# shape: [N]
     tt_matrix: np.ndarray,        # shape: [max_intervals, num_edges], seconds
     interval: float
-) -> np.ndarray:
+) -> tuple[np.ndarray, list]:
     """Computes pure time-dependent shortest paths using dynamic link travel times.
     
     Args:
@@ -32,10 +32,13 @@ def compute_td_shortest_paths(
         interval: time per interval in seconds
         
     Returns:
-        np.ndarray containing optimal travel times (t_SP) for each query.
+        tuple containing:
+            - np.ndarray containing optimal travel times (t_SP) for each query.
+            - list of lists containing the optimal path (list of edge_ids) for each query.
     """
     N = len(start_times)
     t_sp = np.zeros(N, dtype=np.float32)
+    paths = [[] for _ in range(N)]
     num_intervals = tt_matrix.shape[0]
     
     for i in range(N):
@@ -49,6 +52,7 @@ def compute_td_shortest_paths(
             continue
             
         dist = {start_node: start_time}
+        parent = {}
         pq = [(start_time, start_node)]
         found = False
         
@@ -58,6 +62,15 @@ def compute_td_shortest_paths(
             if u == dest_node:
                 t_sp[i] = curr_time - start_time
                 found = True
+                
+                path = []
+                curr = dest_node
+                while curr in parent:
+                    p, e_id = parent[curr]
+                    path.append(e_id)
+                    curr = p
+                path.reverse()
+                paths[i] = path
                 break
                 
             if curr_time > dist.get(u, float('inf')):
@@ -73,10 +86,11 @@ def compute_td_shortest_paths(
                 next_time = curr_time + float(tt)
                 if next_time < dist.get(v, float('inf')):
                     dist[v] = next_time
+                    parent[v] = (u, edge_id)
                     heapq.heappush(pq, (next_time, v))
                     
         if not found:
             # If unreachable
             t_sp[i] = float('inf')
             
-    return t_sp
+    return t_sp, paths

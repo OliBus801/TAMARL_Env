@@ -6,47 +6,74 @@ from tamarl.core.dnl_matsim import TorchDNLMATSim
 
 
 class Rewarder:
-    """Dense reward: -dt per tick for all en-route agents.
+    """Dense reward: -dt per tick spent traveling.
     
     Maximizing cumulative reward = minimizing total travel time (γ=1).
+    This implementation tracks exact continuous travel time dynamically, ensuring 
+    Sum(step_rewards) over an episode exactly equals -Total Travel Time.
     """
 
     def __init__(self, dnl: TorchDNLMATSim):
         self.dnl = dnl
+        self._prev_tt_sums: torch.Tensor = None
+        self.reset()
+
+    def reset(self):
+        """Reset the continuous travel time trackers for a new episode."""
+        self._prev_tt_sums = torch.zeros(self.dnl.num_agents, device=self.dnl.device, dtype=torch.float32)
+
+    def _get_continuous_tt(self) -> torch.Tensor:
+        """Calculate continuous travel time for all agents at the current step."""
+        # Sum of all completed legs' TT
+        tt_sum = self.dnl.leg_metrics[:, :, 1].sum(dim=1)
+        
+        # Add active current leg (en-route or waiting for route)
+        active_mask = (self.dnl.status == 0) | (self.dnl.status == 1) | (self.dnl.status == 2)
+        c_leg = self.dnl.current_leg
+        deps = self.dnl.leg_departure_times.gather(1, c_leg.unsqueeze(1)).squeeze(1)
+        
+        tt_active = torch.zeros_like(tt_sum)
+        tt_active[active_mask] = (self.dnl.current_step - deps[active_mask]).float()
+        
+        return tt_sum + tt_active
 
     def compute_step_rewards(self, active_agents: Set[str], n_ticks: int = 1) -> Dict[str, float]:
-        """Compute rewards for all active agents over n_ticks of simulation.
+        """Compute rewards for all active agents.
         
-        Args:
-            active_agents: set of agent_id strings currently active in the env
-            n_ticks: number of DNL ticks that were advanced in this macro-step
-            
-        Returns:
-            Dict mapping agent_id → reward (float)
+        The reward is strictly proportional to the exact delta of accumulated travel time 
+        since the last time step_rewards was called.
         """
+        curr_tt_sums = self._get_continuous_tt()
+        
+        # Calculate exactly how much travel time each agent accrued since last check
+        tt_deltas = (curr_tt_sums - self._prev_tt_sums)
+        
         rewards = {}
         dt = self.dnl.dt
         
         for agent_id in active_agents:
             agent_idx = int(agent_id.split("_")[-1])
-            status = self.dnl.status[agent_idx].item()
+            # Negative penalty for newly accrued travel time
+            rewards[agent_id] = -float(tt_deltas[agent_idx].item()) * dt
             
-            if status == 3:  # Done/arrived
-                rewards[agent_id] = 0.0
-            else:
-                # En-route: penalty proportional to time spent traveling
-                rewards[agent_id] = -dt * n_ticks
-        
+        # VERY IMPORTANT: update only the previous tt sums for agents that were just evaluated!
+        # Wait, if an agent is not in active_agents, it doesn't get evaluated here.
+        # But if it gets evaluated LATER, its delta MUST span the entire time since it was last evaluated!
+        # So we MUST only update _prev_tt_sums for agents in active_agents here!
+        for agent_id in active_agents:
+            agent_idx = int(agent_id.split("_")[-1])
+            self._prev_tt_sums[agent_idx] = curr_tt_sums[agent_idx]
+            
         return rewards
 
     def compute_batch_rewards(self, active_agent_indices: torch.Tensor, n_ticks: int = 1) -> torch.Tensor:
-        """Vectorised reward computation.
+        """Vectorised reward computation."""
+        curr_tt_sums = self._get_continuous_tt()
+        tt_deltas = curr_tt_sums[active_agent_indices] - self._prev_tt_sums[active_agent_indices]
         
-        Returns:
-            Tensor [K] of rewards for each agent in active_agent_indices
-        """
-        statuses = self.dnl.status[active_agent_indices]
-        rewards = torch.full((active_agent_indices.size(0),), -self.dnl.dt * n_ticks, 
-                           device=self.dnl.device)
-        rewards[statuses == 3] = 0.0  # Done agents get 0
+        rewards = -tt_deltas * self.dnl.dt
+        
+        # Update trackers only for evaluated agents
+        self._prev_tt_sums[active_agent_indices] = curr_tt_sums[active_agent_indices]
+        
         return rewards

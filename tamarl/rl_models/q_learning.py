@@ -43,7 +43,7 @@ class QLearningAgent:
     def __init__(
         self,
         n_actions: int,
-        alpha: float = 0.1,
+        alpha: float = 0.5,
         gamma: float = 1.0,
         epsilon_start: float = 1.0,
         epsilon_end: float = 0.05,
