@@ -48,7 +48,9 @@ class TorchDNLMATSim:
                  enable_profiling: bool = False,
                  track_events: bool = False,
                  first_edges: torch.Tensor = None,
-                 destinations: torch.Tensor = None):
+                 destinations: torch.Tensor = None,
+                 collect_link_tt: bool = False,
+                 link_tt_interval: float = 300.0):
         """
         Initialize the TorchDNLMATSim simulation engine.
         
@@ -160,6 +162,13 @@ class TorchDNLMATSim:
 
         # OPT: Incremental buffer counts (avoids recomputing bincount on all agents)
         self.buffer_counts = torch.zeros(self.num_edges, device=self.device, dtype=torch.float32)
+
+        self.collect_link_tt = collect_link_tt
+        self.link_tt_interval = link_tt_interval
+        if self.collect_link_tt:
+            self.max_intervals = 100
+            self.interval_tt_sum = torch.zeros((self.max_intervals, self.num_edges), device=self.device, dtype=torch.float32)
+            self.interval_tt_count = torch.zeros((self.max_intervals, self.num_edges), device=self.device, dtype=torch.float32)
 
         # Agent State - Structure of Arrays (SOA)
         # Status | 0: Waiting/Activity, 1: Traveling, 2: Buffer, 3: Done, 4: Exiter (waiting for dispatch)
@@ -291,6 +300,10 @@ class TorchDNLMATSim:
             self.rng.manual_seed(self.seed)
         self._init_event_buffer()
         
+        if self.collect_link_tt:
+            self.interval_tt_sum.fill_(0)
+            self.interval_tt_count.fill_(0)
+
         if self.profiler:
             self.profiler.clear()
 
@@ -468,6 +481,23 @@ class TorchDNLMATSim:
                 self._record_events(EVT_LEFT_LINK, winners, w_curr)
                 self._record_events(EVT_ENTERED_LINK, winners, w_next)
 
+            if self.collect_link_tt:
+                interval_idx = int((self.current_step * self.dt) // self.link_tt_interval)
+                while interval_idx >= self.interval_tt_sum.size(0):
+                    new_size = max(interval_idx + 10, self.interval_tt_sum.size(0) * 2)
+                    new_sum = torch.zeros((new_size, self.num_edges), device=self.device, dtype=torch.float32)
+                    new_count = torch.zeros((new_size, self.num_edges), device=self.device, dtype=torch.float32)
+                    new_sum[:self.interval_tt_sum.size(0)] = self.interval_tt_sum
+                    new_count[:self.interval_tt_count.size(0)] = self.interval_tt_count
+                    self.interval_tt_sum = new_sum
+                    self.interval_tt_count = new_count
+                
+                ff_curr = self.ff_travel_time_steps[w_curr]
+                delay = self.current_step - stuck_s[storage_pass]
+                tt = (ff_curr + delay).float() * self.dt
+                self.interval_tt_sum[interval_idx].scatter_add_(0, w_curr, tt)
+                self.interval_tt_count[interval_idx].scatter_add_(0, w_curr, torch.ones_like(tt))
+
             # OPT: Update buffer_counts (agents leaving buffer)
             self.buffer_counts.scatter_add_(0, w_curr,
                 -torch.ones(winners.size(0), device=self.device))
@@ -584,6 +614,25 @@ class TorchDNLMATSim:
 
         # --- Exiters: leave the network (waiting for next leg dispatch) ---
         exiters = arrived_sorted[proc_exit_mask]
+
+        if self.collect_link_tt and exiters.numel() > 0:
+            exit_edges = edges_sorted[proc_exit_mask]
+            interval_idx = int((self.current_step * self.dt) // self.link_tt_interval)
+            while interval_idx >= self.interval_tt_sum.size(0):
+                new_size = max(interval_idx + 10, self.interval_tt_sum.size(0) * 2)
+                new_sum = torch.zeros((new_size, self.num_edges), device=self.device, dtype=torch.float32)
+                new_count = torch.zeros((new_size, self.num_edges), device=self.device, dtype=torch.float32)
+                new_sum[:self.interval_tt_sum.size(0)] = self.interval_tt_sum
+                new_count[:self.interval_tt_count.size(0)] = self.interval_tt_count
+                self.interval_tt_sum = new_sum
+                self.interval_tt_count = new_count
+                
+            ff_curr = self.ff_travel_time_steps[exit_edges]
+            delay = self.current_step - self.stuck_since[exiters]
+            tt = (ff_curr + delay).float() * self.dt
+            self.interval_tt_sum[interval_idx].scatter_add_(0, exit_edges, tt)
+            self.interval_tt_count[interval_idx].scatter_add_(0, exit_edges, torch.ones_like(tt))
+
         self.status[exiters] = 4
 
         if self.track_events:
@@ -911,3 +960,22 @@ class TorchDNLMATSim:
         # Convert to list of tuples
         events_cpu = events_sorted.tolist()
         return [tuple(row) for row in events_cpu]
+
+    def get_dynamic_link_travel_times(self) -> torch.Tensor:
+        """Returns [num_intervals_active, num_edges] with average travel times."""
+        if not self.collect_link_tt:
+            return None
+        max_active_interval = int((self.current_step * self.dt) // self.link_tt_interval)
+        if max_active_interval >= self.interval_tt_sum.size(0):
+             max_active_interval = self.interval_tt_sum.size(0) - 1
+             
+        sum_tt = self.interval_tt_sum[:max_active_interval + 1]
+        count_tt = self.interval_tt_count[:max_active_interval + 1]
+        
+        avg_tt = sum_tt / count_tt.clamp(min=1.0)
+        
+        # Where count is 0, fallback to ff_travel_time
+        ff_seconds = self.edge_static[:, 4].unsqueeze(0).expand_as(avg_tt)
+        avg_tt = torch.where(count_tt > 0, avg_tt, ff_seconds)
+        
+        return avg_tt

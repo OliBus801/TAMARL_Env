@@ -4,6 +4,7 @@ from typing import Dict, List, Optional
 import numpy as np
 import torch
 from tamarl.core.dnl_matsim import TorchDNLMATSim
+from tamarl.envs.components.time_dependent_dijkstra import build_adjacency_list, compute_td_shortest_paths
 
 
 # ── Core Metrics ──────────────────────────────────────────────────────────────
@@ -205,3 +206,87 @@ def _run_episode_with_deviation(env, policy, deviant_agent: str, rng) -> Optiona
         valid_tt = agent_tt[agent_tt > 0]
         return float(valid_tt.sum().item() * env.dnl.dt)
     return None
+
+# ── Relative Gap ────────────────────────────────────────────────────────────
+
+def compute_relative_gap(dnl: TorchDNLMATSim, link_tt_interval: float = 300.0) -> float:
+    """Computes the Relative Gap (RGap) metric over all arrived agents.
+    
+    RGap = sum(t_i - t_i_SP) / sum(t_i)
+    """
+    if not getattr(dnl, 'collect_link_tt', False):
+        return float('inf')
+        
+    tt_matrix = dnl.get_dynamic_link_travel_times()
+    if tt_matrix is None:
+        return float('inf')
+        
+    tt_matrix_np = tt_matrix.cpu().numpy()
+    
+    done_mask = (dnl.status == 3).cpu().numpy()
+    if not done_mask.any():
+        return 0.0
+        
+    done_agents = np.where(done_mask)[0]
+    leg_metrics = dnl.leg_metrics.cpu().numpy()
+    
+    total_real_tt = 0.0
+    
+    start_times_list = []
+    origins_list = []
+    destinations_list = []
+    
+    all_first_edges = dnl._all_first_edges.cpu().numpy()
+    dests = dnl.destinations.cpu().numpy()
+    edge_endpoints = dnl.edge_endpoints.cpu().numpy()
+    leg_departure_times = dnl.leg_departure_times.cpu().numpy()
+    num_legs = dnl.num_legs.cpu().numpy()
+    
+    for agent_id in done_agents:
+        for leg_idx in range(num_legs[agent_id]):
+            real_tt = leg_metrics[agent_id, leg_idx, 1]
+            if real_tt <= 0:
+                continue
+                
+            first_edge = all_first_edges[agent_id, leg_idx]
+            # MATSim spawns agents into the capacity buffer of the their first link,
+            # meaning their physical start node is the destination of the first link.
+            origin_node = edge_endpoints[first_edge, 1]
+            dest_node = dests[agent_id, leg_idx]
+            dep_time_steps = leg_departure_times[agent_id, leg_idx]
+            dep_time_sec = dep_time_steps * dnl.dt
+            
+            start_times_list.append(dep_time_sec)
+            origins_list.append(origin_node)
+            destinations_list.append(dest_node)
+            
+            # Since real_tt is already in seconds, just add it
+            total_real_tt += real_tt
+            
+    if len(start_times_list) == 0 or total_real_tt <= 0:
+        return 0.0
+        
+    start_times_np = np.array(start_times_list, dtype=np.float32)
+    origins_np = np.array(origins_list, dtype=np.int32)
+    dests_np = np.array(destinations_list, dtype=np.int32)
+    
+    adj = build_adjacency_list(dnl.num_nodes, edge_endpoints)
+    t_sp = compute_td_shortest_paths(
+        adj=adj,
+        start_times=start_times_np,
+        origin_nodes=origins_np,
+        destination_nodes=dests_np,
+        tt_matrix=tt_matrix_np,
+        interval=float(link_tt_interval)
+    )
+    
+    # Exclude unreachable agents from the gap, though in a sane scenario all matched
+    valid_sp_mask = (t_sp != float('inf'))
+    if not valid_sp_mask.any():
+        return 0.0
+        
+    total_sp_tt = np.sum(t_sp[valid_sp_mask])
+    
+    # Ensure RGap doesn't become negative due to precision
+    rgap = max(0.0, (total_real_tt - float(total_sp_tt)) / total_real_tt)
+    return float(rgap)

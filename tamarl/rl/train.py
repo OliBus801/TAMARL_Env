@@ -14,7 +14,7 @@ from tqdm import tqdm
 from tamarl.envs.dta_markov_game_parallel import DTAMarkovGameEnv
 from tamarl.envs.components.metrics import (
     compute_tstt, compute_mean_travel_time, compute_arrival_rate,
-    compute_travel_time_stats,
+    compute_travel_time_stats, compute_relative_gap,
     compute_mean_episode_reward, compute_reward_stats,
 )
 from tamarl.envs.scenario_loader import load_scenario
@@ -88,7 +88,7 @@ def _aggregate_stats(window: List[Dict]) -> Dict[str, float]:
     """Aggregate stats over a window of episodes."""
     keys = ['tstt', 'mean_travel_time', 'arrival_rate', 'mean_reward',
             'episode_length', 'n_decisions', 'tt_p90', 'tt_p95',
-            'wall_time']
+            'wall_time', 'relative_gap']
     agg = {}
     for k in keys:
         vals = [s[k] for s in window if k in s]
@@ -130,6 +130,8 @@ def train(
     # BPR params for Frank-Wolfe
     bpr_alpha: float = 0.15,
     bpr_beta: float = 4.0,
+    # Metrics
+    relative_gap: bool = True,
 ):
     """Run the training loop with expanded metrics and optional W&B logging.
 
@@ -162,6 +164,7 @@ def train(
         'bpr_alpha': bpr_alpha,
         'bpr_beta': bpr_beta,
         'agent_type': agent_type,
+        'relative_gap': relative_gap,
     }
     if agent_type == 'qlearning':
         config.update({
@@ -253,9 +256,27 @@ def train(
     pbar = tqdm(range(n_episodes), desc="Training", unit="ep", dynamic_ncols=True)
 
     for ep in pbar:
+        # Determine if this episode requires full metric logging
+        is_log_step = ((ep + 1) % log_interval == 0) or (ep == n_episodes - 1)
+        
+        # Configure env to collect metric if RGap is enabled
+        if relative_gap and is_log_step:
+            env.dnl.collect_link_tt = True
+            if getattr(env.dnl, 'interval_tt_sum', None) is None:
+                env.dnl.max_intervals = 100
+                import torch
+                env.dnl.interval_tt_sum = torch.zeros((env.dnl.max_intervals, env.dnl.num_edges), device=env.dnl.device, dtype=torch.float32)
+                env.dnl.interval_tt_count = torch.zeros((env.dnl.max_intervals, env.dnl.num_edges), device=env.dnl.device, dtype=torch.float32)
+        else:
+            env.dnl.collect_link_tt = False
+
         t0 = time.time()
         stats = run_episode(env, agent)
         wall_time = time.time() - t0
+
+        if relative_gap and is_log_step:
+            rgap = compute_relative_gap(env.dnl, link_tt_interval=300.0)
+            stats['relative_gap'] = rgap
 
         stats['wall_time'] = wall_time
 
@@ -271,8 +292,6 @@ def train(
         pbar.set_postfix(postfix)
 
         # ── Log at interval ──
-        is_log_step = ((ep + 1) % log_interval == 0) or (ep == n_episodes - 1)
-
         if is_log_step:
             agg = _aggregate_stats(window_stats)
 
@@ -283,6 +302,8 @@ def train(
             )
             tqdm.write(f"  │ TSTT:       {agg['tstt_mean']:.0f} ± {agg['tstt_std']:.0f}")
             tqdm.write(f"  │ Mean TT:    {agg['mean_travel_time_mean']:.1f} ± {agg['mean_travel_time_std']:.1f}")
+            if 'relative_gap_mean' in agg:
+                tqdm.write(f"  │ RGap:       {agg['relative_gap_mean']:.4f} ± {agg['relative_gap_std']:.4f}")
             tqdm.write(f"  │ p95:        {agg.get('tt_p95_mean', 0):.1f} ± {agg.get('tt_p95_std', 0):.1f}")
             tqdm.write(f"  │ Arrival:    {agg['arrival_rate_mean']*100:.1f}%")
             tqdm.write(f"  │ Reward:     {agg['mean_reward_mean']:.1f} ± {agg['mean_reward_std']:.1f}")
@@ -295,6 +316,8 @@ def train(
                 'metrics/Arrival Rate': agg['arrival_rate_mean'],
                 'metrics/Mean Reward': agg['mean_reward_mean'],
             }
+            if 'relative_gap_mean' in agg:
+                wandb_metrics['metrics/Relative Gap'] = agg['relative_gap_mean']
 
             # Agent-specific metrics
             if 'epsilon_mean' in agg:
@@ -303,7 +326,7 @@ def train(
                 wandb_metrics['charts/Q-Table Size'] = agg['q_table_size_mean']
 
             for k, v in agg.items():
-                if k not in ['tstt_mean', 'mean_travel_time_mean',
+                if k not in ['tstt_mean', 'mean_travel_time_mean', 'relative_gap_mean',
                              'arrival_rate_mean', 'mean_reward_mean', 'epsilon_mean',
                              'q_table_size_mean']:
                     nice_name = k.replace('_', ' ').title().replace('Tstt', 'TSTT').replace('Tt ', 'TT ')
@@ -339,6 +362,9 @@ def train(
 
     print(f"  TSTT:             {_fmt('tstt')}")
     print(f"  Mean TT:          {_fmt('mean_travel_time')}")
+    if relative_gap and any('relative_gap' in s for s in all_stats):
+        gap_vals = [s['relative_gap'] for s in all_stats if 'relative_gap' in s]
+        print(f"  Relative Gap:     {np.mean(gap_vals):.4f} ± {np.std(gap_vals):.4f}")
     print(f"  TT p95:           {_fmt('tt_p95')}")
     print(f"  Arrival:          {np.mean([s['arrival_rate'] for s in all_stats])*100:.1f}%")
     print(f"  Mean Reward:      {_fmt('mean_reward')}")
@@ -346,12 +372,18 @@ def train(
 
     # Log summary to W&B
     tstt_vals = [s['tstt'] for s in all_stats]
-    logger.log_summary({
+    summary = {
         'metrics/TSTT Mean': float(np.mean(tstt_vals)),
         'charts/TSTT Std': float(np.std(tstt_vals)),
         'metrics/Arrival Rate Mean': float(np.mean([s['arrival_rate'] for s in all_stats])),
         'metrics/Mean Reward Mean': float(np.mean([s['mean_reward'] for s in all_stats])),
-    })
+    }
+    
+    if relative_gap and any('relative_gap' in s for s in all_stats):
+        gap_vals = [s['relative_gap'] for s in all_stats if 'relative_gap' in s]
+        summary['metrics/Relative Gap Mean'] = float(np.mean(gap_vals))
+        
+    logger.log_summary(summary)
 
     logger.finish()
 
@@ -423,6 +455,10 @@ if __name__ == "__main__":
                         help="Start and end hours for rendering (e.g. --render_hours 0 0.15)")
     parser.add_argument("--render_speed", type=int, default=1, help="Speed factor for rendering (default: 1)")
 
+    # Metrics
+    parser.add_argument("--no-relative_gap", action="store_false", dest="relative_gap",
+                        help="Disable Relative Gap computation to save compute")
+
     args = parser.parse_args()
 
     train(
@@ -451,4 +487,5 @@ if __name__ == "__main__":
         wandb_run_name=args.wandb_run_name,
         bpr_alpha=args.bpr_alpha,
         bpr_beta=args.bpr_beta,
+        relative_gap=args.relative_gap,
     )
