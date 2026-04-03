@@ -5,6 +5,8 @@ logs to Weights & Biases for real-time monitoring.
 """
 
 import argparse
+import json
+import os
 import time
 import numpy as np
 from typing import Dict, List, Optional
@@ -23,6 +25,7 @@ from tamarl.rl.render_helper import render_episode
 from tamarl.rl_models.random_agent import RandomAgent
 from tamarl.rl_models.q_learning import QLearningAgent
 from tamarl.rl_models.msa_agent import MSAAgent
+from tamarl.rl_models.sb3_agent import SB3Agent
 
 
 def run_episode(env: DTAMarkovGameEnv, agent):
@@ -119,6 +122,13 @@ def train(
     msa_alpha_max: float = 1.0,
     msa_alpha_min: float = 0.05,
     msa_decay: float = 0.05,
+    # SB3
+    sb3_lr: float = 3e-4,
+    sb3_gamma: float = 1.0,
+    sb3_net_arch: Optional[list] = None,
+    sb3_batch_size: int = 64,
+    sb3_buffer_size: int = 10_000,
+    sb3_n_steps: int = 128,
     # Logging
     log_interval: int = 100,
     # Render
@@ -179,6 +189,15 @@ def train(
             'msa_alpha_min': msa_alpha_min,
             'msa_decay': msa_decay,
         })
+    elif agent_type in ('ppo', 'dqn', 'a2c'):
+        config.update({
+            'sb3_lr': sb3_lr,
+            'sb3_gamma': sb3_gamma,
+            'sb3_net_arch': sb3_net_arch or [64, 64],
+            'sb3_batch_size': sb3_batch_size,
+            'sb3_buffer_size': sb3_buffer_size,
+            'sb3_n_steps': sb3_n_steps,
+        })
 
     print(f"{'='*65}")
     print(f"  DTA Markov Game — Training Runner")
@@ -193,6 +212,8 @@ def train(
         print(f"  Q-Learning:    α={ql_alpha}, γ={ql_gamma}, ε={ql_epsilon_start}→{ql_epsilon_end} (decay={ql_epsilon_decay})")
     elif agent_type == 'msa':
         print(f"  MSA:         α_max={msa_alpha_max}, α_min={msa_alpha_min}, decay={msa_decay}")
+    elif agent_type in ('ppo', 'dqn', 'a2c'):
+        print(f"  SB3 {agent_type.upper()}:    lr={sb3_lr}, γ={sb3_gamma}, net={sb3_net_arch or [64,64]}, batch={sb3_batch_size}")
     print(f"{'='*65}\n")
 
     # ── W&B init ──
@@ -240,6 +261,19 @@ def train(
             alpha_min=msa_alpha_min,
             alpha_decay=msa_decay,
             seed=seed,
+        )
+    elif agent_type in ('ppo', 'dqn', 'a2c'):
+        agent = SB3Agent(
+            algorithm=agent_type,
+            env=env,
+            learning_rate=sb3_lr,
+            gamma=sb3_gamma,
+            net_arch=sb3_net_arch,
+            device=device,
+            seed=seed,
+            batch_size=sb3_batch_size,
+            buffer_size=sb3_buffer_size,
+            n_steps=sb3_n_steps,
         )
     else:
         agent = RandomAgent(seed=seed)
@@ -431,88 +465,260 @@ def train(
     return all_stats
 
 
-if __name__ == "__main__":
+def load_config(config_path: str) -> dict:
+    """Load a JSON config file and map it to flat train() kwargs.
+
+    The JSON file uses categorized sections (scenario, training, q_learning,
+    msa, sb3, logging, rendering, metrics).  This function flattens them
+    into the keyword arguments expected by ``train()``.
+
+    Args:
+        config_path: path to a ``.json`` configuration file.
+
+    Returns:
+        A dict of keyword arguments for ``train()``.
+    """
+    with open(config_path, "r") as f:
+        cfg = json.load(f)
+
+    kwargs: dict = {}
+
+    # ── Scenario ──
+    sc = cfg.get("scenario", {})
+    if "path" in sc:
+        kwargs["scenario_path"] = sc["path"]
+    if "population_filter" in sc:
+        kwargs["population_filter"] = sc["population_filter"]
+
+    # ── Training ──
+    tr = cfg.get("training", {})
+    _map = {
+        "agent": "agent_type",
+        "episodes": "n_episodes",
+        "max_steps": "max_steps",
+        "timestep": "timestep",
+        "device": "device",
+        "seed": "seed",
+    }
+    for json_key, kwarg_key in _map.items():
+        if json_key in tr:
+            kwargs[kwarg_key] = tr[json_key]
+
+    # ── Q-Learning ──
+    ql = cfg.get("q_learning", {})
+    _ql_map = {
+        "alpha": "ql_alpha",
+        "gamma": "ql_gamma",
+        "epsilon_start": "ql_epsilon_start",
+        "epsilon_end": "ql_epsilon_end",
+        "epsilon_decay": "ql_epsilon_decay",
+        "n_bins": "ql_n_bins",
+    }
+    for json_key, kwarg_key in _ql_map.items():
+        if json_key in ql:
+            kwargs[kwarg_key] = ql[json_key]
+
+    # ── MSA ──
+    msa = cfg.get("msa", {})
+    _msa_map = {
+        "alpha_max": "msa_alpha_max",
+        "alpha_min": "msa_alpha_min",
+        "decay": "msa_decay",
+    }
+    for json_key, kwarg_key in _msa_map.items():
+        if json_key in msa:
+            kwargs[kwarg_key] = msa[json_key]
+
+    # ── SB3 ──
+    sb3 = cfg.get("sb3", {})
+    _sb3_map = {
+        "learning_rate": "sb3_lr",
+        "gamma": "sb3_gamma",
+        "net_arch": "sb3_net_arch",
+        "batch_size": "sb3_batch_size",
+        "buffer_size": "sb3_buffer_size",
+        "n_steps": "sb3_n_steps",
+    }
+    for json_key, kwarg_key in _sb3_map.items():
+        if json_key in sb3:
+            kwargs[kwarg_key] = sb3[json_key]
+
+    # ── Logging ──
+    log = cfg.get("logging", {})
+    if "log_interval" in log:
+        kwargs["log_interval"] = log["log_interval"]
+    if "wandb_enabled" in log:
+        kwargs["wandb_enabled"] = log["wandb_enabled"]
+    if "wandb_project" in log:
+        kwargs["wandb_project"] = log["wandb_project"]
+    if "wandb_run_name" in log:
+        kwargs["wandb_run_name"] = log["wandb_run_name"]
+    if "wandb_tags" in log:
+        kwargs["wandb_tags"] = log["wandb_tags"]
+
+    # ── Rendering ──
+    rnd = cfg.get("rendering", {})
+    if "render" in rnd:
+        kwargs["render"] = rnd["render"]
+    if "format" in rnd:
+        kwargs["render_format"] = rnd["format"]
+    if "fps" in rnd:
+        kwargs["render_fps"] = rnd["fps"]
+    if "hours" in rnd:
+        kwargs["render_hours"] = tuple(rnd["hours"]) if rnd["hours"] else None
+    if "speed" in rnd:
+        kwargs["render_speed"] = rnd["speed"]
+
+    # ── Metrics ──
+    met = cfg.get("metrics", {})
+    if "relative_gap" in met:
+        kwargs["relative_gap"] = met["relative_gap"]
+
+    return kwargs
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    """Build the argparse parser for CLI arguments."""
     parser = argparse.ArgumentParser(description="DTA Markov Game — Training Runner")
 
+    # Config file
+    parser.add_argument("--config", default=None,
+                        help="Path to JSON config file (overrides defaults, CLI overrides config)")
+
     # Scenario
-    parser.add_argument("--scenario", required=True, help="Path to scenario folder")
+    parser.add_argument("--scenario", default=None, help="Path to scenario folder")
     parser.add_argument("--population", default=None, help="Population file filter (e.g. '100')")
 
     # Agent
-    parser.add_argument("--agent", default="random", choices=["random", "qlearning", "msa"],
-                        help="Agent type: 'random', 'qlearning' or 'msa'")
+    parser.add_argument("--agent", default=None,
+                        choices=["random", "qlearning", "msa", "ppo", "dqn", "a2c"],
+                        help="Agent type: 'random', 'qlearning', 'msa', 'ppo', 'dqn', or 'a2c'")
 
     # Training
-    parser.add_argument("--episodes", type=int, default=5, help="Number of episodes")
-    parser.add_argument("--max_steps", type=int, default=86400, help="Max ticks per episode")
-    parser.add_argument("--timestep", type=float, default=1.0, help="Simulation timestep (s)")
-    parser.add_argument("--device", default="cpu", help="Device ('cpu' or 'cuda')")
+    parser.add_argument("--episodes", type=int, default=None, help="Number of episodes")
+    parser.add_argument("--max_steps", type=int, default=None, help="Max ticks per episode")
+    parser.add_argument("--timestep", type=float, default=None, help="Simulation timestep (s)")
+    parser.add_argument("--device", default=None, help="Device ('cpu' or 'cuda')")
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
 
     # Logging
-    parser.add_argument("--log_interval", type=int, default=100,
+    parser.add_argument("--log_interval", type=int, default=None,
                         help="Log metrics every N episodes (default: 100)")
 
     # Q-Learning hyperparameters
-    parser.add_argument("--ql_alpha", type=float, default=0.5, help="Q-learning rate (default: 0.5)")
-    parser.add_argument("--ql_gamma", type=float, default=1.0, help="Q-learning discount (default: 1.0)")
-    parser.add_argument("--ql_epsilon_start", type=float, default=1.0, help="Initial epsilon")
-    parser.add_argument("--ql_epsilon_end", type=float, default=0.05, help="Final epsilon")
-    parser.add_argument("--ql_epsilon_decay", type=float, default=0.995, help="Epsilon decay per episode")
-    parser.add_argument("--ql_n_bins", type=int, default=5, help="Congestion discretisation bins")
+    parser.add_argument("--ql_alpha", type=float, default=None, help="Q-learning rate")
+    parser.add_argument("--ql_gamma", type=float, default=None, help="Q-learning discount")
+    parser.add_argument("--ql_epsilon_start", type=float, default=None, help="Initial epsilon")
+    parser.add_argument("--ql_epsilon_end", type=float, default=None, help="Final epsilon")
+    parser.add_argument("--ql_epsilon_decay", type=float, default=None, help="Epsilon decay per episode")
+    parser.add_argument("--ql_n_bins", type=int, default=None, help="Congestion discretisation bins")
 
     # MSA parameters
-    parser.add_argument("--msa_alpha_max", type=float, default=1.0, help="Initial MSA update probability")
-    parser.add_argument("--msa_alpha_min", type=float, default=0.05, help="Minimum MSA update probability")
-    parser.add_argument("--msa_decay", type=float, default=0.05, help="MSA exponential decay lambda")
+    parser.add_argument("--msa_alpha_max", type=float, default=None, help="Initial MSA update probability")
+    parser.add_argument("--msa_alpha_min", type=float, default=None, help="Minimum MSA update probability")
+    parser.add_argument("--msa_decay", type=float, default=None, help="MSA exponential decay lambda")
+
+    # SB3 hyperparameters
+    parser.add_argument("--sb3_lr", type=float, default=None, help="SB3 learning rate")
+    parser.add_argument("--sb3_gamma", type=float, default=None, help="SB3 discount factor")
+    parser.add_argument("--sb3_net_arch", type=int, nargs="+", default=None,
+                        help="SB3 hidden layer sizes (e.g. --sb3_net_arch 64 64)")
+    parser.add_argument("--sb3_batch_size", type=int, default=None, help="SB3 batch size")
+    parser.add_argument("--sb3_buffer_size", type=int, default=None, help="DQN replay buffer size")
+    parser.add_argument("--sb3_n_steps", type=int, default=None, help="PPO/A2C rollout length")
 
     # W&B
-    parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
-    parser.add_argument("--wandb_project", default="tamarl", help="W&B project name")
+    parser.add_argument("--wandb", action="store_true", default=None,
+                        help="Enable Weights & Biases logging")
+    parser.add_argument("--wandb_project", default=None, help="W&B project name")
     parser.add_argument("--wandb_run_name", default=None, help="W&B run name")
 
     # Render
     parser.add_argument("--render", default=None, choices=["interval", "end"],
-                        help="Render episodes: 'interval' (at each log_interval) or 'end' (final episode)")
-    parser.add_argument("--render_format", default="gif", choices=["gif", "mp4", "live"],
+                        help="Render episodes: 'interval' or 'end'")
+    parser.add_argument("--render_format", default=None, choices=["gif", "mp4", "live"],
                         help="Render format: gif, mp4, or live")
-    parser.add_argument("--render_fps", type=int, default=5, help="FPS for rendered animation (default: 5)")
+    parser.add_argument("--render_fps", type=int, default=None, help="FPS for rendered animation")
     parser.add_argument("--render_hours", type=float, nargs=2, default=None,
-                        help="Start and end hours for rendering (e.g. --render_hours 0 0.15)")
-    parser.add_argument("--render_speed", type=int, default=1, help="Speed factor for rendering (default: 1)")
+                        help="Start and end hours for rendering")
+    parser.add_argument("--render_speed", type=int, default=None, help="Speed factor for rendering")
 
     # Metrics
     parser.add_argument("--no-relative_gap", action="store_false", dest="relative_gap",
-                        help="Disable Relative Gap computation to save compute")
+                        default=None, help="Disable Relative Gap computation")
 
+    return parser
+
+
+# Mapping from CLI arg names to train() kwarg names
+_CLI_TO_KWARGS = {
+    "scenario": "scenario_path",
+    "population": "population_filter",
+    "agent": "agent_type",
+    "episodes": "n_episodes",
+    "max_steps": "max_steps",
+    "timestep": "timestep",
+    "device": "device",
+    "seed": "seed",
+    "log_interval": "log_interval",
+    "ql_alpha": "ql_alpha",
+    "ql_gamma": "ql_gamma",
+    "ql_epsilon_start": "ql_epsilon_start",
+    "ql_epsilon_end": "ql_epsilon_end",
+    "ql_epsilon_decay": "ql_epsilon_decay",
+    "ql_n_bins": "ql_n_bins",
+    "msa_alpha_max": "msa_alpha_max",
+    "msa_alpha_min": "msa_alpha_min",
+    "msa_decay": "msa_decay",
+    "sb3_lr": "sb3_lr",
+    "sb3_gamma": "sb3_gamma",
+    "sb3_net_arch": "sb3_net_arch",
+    "sb3_batch_size": "sb3_batch_size",
+    "sb3_buffer_size": "sb3_buffer_size",
+    "sb3_n_steps": "sb3_n_steps",
+    "wandb": "wandb_enabled",
+    "wandb_project": "wandb_project",
+    "wandb_run_name": "wandb_run_name",
+    "render": "render",
+    "render_format": "render_format",
+    "render_fps": "render_fps",
+    "render_hours": "render_hours",
+    "render_speed": "render_speed",
+    "relative_gap": "relative_gap",
+}
+
+
+if __name__ == "__main__":
+    parser = _build_parser()
     args = parser.parse_args()
 
-    train(
-        scenario_path=args.scenario,
-        population_filter=args.population,
-        n_episodes=args.episodes,
-        max_steps=args.max_steps,
-        timestep=args.timestep,
-        device=args.device,
-        seed=args.seed,
-        agent_type=args.agent,
-        ql_alpha=args.ql_alpha,
-        ql_gamma=args.ql_gamma,
-        ql_epsilon_start=args.ql_epsilon_start,
-        ql_epsilon_end=args.ql_epsilon_end,
-        ql_epsilon_decay=args.ql_epsilon_decay,
-        ql_n_bins=args.ql_n_bins,
-        msa_alpha_max=args.msa_alpha_max,
-        msa_alpha_min=args.msa_alpha_min,
-        msa_decay=args.msa_decay,
-        log_interval=args.log_interval,
-        render=args.render,
-        render_format=args.render_format,
-        render_fps=args.render_fps,
-        render_hours=args.render_hours,
-        render_speed=args.render_speed,
-        wandb_enabled=args.wandb,
-        wandb_project=args.wandb_project,
-        wandb_run_name=args.wandb_run_name,
-        relative_gap=args.relative_gap,
-    )
+    # 1. Start with train() defaults
+    import inspect
+    sig = inspect.signature(train)
+    kwargs = {
+        k: v.default
+        for k, v in sig.parameters.items()
+        if v.default is not inspect.Parameter.empty
+    }
+
+    # 2. Override with JSON config if provided
+    if args.config:
+        config_path = args.config
+        if not os.path.isfile(config_path):
+            parser.error(f"Config file not found: {config_path}")
+        json_kwargs = load_config(config_path)
+        kwargs.update(json_kwargs)
+        print(f"  📄 Loaded config from: {config_path}")
+
+    # 3. Override with CLI arguments (only those explicitly set)
+    args_dict = vars(args)
+    for cli_name, kwarg_name in _CLI_TO_KWARGS.items():
+        cli_val = args_dict.get(cli_name)
+        if cli_val is not None:
+            kwargs[kwarg_name] = cli_val
+
+    # 4. Ensure scenario_path is set
+    if "scenario_path" not in kwargs or kwargs["scenario_path"] is None:
+        parser.error("--scenario is required (via CLI or config file)")
+
+    train(**kwargs)

@@ -1,0 +1,61 @@
+{
+    "_comment": "TAMARL Training Configuration — Default values for all parameters",
+
+    "scenario": {
+        "path": "tamarl/data/scenarios/equil/",
+        "population_filter": null
+    },
+
+    "training": {
+        "agent": "random",
+        "episodes": 5,
+        "max_steps": 86400,
+        "timestep": 1.0,
+        "device": "cpu",
+        "seed": null
+    },
+
+    "q_learning": {
+        "alpha": 0.5,
+        "gamma": 1.0,
+        "epsilon_start": 1.0,
+        "epsilon_end": 0.05,
+        "epsilon_decay": 0.995,
+        "n_bins": 5
+    },
+
+    "msa": {
+        "alpha_max": 1.0,
+        "alpha_min": 0.05,
+        "decay": 0.05
+    },
+
+    "sb3": {
+        "learning_rate": 3e-4,
+        "gamma": 1.0,
+        "net_arch": [64, 64],
+        "batch_size": 64,
+        "buffer_size": 10000,
+        "n_steps": 128
+    },
+
+    "logging": {
+        "log_interval": 100,
+        "wandb_enabled": false,
+        "wandb_project": "tamarl",
+        "wandb_run_name": null,
+        "wandb_tags": null
+    },
+
+    "rendering": {
+        "render": null,
+        "format": "gif",
+        "fps": 5,
+        "hours": null,
+        "speed": 1
+    },
+
+    "metrics": {
+        "relative_gap": true
+    }
+}
