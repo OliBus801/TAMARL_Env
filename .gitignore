@@ -25,6 +25,9 @@ wandb/
 *.webp
 *.mp4
 
+# JSON config files
+*.json
+
 # MATSim scenarios data
 *.xml
 *.pkl
