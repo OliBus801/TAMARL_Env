@@ -109,7 +109,7 @@ def train(
     seed: Optional[int] = None,
     # Agent
     agent_type: str = "random",
-    ql_alpha: float = 0.1,
+    ql_alpha: float = 0.7,
     ql_gamma: float = 1.0,
     ql_epsilon_start: float = 1.0,
     ql_epsilon_end: float = 0.05,
@@ -132,9 +132,6 @@ def train(
     wandb_project: str = "tamarl",
     wandb_run_name: Optional[str] = None,
     wandb_tags: Optional[list] = None,
-    # BPR params for Frank-Wolfe
-    bpr_alpha: float = 0.15,
-    bpr_beta: float = 4.0,
     # Metrics
     relative_gap: bool = True,
 ):
@@ -153,8 +150,6 @@ def train(
         wandb_project: W&B project name
         wandb_run_name: W&B run name (auto-generated if None)
         wandb_tags: W&B run tags
-        bpr_alpha: BPR alpha parameter for Frank-Wolfe
-        bpr_beta: BPR beta parameter for Frank-Wolfe
     """
     # ── Config ──
     config = {
@@ -166,8 +161,6 @@ def train(
         'device': device,
         'seed': seed,
         'log_interval': log_interval,
-        'bpr_alpha': bpr_alpha,
-        'bpr_beta': bpr_beta,
         'agent_type': agent_type,
         'relative_gap': relative_gap,
     }
@@ -199,9 +192,7 @@ def train(
     if agent_type == 'qlearning':
         print(f"  Q-Learning:    α={ql_alpha}, γ={ql_gamma}, ε={ql_epsilon_start}→{ql_epsilon_end} (decay={ql_epsilon_decay})")
     elif agent_type == 'msa':
-        print(f"  S-MSA:         α_max={msa_alpha_max}, α_min={msa_alpha_min}, decay={msa_decay}")
-    print(f"  BPR:           α={bpr_alpha}, β={bpr_beta}")
-    print(f"  W&B:           {'enabled' if wandb_enabled else 'disabled'}")
+        print(f"  MSA:         α_max={msa_alpha_max}, α_min={msa_alpha_min}, decay={msa_decay}")
     print(f"{'='*65}\n")
 
     # ── W&B init ──
@@ -276,7 +267,7 @@ def train(
         idx_to_link_id = {v: k for k, v in scenario_data.link_id_to_idx.items()}
 
     if agent_type == 'msa':
-        print("\n  Initializing S-MSA agent routing with FF times...")
+        print("\n  Initializing MSA agent routing with FF times...")
         agent.end_episode(env.dnl, is_init=True)
 
     # ── Training loop ──
@@ -475,10 +466,6 @@ if __name__ == "__main__":
     parser.add_argument("--msa_alpha_min", type=float, default=0.05, help="Minimum MSA update probability")
     parser.add_argument("--msa_decay", type=float, default=0.05, help="MSA exponential decay lambda")
 
-    # BPR parameters
-    parser.add_argument("--bpr_alpha", type=float, default=0.15, help="BPR alpha (default: 0.15)")
-    parser.add_argument("--bpr_beta", type=float, default=4.0, help="BPR beta (default: 4.0)")
-
     # W&B
     parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
     parser.add_argument("--wandb_project", default="tamarl", help="W&B project name")
@@ -527,7 +514,5 @@ if __name__ == "__main__":
         wandb_enabled=args.wandb,
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run_name,
-        bpr_alpha=args.bpr_alpha,
-        bpr_beta=args.bpr_beta,
         relative_gap=args.relative_gap,
     )

@@ -3,7 +3,7 @@ import math
 from tamarl.envs.components.time_dependent_dijkstra import build_adjacency_list, compute_td_shortest_paths
 
 class MSAAgent:
-    """Stochastic Method of Successive Averages (S-MSA) Agent.
+    """Method of Successive Averages (MSA) Agent.
     
     Approximates Dynamic User Equilibrium by updating paths with a decaying 
     probability alpha_k = alpha_min + (alpha_max - alpha_min) * exp(-lambda * k).
