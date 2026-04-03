@@ -444,7 +444,7 @@ if __name__ == "__main__":
 
     # Training
     parser.add_argument("--episodes", type=int, default=5, help="Number of episodes")
-    parser.add_argument("--max_steps", type=int, default=3600, help="Max ticks per episode")
+    parser.add_argument("--max_steps", type=int, default=86400, help="Max ticks per episode")
     parser.add_argument("--timestep", type=float, default=1.0, help="Simulation timestep (s)")
     parser.add_argument("--device", default="cpu", help="Device ('cpu' or 'cuda')")
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
@@ -454,7 +454,7 @@ if __name__ == "__main__":
                         help="Log metrics every N episodes (default: 100)")
 
     # Q-Learning hyperparameters
-    parser.add_argument("--ql_alpha", type=float, default=0.1, help="Q-learning rate (default: 0.1)")
+    parser.add_argument("--ql_alpha", type=float, default=0.5, help="Q-learning rate (default: 0.5)")
     parser.add_argument("--ql_gamma", type=float, default=1.0, help="Q-learning discount (default: 1.0)")
     parser.add_argument("--ql_epsilon_start", type=float, default=1.0, help="Initial epsilon")
     parser.add_argument("--ql_epsilon_end", type=float, default=0.05, help="Final epsilon")
