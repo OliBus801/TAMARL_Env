@@ -16,34 +16,33 @@ class ActionManager:
     def __init__(self, dnl: TorchDNLMATSim):
         self.dnl = dnl
 
-    def get_action_masks(self, deciding_agent_indices: torch.Tensor) -> Dict[str, np.ndarray]:
-        """Build action masks for deciding agents.
-        
+    def get_action_masks_batched(self, deciding_agent_indices: torch.Tensor) -> torch.Tensor:
+        """Build action masks for deciding agents as a single tensor.
+
         Args:
-            deciding_agent_indices: tensor of agent indices that need decisions
-            
+            deciding_agent_indices: [K] tensor of agent indices.
+
         Returns:
-            Dict mapping agent_id string to binary mask ndarray of shape (max_out_degree,)
+            masks: [K, max_out_degree] int8 tensor (1=valid, 0=invalid).
         """
-        masks = {}
         if deciding_agent_indices.numel() == 0:
-            return masks
+            return torch.empty(
+                (0, self.dnl.max_out_degree), device=self.dnl.device, dtype=torch.int8
+            )
 
-        # Get to_node of current edge for each deciding agent
-        curr_edges = self.dnl.current_edge[deciding_agent_indices]
-        curr_to_nodes = self.dnl.edge_endpoints[curr_edges, 1].long()
+        curr_edges = self.dnl.current_edge[deciding_agent_indices]       # [K]
+        nodes = self.dnl.edge_endpoints[curr_edges, 1].long()            # [K]
+        out_edges = self.dnl.node_out_edges[nodes]                       # [K, max_deg]
+        return (out_edges != -1).to(torch.int8)                          # [K, max_deg]
 
-        # Get outgoing edges per node using pre-built lookup
-        node_out = self.dnl.node_out_edges  # [N, max_out_degree]
-        max_deg = self.dnl.max_out_degree
-
-        for i, agent_idx in enumerate(deciding_agent_indices.tolist()):
-            node = curr_to_nodes[i].item()
-            out_edges = node_out[node]  # [max_out_degree], padded with -1
-            mask = (out_edges != -1).cpu().numpy().astype(np.int8)
-            masks[f"agent_{agent_idx}"] = mask
-
-        return masks
+    def get_action_masks(self, deciding_agent_indices: torch.Tensor) -> Dict[str, np.ndarray]:
+        """Build action masks as a dict (PettingZoo interface)."""
+        if deciding_agent_indices.numel() == 0:
+            return {}
+        masks_t = self.get_action_masks_batched(deciding_agent_indices)
+        masks_np = masks_t.cpu().numpy()
+        indices = deciding_agent_indices.tolist()
+        return {f"agent_{idx}": masks_np[i] for i, idx in enumerate(indices)}
 
     def get_action_mask_for_agent(self, agent_idx: int) -> np.ndarray:
         """Get action mask for a single agent.

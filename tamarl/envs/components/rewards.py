@@ -43,28 +43,19 @@ class Rewarder:
         The reward is strictly proportional to the exact delta of accumulated travel time 
         since the last time step_rewards was called.
         """
-        curr_tt_sums = self._get_continuous_tt()
-        
-        # Calculate exactly how much travel time each agent accrued since last check
-        tt_deltas = (curr_tt_sums - self._prev_tt_sums)
-        
-        rewards = {}
-        dt = self.dnl.dt
-        
-        for agent_id in active_agents:
-            agent_idx = int(agent_id.split("_")[-1])
-            # Negative penalty for newly accrued travel time
-            rewards[agent_id] = -float(tt_deltas[agent_idx].item()) * dt
-            
-        # VERY IMPORTANT: update only the previous tt sums for agents that were just evaluated!
-        # Wait, if an agent is not in active_agents, it doesn't get evaluated here.
-        # But if it gets evaluated LATER, its delta MUST span the entire time since it was last evaluated!
-        # So we MUST only update _prev_tt_sums for agents in active_agents here!
-        for agent_id in active_agents:
-            agent_idx = int(agent_id.split("_")[-1])
-            self._prev_tt_sums[agent_idx] = curr_tt_sums[agent_idx]
-            
-        return rewards
+        if not active_agents:
+            return {}
+
+        # Convert str IDs to tensor indices once
+        indices = torch.tensor(
+            [int(a.split("_")[-1]) for a in active_agents],
+            device=self.dnl.device, dtype=torch.long,
+        )
+        rewards_t = self.compute_batch_rewards(indices, n_ticks)
+        rewards_np = rewards_t.cpu().numpy()
+
+        # Build dict from the tensor results
+        return {a: float(rewards_np[i]) for i, a in enumerate(active_agents)}
 
     def compute_batch_rewards(self, active_agent_indices: torch.Tensor, n_ticks: int = 1) -> torch.Tensor:
         """Vectorised reward computation."""

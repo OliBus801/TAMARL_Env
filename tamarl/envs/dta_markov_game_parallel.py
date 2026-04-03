@@ -48,18 +48,6 @@ class DTAMarkovGameEnv(ParallelEnv):
         stuck_threshold: int = 10,
         track_events: bool = False,
     ):
-        """Initialize the DTA Markov Game environment.
-        
-        Args:
-            scenario_path: path to scenario folder with network.xml + population.xml
-            population_filter: substring to match population file (e.g. '100')
-            timestep: simulation timestep dt in seconds
-            scale_factor: scale factor for network capacities
-            max_steps: maximum number of simulation ticks per episode
-            device: 'cpu' or 'cuda'
-            seed: random seed for reproducibility
-            stuck_threshold: stuck threshold for DNL simulator
-        """
         super().__init__()
         
         self._scenario_path = scenario_path
@@ -107,9 +95,21 @@ class DTAMarkovGameEnv(ParallelEnv):
         self.possible_agents = [f"agent_{i}" for i in range(self.dnl.num_agents)]
         self.agents = []
         
-        # Track cumulative rewards per episode
+        # Track cumulative rewards per episode (tensor-based)
+        self._cumulative_rewards_t = torch.zeros(
+            self.dnl.num_agents, device=device, dtype=torch.float32
+        )
+        # Active agent indices (tensor) — avoids string parsing
+        self._active_indices = torch.empty(0, device=device, dtype=torch.long)
+        
+        # Legacy dict for PettingZoo compat
         self._cumulative_rewards: Dict[str, float] = {}
         self._ticks_since_last_step = 0
+        
+        # Pre-allocate zero masks
+        self._zero_mask = torch.zeros(
+            self.dnl.max_out_degree, device=device, dtype=torch.int8
+        )
 
     @functools.lru_cache(maxsize=None)
     def observation_space(self, agent: str) -> spaces.Box:
@@ -119,14 +119,20 @@ class DTAMarkovGameEnv(ParallelEnv):
     def action_space(self, agent: str) -> spaces.Discrete:
         return spaces.Discrete(self.dnl.max_out_degree)
 
-    def reset(
-        self, seed: Optional[int] = None, options: Optional[dict] = None
-    ) -> Tuple[Dict[str, np.ndarray], Dict[str, dict]]:
-        """Reset the environment for a new episode.
+    # ══════════════════════════════════════════════════════════════════
+    #  BATCHED API  (tensors in, tensors out — no string processing)
+    # ══════════════════════════════════════════════════════════════════
+
+    def reset_batched(
+        self, seed: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Reset the environment — tensor API.
         
         Returns:
-            observations: dict of agent_id → observation array
-            infos: dict of agent_id → info dict (no action_mask at reset, agents are waiting)
+            obs_all:          [N, obs_dim]  observations for ALL agents
+            masks_deciding:   [K, max_deg]  action masks for deciding agents only
+            deciding_indices: [K]           which agent indices are deciding
+            active_indices:   [N_active]    which agents are still alive
         """
         if seed is not None:
             self._seed = seed
@@ -135,40 +141,180 @@ class DTAMarkovGameEnv(ParallelEnv):
         if seed is not None:
             self.dnl.rng.manual_seed(seed)
         
+        N = self.dnl.num_agents
+        
         # All agents start alive
+        self._active_indices = torch.arange(N, device=self.dnl.device)
         self.agents = list(self.possible_agents)
+        self._cumulative_rewards_t.zero_()
         self._cumulative_rewards = {a: 0.0 for a in self.agents}
         self._ticks_since_last_step = 0
         self._rewarder.reset()
         
-        # Advance simulation until first decision occurs
-        # (agents need to depart, enter first link, traverse it, then decide at buffer)
+        # Advance simulation until first decision
         self._advance_to_next_decisions()
         
-        # Build observations for deciding agents
-        deciding = self._scheduler.get_deciding_agents()
-        observations = self._obs_builder.build_observations(deciding)
+        # Build observations
+        deciding = self._scheduler.get_deciding_agents()  # [K]
+        obs_deciding = self._obs_builder.build_observations_batched(deciding)  # [K, obs_dim]
         
-        # For agents that are not yet deciding (still waiting/traveling), 
-        # provide initial observations
-        initial_obs = self._obs_builder.build_initial_observations()
-        for agent_id in self.agents:
-            if agent_id not in observations:
-                observations[agent_id] = initial_obs.get(agent_id, 
-                    np.zeros(self._obs_builder.obs_size, dtype=np.float32))
+        # Build initial observations for all agents
+        obs_all = self._obs_builder.build_initial_observations_batched()  # [N, obs_dim]
+        
+        # Overwrite deciding agents' obs with their actual observations
+        if deciding.numel() > 0:
+            obs_all[deciding] = obs_deciding
+        
+        # Action masks for deciding agents
+        masks = self._action_mgr.get_action_masks_batched(deciding)  # [K, max_deg]
+        
+        return obs_all, masks, deciding, self._active_indices.clone()
+
+    def step_batched(
+        self,
+        action_indices: torch.Tensor,
+        action_values: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Execute one macro-step — tensor API.
+        
+        Args:
+            action_indices: [K] agent indices that are acting
+            action_values:  [K] action values (local edge indices)
+            
+        Returns:
+            obs_active:        [N_active_new, obs_dim]  observations for remaining active agents
+            rewards_active:    [N_active_old]           rewards for previously-active agents
+            terminated_mask:   [N_active_old]           bool mask — which agents terminated
+            truncated_mask:    [N_active_old]           bool mask — which agents were truncated
+            masks_deciding:    [K', max_deg]            action masks for newly-deciding agents
+            deciding_indices:  [K']                     which agent indices are newly deciding
+        """
+        prev_active = self._active_indices  # [N_active_old]
+        
+        # 1. Apply actions (vectorised)
+        if action_indices.numel() > 0:
+            self._action_mgr.apply_actions_tensor(action_indices, action_values)
+        
+        # 2. Advance DNL
+        n_ticks = self._advance_to_next_decisions()
+        
+        # 3. Compute rewards (vectorised)
+        rewards = self._rewarder.compute_batch_rewards(prev_active, n_ticks)  # [N_active_old]
+        
+        # 4. Terminations & truncations (vectorised)
+        statuses = self.dnl.status[prev_active]  # [N_active_old]
+        terminated_mask = (statuses == 3)  # arrived
+        truncated_mask = torch.zeros_like(terminated_mask)
+        
+        if self.dnl.current_step >= self._max_steps:
+            truncated_mask = ~terminated_mask  # truncate all non-terminated
+        
+        # 5. Update cumulative rewards
+        self._cumulative_rewards_t[prev_active] += rewards
+        
+        # 6. Filter to surviving agents
+        alive_mask = ~terminated_mask & ~truncated_mask
+        self._active_indices = prev_active[alive_mask]
+        
+        # Update PettingZoo agents list
+        self.agents = [f"agent_{i}" for i in self._active_indices.tolist()]
+        
+        # 7. Build observations for active agents
+        deciding = self._scheduler.get_deciding_agents()  # [K']
+        
+        # Filter deciding to only include agents that are still active
+        if deciding.numel() > 0 and self._active_indices.numel() > 0:
+            is_active = (deciding.unsqueeze(1) == self._active_indices.unsqueeze(0)).any(dim=1)
+            deciding = deciding[is_active]
+        elif self._active_indices.numel() == 0:
+            deciding = torch.empty(0, device=self.dnl.device, dtype=torch.long)
+        
+        n_active = self._active_indices.numel()
+        obs_dim = self._obs_builder.obs_size
+        
+        if n_active == 0:
+            obs_active = torch.empty((0, obs_dim), device=self.dnl.device)
+            masks = torch.empty((0, self.dnl.max_out_degree), device=self.dnl.device, dtype=torch.int8)
+            return obs_active, rewards, terminated_mask, truncated_mask, masks, deciding
+        
+        # Get deciding agents' observations
+        obs_deciding = self._obs_builder.build_observations_batched(deciding)  # [K', obs_dim]
+        
+        # Build obs for all active agents
+        obs_active = torch.zeros((n_active, obs_dim), device=self.dnl.device)
+        
+        # Create a quick lookup: agent_idx -> position in active array
+        # We need to map deciding indices to positions in _active_indices
+        if deciding.numel() > 0 and n_active > 0:
+            # For each deciding agent, find its position in _active_indices
+            # Use broadcasting: _active_indices[pos] == deciding[j]
+            dec_positions = (self._active_indices.unsqueeze(1) == deciding.unsqueeze(0)).any(dim=1)
+            obs_active[dec_positions] = obs_deciding
+        
+        # For non-deciding active agents, build minimal observations
+        if n_active > 0:
+            active_idx = self._active_indices
+            active_statuses = self.dnl.status[active_idx]
+            
+            # Create set of deciding agent indices for fast lookup
+            if deciding.numel() > 0:
+                is_deciding = (active_idx.unsqueeze(1) == deciding.unsqueeze(0)).any(dim=1)
+            else:
+                is_deciding = torch.zeros(n_active, device=self.dnl.device, dtype=torch.bool)
+            
+            needs_obs = ~is_deciding & ((active_statuses == 1) | (active_statuses == 2))
+            
+            if needs_obs.any():
+                need_idx = active_idx[needs_obs]
+                curr_edges = self.dnl.current_edge[need_idx]
+                nodes = self.dnl.edge_endpoints[curr_edges, 1].float()
+                c_legs = self.dnl.current_leg[need_idx]
+                dests = self.dnl.destinations[need_idx, c_legs].float()
+                norm_time = self.dnl.current_step / self._max_steps
+                
+                obs_active[needs_obs, 0] = nodes
+                obs_active[needs_obs, 1] = dests
+                obs_active[needs_obs, 2] = norm_time
+        
+        # 8. Action masks for deciding agents
+        masks = self._action_mgr.get_action_masks_batched(deciding)  # [K', max_deg]
+        
+        return obs_active, rewards, terminated_mask, truncated_mask, masks, deciding
+
+    def has_active_agents(self) -> bool:
+        """Check if any agents are still active."""
+        return self._active_indices.numel() > 0
+
+    # ══════════════════════════════════════════════════════════════════
+    #  PETTINGZOO DICT API  (delegates to batched, converts to dicts)
+    # ══════════════════════════════════════════════════════════════════
+
+    def reset(
+        self, seed: Optional[int] = None, options: Optional[dict] = None
+    ) -> Tuple[Dict[str, np.ndarray], Dict[str, dict]]:
+        """Reset the environment for a new episode (PettingZoo API)."""
+        obs_all_t, masks_t, deciding, active = self.reset_batched(seed)
+        
+        # Convert to dicts
+        obs_all_np = obs_all_t.cpu().numpy()
+        observations = {f"agent_{i}": obs_all_np[i] for i in range(self.dnl.num_agents)}
         
         # Infos with action masks
+        deciding_set = set(deciding.tolist())
+        masks_np = masks_t.cpu().numpy() if masks_t.numel() > 0 else np.empty((0, self.dnl.max_out_degree), dtype=np.int8)
+        deciding_list = deciding.tolist()
+        masks_dict = {deciding_list[i]: masks_np[i] for i in range(len(deciding_list))}
+        
         infos = {}
-        action_masks = self._action_mgr.get_action_masks(deciding)
+        zero_mask_np = np.zeros(self.dnl.max_out_degree, dtype=np.int8)
+        
         for agent_id in self.agents:
-            info = {}
-            if agent_id in action_masks:
-                info["action_mask"] = action_masks[agent_id]
-            else:
-                # Not deciding yet — provide all-zeros mask
-                info["action_mask"] = np.zeros(self.dnl.max_out_degree, dtype=np.int8)
-            
             idx = int(agent_id.split("_")[-1])
+            info = {}
+            if idx in masks_dict:
+                info["action_mask"] = masks_dict[idx]
+            else:
+                info["action_mask"] = zero_mask_np.copy()
             info["curr_leg"] = int(self.dnl.current_leg[idx].item())
             infos[agent_id] = info
         
@@ -183,135 +329,91 @@ class DTAMarkovGameEnv(ParallelEnv):
         Dict[str, bool],
         Dict[str, dict],
     ]:
-        """Execute one macro-step: apply actions, advance DNL to next decision event.
-        
-        Args:
-            actions: dict of agent_id → action index (only for deciding agents)
-            
-        Returns:
-            observations, rewards, terminations, truncations, infos
-        """
+        """Execute one macro-step (PettingZoo API)."""
         current_agents = list(self.agents)
         
-        # 1. Apply actions for deciding agents
+        # Convert dict actions to tensors
         if actions:
-            self._action_mgr.apply_actions(actions)
+            act_indices = []
+            act_values = []
+            for agent_id, action in actions.items():
+                act_indices.append(int(agent_id.split("_")[-1]))
+                act_values.append(action)
+            action_indices_t = torch.tensor(act_indices, device=self.dnl.device, dtype=torch.long)
+            action_values_t = torch.tensor(act_values, device=self.dnl.device, dtype=torch.long)
+        else:
+            action_indices_t = torch.empty(0, device=self.dnl.device, dtype=torch.long)
+            action_values_t = torch.empty(0, device=self.dnl.device, dtype=torch.long)
         
-        # 2. Advance DNL until next decision event (macro-step)
-        n_ticks = self._advance_to_next_decisions()
+        prev_active = self._active_indices.clone()
+        prev_active_list = prev_active.tolist()
         
-        # 3. Compute rewards
-        rewards = self._rewarder.compute_step_rewards(set(current_agents), n_ticks)
+        obs_active_t, rewards_t, term_mask, trunc_mask, masks_t, deciding = self.step_batched(
+            action_indices_t, action_values_t
+        )
         
-        # 4. Determine terminations and truncations
-        terminations = {}
-        truncations = {}
+        # Convert rewards to dict
+        rewards_np = rewards_t.cpu().numpy()
+        rewards = {f"agent_{prev_active_list[i]}": float(rewards_np[i]) 
+                   for i in range(len(prev_active_list))}
         
-        if current_agents:
-            active_indices = [int(a.split("_")[-1]) for a in current_agents]
-            active_tensor = torch.tensor(active_indices, device=self.dnl.device, dtype=torch.long)
-            statuses = self.dnl.status[active_tensor].cpu().numpy()
-            
-            for i, agent_id in enumerate(current_agents):
-                terminations[agent_id] = bool(statuses[i] == 3)  # Arrived at destination
-                truncations[agent_id] = False
+        # Convert terminations/truncations to dict
+        term_np = term_mask.cpu().numpy()
+        trunc_np = trunc_mask.cpu().numpy()
+        terminations = {f"agent_{prev_active_list[i]}": bool(term_np[i])
+                        for i in range(len(prev_active_list))}
+        truncations = {f"agent_{prev_active_list[i]}": bool(trunc_np[i])
+                       for i in range(len(prev_active_list))}
         
-        # Check max steps truncation
-        if self.dnl.current_step >= self._max_steps:
-            for agent_id in current_agents:
-                if not terminations[agent_id]:
-                    truncations[agent_id] = True
-        
-        # 5. Update cumulative rewards
+        # Update cumulative rewards dict
         for agent_id in current_agents:
             self._cumulative_rewards[agent_id] = (
                 self._cumulative_rewards.get(agent_id, 0.0) + rewards.get(agent_id, 0.0)
             )
         
-        # 6. Remove finished agents
-        self.agents = [
-            a for a in current_agents
-            if not terminations[a] and not truncations[a]
-        ]
+        # Convert observations to dict
+        obs_np = obs_active_t.cpu().numpy() if obs_active_t.numel() > 0 else np.empty((0, self._obs_builder.obs_size), dtype=np.float32)
+        active_list = self._active_indices.tolist()
+        observations = {f"agent_{active_list[i]}": obs_np[i] 
+                        for i in range(len(active_list))}
         
-        # 7. Build observations for remaining agents
-        deciding = self._scheduler.get_deciding_agents()
-        observations = self._obs_builder.build_observations(deciding)
+        # Build infos dict
+        deciding_set = set(deciding.tolist()) if deciding.numel() > 0 else set()
+        masks_np = masks_t.cpu().numpy() if masks_t.numel() > 0 else np.empty((0, self.dnl.max_out_degree), dtype=np.int8)
+        deciding_list = deciding.tolist() if deciding.numel() > 0 else []
+        masks_lookup = {deciding_list[i]: masks_np[i] for i in range(len(deciding_list))}
         
-        # For non-deciding remaining agents, build a current obs
-        if self.agents:
-            agent_indices = np.array([int(a.split("_")[-1]) for a in self.agents])
-            idx_tensor = torch.from_numpy(agent_indices).to(self.dnl.device)
-            statuses = self.dnl.status[idx_tensor].cpu().numpy()
-            
-            needs_obs_mask = np.array([a not in observations for a in self.agents])
-            valid_mask = needs_obs_mask & ((statuses == 1) | (statuses == 2))
-            
-            if valid_mask.any():
-                valid_idx_tensor = torch.from_numpy(agent_indices[valid_mask]).to(self.dnl.device)
-                curr_edges = self.dnl.current_edge[valid_idx_tensor]
-                nodes = self.dnl.edge_endpoints[curr_edges, 1].cpu().numpy()
-                c_legs = self.dnl.current_leg[valid_idx_tensor]
-                dests = self.dnl.destinations[valid_idx_tensor, c_legs].cpu().numpy()
-                norm_time = self.dnl.current_step / self._max_steps
-                
-                valid_agent_ids = [self.agents[i] for i in np.where(valid_mask)[0]]
-                for i, agent_id in enumerate(valid_agent_ids):
-                    obs = np.zeros(self._obs_builder.obs_size, dtype=np.float32)
-                    obs[0] = float(nodes[i])
-                    obs[1] = float(dests[i])
-                    obs[2] = norm_time
-                    observations[agent_id] = obs
-                    
-            zero_mask = needs_obs_mask & ~valid_mask
-            if zero_mask.any():
-                zero_agent_ids = [self.agents[i] for i in np.where(zero_mask)[0]]
-                for agent_id in zero_agent_ids:
-                    observations[agent_id] = np.zeros(self._obs_builder.obs_size, dtype=np.float32)
-        
-        # 8. Build infos with action masks
         infos = {}
-        action_masks = self._action_mgr.get_action_masks(deciding)
+        zero_mask_np = np.zeros(self.dnl.max_out_degree, dtype=np.int8)
         for agent_id in current_agents:
-            info = {}
-            if agent_id in action_masks:
-                info["action_mask"] = action_masks[agent_id]
-            else:
-                info["action_mask"] = np.zeros(self.dnl.max_out_degree, dtype=np.int8)
-            
             idx = int(agent_id.split("_")[-1])
+            info = {}
+            if idx in masks_lookup:
+                info["action_mask"] = masks_lookup[idx]
+            else:
+                info["action_mask"] = zero_mask_np.copy()
             info["curr_leg"] = int(self.dnl.current_leg[idx].item())
             infos[agent_id] = info
         
         return observations, rewards, terminations, truncations, infos
 
+    # ══════════════════════════════════════════════════════════════════
+    #  INTERNAL HELPERS
+    # ══════════════════════════════════════════════════════════════════
+
     def _advance_to_next_decisions(self) -> int:
-        """Advance DNL tick-by-tick until a decision event occurs or episode ends.
-        
-        A decision event is when at least one agent needs to choose its next edge
-        (status=2, wakeup_time <= current_step, next_edge == -1).
-        
-        Returns:
-            Number of ticks advanced.
-        """
+        """Advance DNL tick-by-tick until a decision event occurs or episode ends."""
         ticks = 0
-        max_idle = self._max_steps  # Safety limit
+        max_idle = self._max_steps
         
         while ticks < max_idle:
-            # Check if we already have deciding agents
             if ticks > 0 and self._scheduler.has_deciding_agents():
                 break
-            
-            # Check if all agents are done
             all_done = (self.dnl.status >= 3).all().item()
             if all_done:
                 break
-            
-            # Check max steps
             if self.dnl.current_step >= self._max_steps:
                 break
-            
-            # Advance one tick
             self.dnl.step()
             ticks += 1
         
