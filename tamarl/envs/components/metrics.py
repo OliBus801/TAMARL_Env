@@ -4,6 +4,7 @@ from typing import Dict, List, Optional
 import numpy as np
 import torch
 from tamarl.core.dnl_matsim import TorchDNLMATSim
+from tamarl.envs.components.time_dependent_dijkstra import build_adjacency_list, compute_td_shortest_paths
 
 
 # ── Core Metrics ──────────────────────────────────────────────────────────────
@@ -16,7 +17,9 @@ def compute_tstt(dnl: TorchDNLMATSim) -> float:
     """
     done_mask = (dnl.status == 3)
     if done_mask.any():
-        return dnl.agent_metrics[done_mask, 1].sum().item() * dnl.dt
+        valid_legs = dnl.leg_metrics[done_mask, :, 1] > 0
+        if valid_legs.any():
+            return dnl.leg_metrics[done_mask, :, 1][valid_legs].sum().item() * dnl.dt
     return 0.0
 
 
@@ -24,18 +27,12 @@ def compute_mean_travel_time(dnl: TorchDNLMATSim) -> float:
     """Compute mean travel time across arrived agents."""
     done_mask = (dnl.status == 3)
     if done_mask.any():
-        return dnl.agent_metrics[done_mask, 1].mean().item() * dnl.dt
+        valid_legs = dnl.leg_metrics[done_mask, :, 1] > 0
+        if valid_legs.any():
+            return dnl.leg_metrics[done_mask, :, 1][valid_legs].mean().item() * dnl.dt
     return 0.0
 
 
-def compute_normalized_score(tstt_rl: float, tstt_analytical: float) -> float:
-    """Normalized performance score: 1 - (TSTT_RL - TSTT_analytical) / TSTT_analytical.
-    
-    Higher is better. 1.0 = matches analytical optimum.
-    """
-    if tstt_analytical <= 0:
-        return float('-inf')
-    return 1.0 - (tstt_rl - tstt_analytical) / tstt_analytical
 
 
 def compute_arrival_rate(dnl: TorchDNLMATSim) -> float:
@@ -56,7 +53,11 @@ def compute_travel_time_stats(dnl: TorchDNLMATSim) -> Dict[str, float]:
     if not done_mask.any():
         return {k: 0.0 for k in ['mean', 'std', 'min', 'max', 'median', 'p90', 'p95']}
     
-    tt = dnl.agent_metrics[done_mask, 1].cpu().float() * dnl.dt
+    valid_legs = dnl.leg_metrics[done_mask, :, 1] > 0
+    if not valid_legs.any():
+        return {k: 0.0 for k in ['mean', 'std', 'min', 'max', 'median', 'p90', 'p95']}
+        
+    tt = dnl.leg_metrics[done_mask, :, 1][valid_legs].cpu().float() * dnl.dt
     tt_np = tt.numpy()
     
     return {
@@ -170,10 +171,11 @@ def _run_episode_get_travel_times(env, policy) -> Dict[str, float]:
     travel_times = {}
     done_mask = (env.dnl.status == 3)
     if done_mask.any():
-        tt_tensor = env.dnl.agent_metrics[:, 1].cpu() * env.dnl.dt
         for i in range(env.dnl.num_agents):
             if env.dnl.status[i].item() == 3:
-                travel_times[f"agent_{i}"] = float(tt_tensor[i])
+                agent_tt = env.dnl.leg_metrics[i, :, 1]
+                valid_tt = agent_tt[agent_tt > 0]
+                travel_times[f"agent_{i}"] = float(valid_tt.sum().item() * env.dnl.dt)
     
     return travel_times
 
@@ -200,5 +202,91 @@ def _run_episode_with_deviation(env, policy, deviant_agent: str, rng) -> Optiona
     # Get deviant's travel time
     agent_idx = int(deviant_agent.split("_")[-1])
     if env.dnl.status[agent_idx].item() == 3:
-        return float(env.dnl.agent_metrics[agent_idx, 1].item() * env.dnl.dt)
+        agent_tt = env.dnl.leg_metrics[agent_idx, :, 1]
+        valid_tt = agent_tt[agent_tt > 0]
+        return float(valid_tt.sum().item() * env.dnl.dt)
     return None
+
+# ── Relative Gap ────────────────────────────────────────────────────────────
+
+def compute_relative_gap(dnl: TorchDNLMATSim, link_tt_interval: float = 300.0) -> float:
+    """Computes the Relative Gap (RGap) metric over all arrived agents.
+    
+    RGap = sum(t_i - t_i_SP) / sum(t_i)
+    """
+    if not getattr(dnl, 'collect_link_tt', False):
+        return float('inf')
+        
+    tt_matrix = dnl.get_dynamic_link_travel_times()
+    if tt_matrix is None:
+        return float('inf')
+        
+    tt_matrix_np = tt_matrix.cpu().numpy()
+    
+    done_mask = (dnl.status == 3).cpu().numpy()
+    if not done_mask.any():
+        return 0.0
+        
+    done_agents = np.where(done_mask)[0]
+    leg_metrics = dnl.leg_metrics.cpu().numpy()
+    
+    total_real_tt = 0.0
+    
+    start_times_list = []
+    origins_list = []
+    destinations_list = []
+    
+    all_first_edges = dnl._all_first_edges.cpu().numpy()
+    dests = dnl.destinations.cpu().numpy()
+    edge_endpoints = dnl.edge_endpoints.cpu().numpy()
+    leg_departure_times = dnl.leg_departure_times.cpu().numpy()
+    num_legs = dnl.num_legs.cpu().numpy()
+    
+    for agent_id in done_agents:
+        for leg_idx in range(num_legs[agent_id]):
+            real_tt = leg_metrics[agent_id, leg_idx, 1]
+            if real_tt <= 0:
+                continue
+                
+            first_edge = all_first_edges[agent_id, leg_idx]
+            # MATSim spawns agents into the capacity buffer of the their first link,
+            # meaning their physical start node is the destination of the first link.
+            origin_node = edge_endpoints[first_edge, 1]
+            dest_node = dests[agent_id, leg_idx]
+            dep_time_steps = leg_departure_times[agent_id, leg_idx]
+            dep_time_sec = dep_time_steps * dnl.dt
+            
+            start_times_list.append(dep_time_sec)
+            origins_list.append(origin_node)
+            destinations_list.append(dest_node)
+            
+            # Since real_tt is already in seconds, just add it
+            total_real_tt += real_tt
+            
+    if len(start_times_list) == 0 or total_real_tt <= 0:
+        return 0.0
+        
+    start_times_np = np.array(start_times_list, dtype=np.float32)
+    origins_np = np.array(origins_list, dtype=np.int32)
+    dests_np = np.array(destinations_list, dtype=np.int32)
+    
+    adj = build_adjacency_list(dnl.num_nodes, edge_endpoints)
+    t_sp, _ = compute_td_shortest_paths(
+        adj=adj,
+        start_times=start_times_np,
+        origin_nodes=origins_np,
+        destination_nodes=dests_np,
+        tt_matrix=tt_matrix_np,
+        interval=float(link_tt_interval)
+    )
+    
+    # Exclude unreachable agents from the gap, though in a sane scenario all matched
+    valid_sp_mask = (t_sp != float('inf'))
+    if not valid_sp_mask.any():
+        return 0.0
+        
+    total_sp_tt = np.sum(t_sp[valid_sp_mask])
+    
+    # Ensure RGap doesn't become negative due to precision
+    rgap = max(0.0, (total_real_tt - float(total_sp_tt)) / total_real_tt)
+    return float(rgap)

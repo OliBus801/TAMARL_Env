@@ -17,8 +17,11 @@ class ScenarioData:
     edge_static: torch.Tensor        # [E, 5]
     edge_endpoints: torch.Tensor     # [E, 2]
     departure_times: torch.Tensor    # [A]
-    first_edges: torch.Tensor        # [A]
-    destinations: torch.Tensor       # [A] destination node indices
+    first_edges: torch.Tensor        # [A, MaxLegs]
+    destinations: torch.Tensor       # [A, MaxLegs] destination node indices
+    act_end_times: torch.Tensor      # [A, MaxActs] absolute end time (-1 if missing)
+    act_durations: torch.Tensor      # [A, MaxActs] duration (-1 if missing)
+    num_legs: torch.Tensor           # [A] total number of legs per agent
     num_nodes: int
     num_edges: int
     num_agents: int
@@ -78,12 +81,16 @@ def parse_network(network_file: str, scale_factor: float = 1.0, timestep: float 
 
 
 def parse_population(pop_file: str, link_id_to_idx: Dict[str, int], node_id_to_idx: Dict[str, int]):
-    """Parse a MATSim population XML file.
+    """Parse a MATSim population XML file for RL mode.
     
     Returns:
-        trips: list of dicts with keys (dep_time, first_edge, dest_node)
+        agents: list of dicts per person with keys:
+            - dep_time (int)
+            - legs (list of dicts: {'first_edge': int, 'dest_link_id': str})
+            - act_end_times (list of int, per intermediate activity)
+            - act_durations (list of int, per intermediate activity)
     """
-    trips = []
+    agents = []
 
     def time_to_sec(t_str):
         h, m, s = map(int, t_str.split(':'))
@@ -102,22 +109,38 @@ def parse_population(pop_file: str, link_id_to_idx: Dict[str, int], node_id_to_i
                         selected_plan = child
 
             if selected_plan is not None:
-                current_act_end_time = 0
-                # Find the destination from the last activity
-                dest_link_id = None
-                activities = [el for el in selected_plan if el.tag in ['act', 'activity']]
-                if len(activities) >= 2:
-                    dest_link_id = activities[-1].get('link')
-
-                for el in selected_plan:
+                elements = list(selected_plan)
+                
+                first_dep_time = 0
+                person_legs = []
+                act_end_times = []
+                act_durations = []
+                
+                first_act = True
+                
+                for el in elements:
                     if el.tag in ['act', 'activity']:
                         end_time_str = el.get('end_time')
+                        duration_str = el.get('duration')
+                        
+                        act_end = -1
                         if end_time_str:
-                            current_act_end_time = time_to_sec(end_time_str)
+                            act_end = time_to_sec(end_time_str)
+                            
+                        act_dur = -1
+                        if duration_str:
+                            act_dur = time_to_sec(duration_str)
+
+                        if first_act:
+                            if act_end >= 0:
+                                first_dep_time = act_end
+                            elif act_dur >= 0:
+                                first_dep_time = act_dur
+                            first_act = False
                         else:
-                            max_dur = el.get('max_dur')
-                            if max_dur:
-                                current_act_end_time += time_to_sec(max_dur)
+                            act_end_times.append(act_end)
+                            act_durations.append(act_dur)
+                            
                     elif el.tag == 'leg':
                         mode = el.get('mode')
                         if mode == 'car':
@@ -125,28 +148,30 @@ def parse_population(pop_file: str, link_id_to_idx: Dict[str, int], node_id_to_i
                             route_str = route_tag.text.strip() if (route_tag is not None and route_tag.text) else None
                             if route_str:
                                 link_ids = route_str.split(' ')
-                                # First edge
                                 first_link_id = link_ids[0]
-                                if first_link_id not in link_id_to_idx:
-                                    continue
-                                first_edge = link_id_to_idx[first_link_id]
-
-                                # Destination node: to_node of the last link in the route
                                 last_link_id = link_ids[-1]
-                                if last_link_id not in link_id_to_idx:
-                                    continue
+                                
+                                if first_link_id in link_id_to_idx and last_link_id in link_id_to_idx:
+                                    person_legs.append({
+                                        'first_edge': link_id_to_idx[first_link_id],
+                                        'dest_link_id': last_link_id
+                                    })
 
-                                # Find destination node from dest_link's to_node
-                                # We'll resolve this to node idx later
-                                trips.append({
-                                    'dep_time': current_act_end_time,
-                                    'first_edge': first_edge,
-                                    'dest_link_id': last_link_id,
-                                })
+                if len(person_legs) > 0:
+                    num_boundaries = len(person_legs) - 1
+                    act_end_times = act_end_times[:num_boundaries]
+                    act_durations = act_durations[:num_boundaries]
+                    
+                    agents.append({
+                        'dep_time': first_dep_time,
+                        'legs': person_legs,
+                        'act_end_times': act_end_times,
+                        'act_durations': act_durations,
+                    })
 
             elem.clear()
 
-    return trips
+    return agents
 
 
 def load_scenario(
@@ -198,9 +223,9 @@ def load_scenario(
 
     # Parse
     node_id_to_idx, edges_data, link_id_to_idx = parse_network(network_file, scale_factor, timestep)
-    trips = parse_population(population_file, link_id_to_idx, node_id_to_idx)
+    agents = parse_population(population_file, link_id_to_idx, node_id_to_idx)
 
-    if len(trips) == 0:
+    if len(agents) == 0:
         raise ValueError("No valid trips found in population file.")
 
     # Build edge info
@@ -211,15 +236,35 @@ def load_scenario(
     edge_static = torch.tensor([e['attr'] for e in edges_data], dtype=torch.float32)
     edge_endpoints = torch.tensor([[e['u'], e['v']] for e in edges_data], dtype=torch.int32)
     
-    departure_times = torch.tensor([t['dep_time'] for t in trips], dtype=torch.int32)
-    first_edges = torch.tensor([t['first_edge'] for t in trips], dtype=torch.long)
-    destinations = torch.tensor(
-        [edge_to_node[t['dest_link_id']] for t in trips], dtype=torch.long
-    )
+    departure_times = torch.tensor([a['dep_time'] for a in agents], dtype=torch.int32)
+    
+    num_agents = len(agents)
+    max_legs = 0
+    max_acts = 0
+    for a in agents:
+        max_legs = max(max_legs, len(a['legs']))
+        max_acts = max(max_acts, len(a['act_end_times']))
+        
+    first_edges = torch.full((num_agents, max_legs), -1, dtype=torch.long)
+    destinations = torch.full((num_agents, max_legs), -1, dtype=torch.long)
+    act_end_times = torch.full((num_agents, max_acts), -1, dtype=torch.int32)
+    act_durations = torch.full((num_agents, max_acts), -1, dtype=torch.int32)
+    num_legs = torch.zeros(num_agents, dtype=torch.int32)
+    
+    for i, a in enumerate(agents):
+        legs = a['legs']
+        num_legs[i] = len(legs)
+        for j, leg in enumerate(legs):
+            first_edges[i, j] = leg['first_edge']
+            destinations[i, j] = edge_to_node[leg['dest_link_id']]
+            
+        n_acts = len(a['act_end_times'])
+        if n_acts > 0:
+            act_end_times[i, :n_acts] = torch.tensor(a['act_end_times'], dtype=torch.int32)
+            act_durations[i, :n_acts] = torch.tensor(a['act_durations'], dtype=torch.int32)
 
     num_nodes = len(node_id_to_idx)
     num_edges = len(edges_data)
-    num_agents = len(trips)
 
     return ScenarioData(
         edge_static=edge_static,
@@ -227,6 +272,9 @@ def load_scenario(
         departure_times=departure_times,
         first_edges=first_edges,
         destinations=destinations,
+        act_end_times=act_end_times,
+        act_durations=act_durations,
+        num_legs=num_legs,
         num_nodes=num_nodes,
         num_edges=num_edges,
         num_agents=num_agents,

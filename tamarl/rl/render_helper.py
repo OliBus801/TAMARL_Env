@@ -56,6 +56,10 @@ def render_episode(
     episode: int,
     fmt: str = 'gif',
     output_dir: Optional[str] = None,
+    render_fps: int = 5,
+    render_hours: Optional[tuple] = None,
+    render_speed: int = 1,
+    filename: Optional[str] = None,
 ):
     """Render a completed episode's events to gif/mp4 or show live.
 
@@ -73,6 +77,10 @@ def render_episode(
         output_dir = os.path.join(scenario_path, 'renders')
     os.makedirs(output_dir, exist_ok=True)
 
+    time_range = None
+    if render_hours is not None:
+        time_range = (render_hours[0] * 3600.0, render_hours[1] * 3600.0)
+
     # Write events to a temp CSV in the output dir
     events_csv_path = os.path.join(output_dir, f'events_ep{episode}.csv')
     has_events = write_events_csv(dnl, events_csv_path, idx_to_link_id)
@@ -82,16 +90,22 @@ def render_episode(
         return
 
     if fmt == 'live':
-        render_live(scenario_path, output_dir)
+        render_live(scenario_path, output_dir, time_range=time_range, initial_speed=render_speed)
     else:
-        output_path = os.path.join(output_dir, f'episode_{episode}.{fmt}')
+        if filename:
+            output_path = os.path.join(output_dir, f"{filename}.{fmt}")
+        else:
+            output_path = os.path.join(output_dir, f'episode_{episode}.{fmt}')
+            
         render_animation(
             scenario_path,      # scenario_folder (positional)
             output_dir,         # output_folder (positional)
             output_path=output_path,
             fmt=fmt,
-            fps=5,
+            fps=render_fps,
             dpi=100,
+            time_range=time_range,
+            speed=render_speed,
         )
 
     # Clean up the events CSV after rendering

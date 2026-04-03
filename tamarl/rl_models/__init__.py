@@ -2,6 +2,7 @@
 
 from .random_agent import RandomAgent
 from .q_learning import QLearningAgent
+from .sb3_agent import SB3Agent
 
-__all__ = ["RandomAgent", "QLearningAgent"]
+__all__ = ["RandomAgent", "QLearningAgent", "SB3Agent"]
 

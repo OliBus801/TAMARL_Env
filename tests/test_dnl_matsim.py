@@ -259,8 +259,8 @@ def test_rl_mode():
     # RL mode: paths=None
     departure_times = torch.tensor([0], dtype=torch.int32)
     edge_endpoints = torch.tensor([[0, 1], [1, 2]], dtype=torch.int32)
-    first_edges = torch.tensor([0], dtype=torch.long)
-    destinations = torch.tensor([2], dtype=torch.long) # Dest node = 2
+    first_edges = torch.tensor([[0]], dtype=torch.long)
+    destinations = torch.tensor([[2]], dtype=torch.long) # Dest node = 2
     
     dnl = TorchDNLMATSim(edge_static, paths=None, device='cpu', 
                          departure_times=departure_times, 

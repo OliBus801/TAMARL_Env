@@ -49,7 +49,8 @@ class ObservationBuilder:
         # Gather common info
         curr_edges = self.dnl.current_edge[deciding_agent_indices]
         curr_to_nodes = self.dnl.edge_endpoints[curr_edges, 1].long()
-        dests = self.dnl.destinations[deciding_agent_indices]
+        c_legs = self.dnl.current_leg[deciding_agent_indices]
+        dests = self.dnl.destinations[deciding_agent_indices, c_legs]
         norm_time = self.dnl.current_step / self.max_steps
 
         for i, agent_idx in enumerate(deciding_agent_indices.tolist()):
@@ -99,7 +100,7 @@ class ObservationBuilder:
 
         for agent_idx in range(num_agents):
             origin = origin_nodes[agent_idx].item()
-            dest = self.dnl.destinations[agent_idx].item()
+            dest = self.dnl.destinations[agent_idx, 0].item()
 
             out_edges = self.dnl.node_out_edges[origin]
             valid_mask = (out_edges != -1)

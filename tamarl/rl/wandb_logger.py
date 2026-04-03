@@ -39,6 +39,11 @@ class WandbLogger:
                 tags=tags,
                 reinit=True,
             )
+            
+            # Use 'episode' as the custom x-axis for all metrics plotted
+            self._wandb.define_metric("episode")
+            self._wandb.define_metric("*", step_metric="episode")
+            
             print(f"📊 W&B run: {self._run.url}")
         except ImportError:
             print("⚠️  wandb not installed, logging disabled")
@@ -75,26 +80,7 @@ class WandbLogger:
         for key, val in summary.items():
             self._wandb.run.summary[key] = val
 
-    def log_analytical_baseline(self, tstt_analytical: float, fw_result=None):
-        """Log the analytical TSTT baseline as a config value + define metric.
-        
-        Args:
-            tstt_analytical: TSTT from Frank-Wolfe solver
-            fw_result: optional TAPResult with additional info
-        """
-        if not self.enabled or self._wandb is None:
-            return
-        
-        self._wandb.config.update({
-            "analytical_tstt": tstt_analytical,
-        }, allow_val_change=True)
-        
-        if fw_result is not None:
-            self._wandb.config.update({
-                "fw_converged": fw_result.converged,
-                "fw_iterations": fw_result.iterations,
-                "fw_final_gap": fw_result.gap_history[-1] if fw_result.gap_history else None,
-            }, allow_val_change=True)
+
 
     def finish(self):
         """Finalize the wandb run."""
