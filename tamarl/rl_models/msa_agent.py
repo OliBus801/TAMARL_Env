@@ -1,5 +1,6 @@
 import numpy as np
 import math
+import torch
 from tamarl.envs.components.time_dependent_dijkstra import build_adjacency_list, compute_td_shortest_paths
 
 class MSAAgent:
@@ -28,7 +29,6 @@ class MSAAgent:
         self.rng = np.random.default_rng(seed)
         
         # Mapping from node u to list of (outgoing) edge_ids connecting from u.
-        # This matches env.node_to_edges ensuring actions align with environment action space!
         self.node_to_edges = {i: [] for i in range(self.num_nodes)}
         for e in range(self.num_edges):
             u = int(self.edge_endpoints_np[e, 0])
@@ -36,6 +36,69 @@ class MSAAgent:
             
         # agent_paths[agent_id][leg_idx] = list of edge indices.
         self.agent_paths = [[] for _ in range(self.num_agents)]
+
+    # ── Batched API ───────────────────────────────────────────────────
+
+    def get_actions_batched(
+        self,
+        obs: torch.Tensor,
+        masks: torch.Tensor,
+        deciding_indices: torch.Tensor,
+        leg_indices: torch.Tensor = None,
+    ) -> torch.Tensor:
+        """Select MSA path-following actions for all deciding agents.
+
+        Args:
+            obs:               [K, obs_dim]  observations (node is obs[:,0])
+            masks:             [K, max_deg]  action masks (int8, 1=valid)
+            deciding_indices:  [K]           agent indices
+            leg_indices:       [K]           current leg per agent (optional)
+
+        Returns:
+            actions: [K] tensor of action indices
+        """
+        K = deciding_indices.numel()
+        if K == 0:
+            return torch.empty(0, device=deciding_indices.device, dtype=torch.long)
+
+        device = deciding_indices.device
+        nodes = obs[:, 0].long().cpu().numpy()
+        agents = deciding_indices.cpu().numpy()
+        
+        if leg_indices is not None:
+            legs = leg_indices.cpu().numpy()
+        else:
+            legs = np.zeros(K, dtype=np.int64)
+
+        actions = np.zeros(K, dtype=np.int64)
+
+        for i in range(K):
+            agent_id = int(agents[i])
+            node = int(nodes[i])
+            leg = int(legs[i])
+            
+            valid_edges = self.node_to_edges.get(node, [])
+            if len(valid_edges) == 0:
+                continue
+            
+            path = self.agent_paths[agent_id][leg]
+            
+            # Find which edge in the path starts at `node`
+            chosen_edge = -1
+            for e_id in path:
+                if self.edge_endpoints_np[e_id, 0] == node:
+                    chosen_edge = e_id
+                    break
+            
+            if chosen_edge != -1:
+                try:
+                    actions[i] = valid_edges.index(chosen_edge)
+                except ValueError:
+                    pass  # default 0
+
+        return torch.from_numpy(actions).to(device)
+
+    # ── Dict API (legacy) ────────────────────────────────────────────
         
     def get_actions(self, observations, infos):
         actions = {}

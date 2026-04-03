@@ -9,6 +9,7 @@ import json
 import os
 import time
 import numpy as np
+import torch
 from typing import Dict, List, Optional
 
 from tqdm import tqdm
@@ -29,7 +30,77 @@ from tamarl.rl_models.sb3_agent import SB3Agent
 
 
 def run_episode(env: DTAMarkovGameEnv, agent):
-    """Run a single episode and return expanded stats."""
+    """Run a single episode using the appropriate API for the agent type.
+
+    Uses the batched tensor API for agents that support it (SB3, Random, MSA),
+    falls back to the dict-based PettingZoo API for Q-learning.
+    """
+    use_batched = hasattr(agent, 'get_actions_batched')
+
+    if use_batched:
+        return _run_episode_batched(env, agent)
+    else:
+        return _run_episode_dict(env, agent)
+
+
+def _run_episode_batched(env: DTAMarkovGameEnv, agent):
+    """Run a single episode using the batched tensor API — no dicts, no string parsing."""
+    obs_all, masks, deciding, active = env.reset_batched()
+
+    cumulative_rewards = torch.zeros(env.dnl.num_agents, device=env.dnl.device)
+    n_decisions = 0
+    is_sb3 = isinstance(agent, SB3Agent)
+    is_msa = isinstance(agent, MSAAgent)
+
+    while env.has_active_agents():
+        K = deciding.numel()
+        if K > 0:
+            # Get observations for deciding agents only
+            obs_deciding = obs_all[deciding] if obs_all.shape[0] == env.dnl.num_agents else \
+                           env._obs_builder.build_observations_batched(deciding)
+
+            # Get actions — one forward pass for all K agents
+            if is_msa:
+                leg_indices = env.dnl.current_leg[deciding]
+                actions = agent.get_actions_batched(obs_deciding, masks, deciding, leg_indices)
+            else:
+                actions = agent.get_actions_batched(obs_deciding, masks, deciding)
+
+            n_decisions += K
+        else:
+            actions = torch.empty(0, device=env.dnl.device, dtype=torch.long)
+
+        prev_active = env._active_indices.clone()
+
+        obs_active, rewards, terminated, truncated, masks, deciding = env.step_batched(
+            deciding if K > 0 else torch.empty(0, device=env.dnl.device, dtype=torch.long),
+            actions,
+        )
+        obs_all = obs_active  # For next iteration, use obs indexed by active agents
+
+        # Accumulate rewards
+        cumulative_rewards[prev_active] += rewards
+
+        # SB3 learning update
+        if is_sb3:
+            agent.update_batched(
+                obs_active, rewards, terminated, truncated,
+                masks, deciding, prev_active,
+            )
+
+    # Decay exploration after each episode
+    if hasattr(agent, 'decay_epsilon'):
+        agent.decay_epsilon()
+
+    # ── Compute metrics ──
+    cum_np = cumulative_rewards.cpu().numpy()
+    cum_dict = {f"agent_{i}": float(cum_np[i]) for i in range(env.dnl.num_agents)}
+
+    return _compute_stats(env, cum_dict, n_decisions)
+
+
+def _run_episode_dict(env: DTAMarkovGameEnv, agent):
+    """Run a single episode using the PettingZoo dict API (Q-learning)."""
     obs, infos = env.reset()
 
     cumulative_rewards = {}
@@ -45,15 +116,17 @@ def run_episode(env: DTAMarkovGameEnv, agent):
         for agent_id, r in rewards.items():
             cumulative_rewards[agent_id] = cumulative_rewards.get(agent_id, 0.0) + r
 
-        # Q-learning update (or any learnable agent)
         if is_learner:
             agent.update(obs, rewards, terminations, truncations, infos)
 
-    # Decay exploration after each episode
     if hasattr(agent, 'decay_epsilon'):
         agent.decay_epsilon()
 
-    # ── Compute metrics ──
+    return _compute_stats(env, cumulative_rewards, n_decisions)
+
+
+def _compute_stats(env: DTAMarkovGameEnv, cumulative_rewards: dict, n_decisions: int) -> dict:
+    """Compute metrics from a completed episode."""
     tstt = compute_tstt(env.dnl)
     mean_tt = compute_mean_travel_time(env.dnl)
     arr_rate = compute_arrival_rate(env.dnl)
@@ -78,12 +151,6 @@ def run_episode(env: DTAMarkovGameEnv, agent):
         'reward_min': reward_stats['min'],
         'reward_max': reward_stats['max'],
     }
-
-    # Agent-specific stats
-    if hasattr(agent, 'epsilon'):
-        stats['epsilon'] = agent.epsilon
-    if hasattr(agent, 'q_table_size'):
-        stats['q_table_size'] = agent.q_table_size
 
     return stats
 
@@ -330,6 +397,12 @@ def train(
         stats = run_episode(env, agent)
         wall_time = time.time() - t0
 
+        # Add agent-specific stats
+        if hasattr(agent, 'epsilon'):
+            stats['epsilon'] = agent.epsilon
+        if hasattr(agent, 'q_table_size'):
+            stats['q_table_size'] = agent.q_table_size
+
         if relative_gap and is_log_step:
             rgap = compute_relative_gap(env.dnl, link_tt_interval=300.0)
             stats['relative_gap'] = rgap
@@ -343,7 +416,7 @@ def train(
         window_stats.append(stats)
 
         postfix = {
-            'TSTT': f"{stats['tstt']:.0f}",
+            'Mean TT': f"{stats['mean_travel_time']:.0f}",
             'Arr': f"{stats['arrival_rate']*100:.0f}%",
         }
         if 'epsilon' in stats:
@@ -405,7 +478,7 @@ def train(
                     render_fps=render_fps,
                     render_hours=render_hours,
                     render_speed=render_speed,
-                    filename=wandb_run_name if wandb_run_name else None,
+                    filename=f"{wandb_run_name}_{ep+1}" if wandb_run_name else f"{agent_type}_{scenario_name}_{ep+1}",
                 )
 
             window_stats = []
@@ -458,7 +531,7 @@ def train(
             render_fps=render_fps,
             render_hours=render_hours,
             render_speed=render_speed,
-            filename=wandb_run_name if wandb_run_name else None,
+            filename=f"{wandb_run_name}_{n_episodes}" if wandb_run_name else f"{agent_type}_{scenario_name}_{n_episodes}",
         )
 
     env.close()
