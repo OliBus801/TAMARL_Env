@@ -26,6 +26,7 @@ from tamarl.rl.render_helper import render_episode
 from tamarl.rl_models.random_agent import RandomAgent
 from tamarl.rl_models.q_learning import QLearningAgent
 from tamarl.rl_models.msa_agent import MSAAgent
+from tamarl.rl_models.aon_agent import AONAgent
 from tamarl.rl_models.sb3_agent import SB3Agent
 
 
@@ -256,6 +257,8 @@ def train(
             'msa_alpha_min': msa_alpha_min,
             'msa_decay': msa_decay,
         })
+    elif agent_type == 'aon':
+        pass  # AON doesn't have specific hyperparameters, uses FF times
     elif agent_type in ('ppo', 'dqn', 'a2c'):
         config.update({
             'sb3_lr': sb3_lr,
@@ -279,6 +282,8 @@ def train(
         print(f"  Q-Learning:    α={ql_alpha}, γ={ql_gamma}, ε={ql_epsilon_start}→{ql_epsilon_end} (decay={ql_epsilon_decay})")
     elif agent_type == 'msa':
         print(f"  MSA:         α_max={msa_alpha_max}, α_min={msa_alpha_min}, decay={msa_decay}")
+    elif agent_type == 'aon':
+        print(f"  AON:         Shortest Path at Free Flow")
     elif agent_type in ('ppo', 'dqn', 'a2c'):
         print(f"  SB3 {agent_type.upper()}:    lr={sb3_lr}, γ={sb3_gamma}, net={sb3_net_arch or [64,64]}, batch={sb3_batch_size}")
     print(f"{'='*65}\n")
@@ -329,6 +334,16 @@ def train(
             alpha_decay=msa_decay,
             seed=seed,
         )
+    elif agent_type == 'aon':
+        agent = AONAgent(
+            num_agents=env.dnl.num_agents,
+            num_nodes=env.dnl.num_nodes,
+            num_edges=env.dnl.num_edges,
+            edge_endpoints=env.dnl.edge_endpoints,
+            ff_times=env.dnl.ff_travel_time_steps,
+            dt=env.dnl.dt,
+            seed=seed,
+        )
     elif agent_type in ('ppo', 'dqn', 'a2c'):
         agent = SB3Agent(
             algorithm=agent_type,
@@ -367,8 +382,8 @@ def train(
     if need_events:
         idx_to_link_id = {v: k for k, v in scenario_data.link_id_to_idx.items()}
 
-    if agent_type == 'msa':
-        print("\n  Initializing MSA agent routing with FF times...")
+    if agent_type in ('msa', 'aon'):
+        print(f"\n  Initializing {agent_type.upper()} agent routing with FF times...")
         agent.end_episode(env.dnl, is_init=True)
 
     # ── Training loop ──
@@ -664,8 +679,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # Agent
     parser.add_argument("--agent", default=None,
-                        choices=["random", "qlearning", "msa", "ppo", "dqn", "a2c"],
-                        help="Agent type: 'random', 'qlearning', 'msa', 'ppo', 'dqn', or 'a2c'")
+                        choices=["random", "qlearning", "msa", "ppo", "dqn", "a2c", "aon"],
+                        help="Agent type: 'random', 'qlearning', 'msa', 'ppo', 'dqn', 'a2c', or 'aon'")
 
     # Training
     parser.add_argument("--episodes", type=int, default=None, help="Number of episodes")

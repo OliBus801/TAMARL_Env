@@ -83,6 +83,19 @@ def main():
         metavar=('START', 'END'),
         help="Filter events to a specific time range in hours (e.g. '--hours 7 7.25')."
     )
+    parser.add_argument(
+        "--zoom-factor",
+        type=float,
+        default=1.0,
+        help="Zoom factor to scale the map bounds. > 1 zooms in, < 1 zooms out (default: 1.0)."
+    )
+    parser.add_argument(
+        "--zoom-center",
+        type=float,
+        nargs=2,
+        metavar=('X', 'Y'),
+        help="Target coordinates (X, Y) to center the zoom. Left empty, centers on the default network center."
+    )
 
     args = parser.parse_args()
 
@@ -102,6 +115,8 @@ def main():
             show_labels=not args.no_labels,
             initial_speed=args.speed,
             time_range=time_range,
+            zoom_factor=args.zoom_factor,
+            zoom_center=args.zoom_center,
         )
     else:
         from tamarl.visualisation.renderer import render_animation
@@ -123,6 +138,8 @@ def main():
             dpi=args.dpi,
             time_range=time_range,
             speed=args.speed,
+            zoom_factor=args.zoom_factor,
+            zoom_center=args.zoom_center,
         )
 
 if __name__ == "__main__":
