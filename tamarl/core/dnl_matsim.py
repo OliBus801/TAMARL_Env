@@ -766,12 +766,12 @@ class TorchDNLMATSim:
 
         first_edges = self.next_edge[waiting_agents]
 
-        # Events: actend + departure fire once per leg when departure time has been reached.
-        # Uses _departure_emitted flag to avoid re-emitting for agents failing flow check
-        if self.track_events:
-            not_yet_emitted = ~self._departure_emitted[waiting_agents]
-            departing_now = not_yet_emitted & (self.wakeup_time[waiting_agents] <= self.current_step)
-            
+        # Record departure time for metrics (always, not just when tracking events).
+        # Uses _departure_emitted flag to fire only once per leg.
+        not_yet_emitted = ~self._departure_emitted[waiting_agents]
+        departing_now = not_yet_emitted & (self.wakeup_time[waiting_agents] <= self.current_step)
+        
+        if departing_now.any():
             dep_agents = waiting_agents[departing_now]
             dep_edges = first_edges[departing_now]
             
@@ -779,13 +779,12 @@ class TorchDNLMATSim:
             dep_c_legs = self.current_leg[dep_agents]
             self.leg_departure_times[dep_agents, dep_c_legs] = self.current_step
             
-            # The activity link is recorded as the downstream link they are departing towards.
-            # MATSim uses the previous link for the actend, but we don't store it reliably across 
-            # the multi-leg transition yet, so we use the first edge of the new leg.
-            self._record_events(EVT_ACTEND, dep_agents, dep_edges)
-            self._record_events(EVT_DEPARTURE, dep_agents, dep_edges)
-            
             self._departure_emitted[dep_agents] = True
+            
+            # Events: actend + departure
+            if self.track_events:
+                self._record_events(EVT_ACTEND, dep_agents, dep_edges)
+                self._record_events(EVT_DEPARTURE, dep_agents, dep_edges)
 
         # Sort by (first_edge, departure_time) for FIFO per-link ordering
         dep_times = self.wakeup_time[waiting_agents]

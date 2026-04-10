@@ -7,32 +7,86 @@ from tamarl.core.dnl_matsim import TorchDNLMATSim
 from tamarl.envs.components.time_dependent_dijkstra import build_adjacency_list, compute_td_shortest_paths
 
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _get_all_leg_travel_times(dnl: TorchDNLMATSim) -> torch.Tensor:
+    """Collect travel times for ALL agents, including those still en-route.
+
+    For arrived agents (status == 3): uses the recorded leg_metrics.
+    For en-route agents (status 0/1/2/4): uses current_step - departure_time
+    for the leg they are currently on (lower-bound travel time).
+
+    Returns:
+        1-D float tensor of per-leg travel times (in simulation steps).
+        May be empty if no valid times exist.
+    """
+    parts: list[torch.Tensor] = []
+
+    # 1. Completed legs from arrived agents
+    done_mask = (dnl.status == 3)
+    if done_mask.any():
+        done_tt = dnl.leg_metrics[done_mask, :, 1]  # [D, MaxLegs]
+        valid = done_tt > 0
+        if valid.any():
+            parts.append(done_tt[valid])
+
+    # 2. Completed intermediate legs of en-route agents (legs before the current one)
+    en_route_mask = (dnl.status == 1) | (dnl.status == 2) | (dnl.status == 4)
+    # Also include status==0 agents that have already departed at least once
+    waiting_departed = (dnl.status == 0) & (dnl.current_leg > 0)
+    en_route_mask = en_route_mask | waiting_departed
+
+    if en_route_mask.any():
+        er_agents = torch.nonzero(en_route_mask, as_tuple=True)[0]
+        c_legs = dnl.current_leg[er_agents]  # current leg index
+
+        # 2a. Already-completed intermediate legs (indices 0..c_leg-1)
+        er_tt = dnl.leg_metrics[er_agents, :, 1]  # [K, MaxLegs]
+        completed_mask = er_tt > 0
+        # Exclude the current leg slot – it hasn't been finalized by the engine
+        leg_range = torch.arange(er_tt.shape[1], device=dnl.device).unsqueeze(0)  # [1, MaxLegs]
+        completed_mask = completed_mask & (leg_range < c_legs.unsqueeze(1))
+        if completed_mask.any():
+            parts.append(er_tt[completed_mask])
+
+        # 2b. Current (in-progress) leg: travel_time = current_step - departure_time
+        dep_times = dnl.leg_departure_times[er_agents, c_legs]  # [K]
+        # Status 1/2/4 agents are by definition on an active leg.
+        # Status 0 agents (between legs) haven't started their current leg yet,
+        # so only their completed legs (2a) count.
+        actually_en_route = (dnl.status[er_agents] != 0)
+        if actually_en_route.any():
+            in_progress_tt = (dnl.current_step - dep_times[actually_en_route]).float()
+            # Clamp to 0 in case of edge timing quirks
+            in_progress_tt = torch.clamp(in_progress_tt, min=0.0)
+            parts.append(in_progress_tt)
+
+    if not parts:
+        return torch.empty(0, device=dnl.device)
+    return torch.cat(parts)
+
+
 # ── Core Metrics ──────────────────────────────────────────────────────────────
 
 def compute_tstt(dnl: TorchDNLMATSim) -> float:
     """Compute Total System Travel Time (TSTT).
-    
-    Sum of all agents' travel times (agent_metrics[:, 1]).
-    Only considers agents that have arrived (status == 3).
+
+    Includes all agents: arrived agents use their recorded travel time;
+    en-route agents use current_step - departure_time as a lower bound
+    for their current leg.
     """
-    done_mask = (dnl.status == 3)
-    if done_mask.any():
-        valid_legs = dnl.leg_metrics[done_mask, :, 1] > 0
-        if valid_legs.any():
-            return dnl.leg_metrics[done_mask, :, 1][valid_legs].sum().item() * dnl.dt
+    tt = _get_all_leg_travel_times(dnl)
+    if tt.numel() > 0:
+        return tt.sum().item() * dnl.dt
     return 0.0
 
 
 def compute_mean_travel_time(dnl: TorchDNLMATSim) -> float:
-    """Compute mean travel time across arrived agents."""
-    done_mask = (dnl.status == 3)
-    if done_mask.any():
-        valid_legs = dnl.leg_metrics[done_mask, :, 1] > 0
-        if valid_legs.any():
-            return dnl.leg_metrics[done_mask, :, 1][valid_legs].mean().item() * dnl.dt
+    """Compute mean travel time across all agents (arrived + en-route)."""
+    tt = _get_all_leg_travel_times(dnl)
+    if tt.numel() > 0:
+        return tt.mean().item() * dnl.dt
     return 0.0
-
-
 
 
 def compute_arrival_rate(dnl: TorchDNLMATSim) -> float:
@@ -44,22 +98,21 @@ def compute_arrival_rate(dnl: TorchDNLMATSim) -> float:
 # ── Travel Time Distribution ────────────────────────────────────────────────
 
 def compute_travel_time_stats(dnl: TorchDNLMATSim) -> Dict[str, float]:
-    """Compute detailed travel time statistics across arrived agents.
-    
+    """Compute detailed travel time statistics across all agents.
+
+    Includes en-route agents whose current-leg travel time is estimated
+    as current_step - departure_time.
+
     Returns:
         Dict with keys: mean, std, min, max, median, p90, p95
     """
-    done_mask = (dnl.status == 3)
-    if not done_mask.any():
+    tt = _get_all_leg_travel_times(dnl)
+    if tt.numel() == 0:
         return {k: 0.0 for k in ['mean', 'std', 'min', 'max', 'median', 'p90', 'p95']}
-    
-    valid_legs = dnl.leg_metrics[done_mask, :, 1] > 0
-    if not valid_legs.any():
-        return {k: 0.0 for k in ['mean', 'std', 'min', 'max', 'median', 'p90', 'p95']}
-        
-    tt = dnl.leg_metrics[done_mask, :, 1][valid_legs].cpu().float() * dnl.dt
-    tt_np = tt.numpy()
-    
+
+    tt_sec = tt.cpu().float() * dnl.dt
+    tt_np = tt_sec.numpy()
+
     return {
         'mean': float(tt_np.mean()),
         'std': float(tt_np.std()),

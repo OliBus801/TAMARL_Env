@@ -2,11 +2,15 @@
 
 This environment wraps the DNL simulator as a Markov Game where each
 agent independently chooses outgoing edges at decision points (capacity buffer).
+
+Supports two formulations:
+  - link-based (default): agents choose next edge at every node.
+  - path-based: agents choose a complete path at departure, then auto-follow.
 """
 from __future__ import annotations
 
 import functools
-from typing import Dict, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import torch
@@ -19,6 +23,7 @@ from tamarl.envs.components.scheduler import DecisionScheduler
 from tamarl.envs.components.actions import ActionManager
 from tamarl.envs.components.observations import ObservationBuilder
 from tamarl.envs.components.rewards import Rewarder
+from tamarl.envs.components.path_enumerator import enumerate_top_k_paths
 
 
 class DTAMarkovGameEnv(ParallelEnv):
@@ -47,6 +52,8 @@ class DTAMarkovGameEnv(ParallelEnv):
         seed: Optional[int] = None,
         stuck_threshold: int = 10,
         track_events: bool = False,
+        formulation: str = "link-based",
+        top_k_paths: int = 3,
     ):
         super().__init__()
         
@@ -58,6 +65,8 @@ class DTAMarkovGameEnv(ParallelEnv):
         self._device = device
         self._seed = seed
         self._stuck_threshold = stuck_threshold
+        self._formulation = formulation
+        self._top_k_paths = top_k_paths
         
         # Load scenario
         self._scenario = load_scenario(
@@ -91,6 +100,19 @@ class DTAMarkovGameEnv(ParallelEnv):
         self._obs_builder = ObservationBuilder(self.dnl, max_steps=max_steps)
         self._rewarder = Rewarder(self.dnl)
         
+        # ── OD pairs (computed once, used by Q-learning) ──
+        self._od_pairs = self._compute_od_pairs()
+        
+        # ── Path-based formulation ──
+        self._paths_per_od: Optional[Dict[Tuple[int,int], List[List[int]]]] = None
+        if formulation == "path-based":
+            self._paths_per_od = self._enumerate_paths(top_k_paths)
+            # Per-agent chosen path tracking
+            self._agent_chosen_path: List[Optional[List[int]]] = [
+                None for _ in range(self.dnl.num_agents)
+            ]
+            self._agent_path_ptr = np.zeros(self.dnl.num_agents, dtype=np.int64)
+        
         # PettingZoo agent list
         self.possible_agents = [f"agent_{i}" for i in range(self.dnl.num_agents)]
         self.agents = []
@@ -111,12 +133,59 @@ class DTAMarkovGameEnv(ParallelEnv):
             self.dnl.max_out_degree, device=device, dtype=torch.int8
         )
 
+    # ── OD pair + path helpers ────────────────────────────────────────
+
+    def _compute_od_pairs(self) -> np.ndarray:
+        """Compute (origin_node, dest_node) for each agent (first leg).
+
+        The origin is the *to_node* of the first edge — the node where
+        the agent actually arrives and starts making routing decisions.
+
+        Returns:
+            [N, 2] int32 numpy array.
+        """
+        first_edges = self._scenario.first_edges[:, 0].numpy()  # [N]
+        edge_eps = self._scenario.edge_endpoints.numpy()          # [E, 2]
+        origins = edge_eps[first_edges, 1]                        # to_node of first edge
+        dests = self._scenario.destinations[:, 0].numpy()         # dest_node of first leg
+        return np.stack([origins, dests], axis=1).astype(np.int32)
+
+    def _enumerate_paths(self, k: int) -> Dict[Tuple[int,int], List[List[int]]]:
+        """Enumerate top-k loopless paths for each unique OD pair."""
+        edge_eps = self._scenario.edge_endpoints.numpy()
+        ff_times = self.dnl.ff_travel_time_steps.cpu().numpy().astype(np.float64)
+        unique_ods = np.unique(self._od_pairs, axis=0)
+        paths = enumerate_top_k_paths(
+            num_nodes=self.dnl.num_nodes,
+            edge_endpoints=edge_eps,
+            ff_times=ff_times,
+            od_pairs=unique_ods,
+            k=k,
+        )
+        return paths
+
+    @property
+    def od_pairs(self) -> np.ndarray:
+        """[N, 2] array of (origin_node, dest_node) per agent."""
+        return self._od_pairs
+
+    @property
+    def paths_per_od(self) -> Optional[Dict[Tuple[int,int], List[List[int]]]]:
+        """Enumerated paths per OD pair (path-based only)."""
+        return self._paths_per_od
+
+    @property
+    def formulation(self) -> str:
+        return self._formulation
+
     @functools.lru_cache(maxsize=None)
     def observation_space(self, agent: str) -> spaces.Box:
         return self._obs_builder.observation_space()
 
     @functools.lru_cache(maxsize=None)
     def action_space(self, agent: str) -> spaces.Discrete:
+        if self._formulation == "path-based":
+            return spaces.Discrete(self._top_k_paths)
         return spaces.Discrete(self.dnl.max_out_degree)
 
     # ══════════════════════════════════════════════════════════════════
@@ -151,6 +220,11 @@ class DTAMarkovGameEnv(ParallelEnv):
         self._ticks_since_last_step = 0
         self._rewarder.reset()
         
+        # Reset path-based state
+        if self._formulation == "path-based":
+            self._agent_chosen_path = [None for _ in range(N)]
+            self._agent_path_ptr = np.zeros(N, dtype=np.int64)
+        
         # Advance simulation until first decision
         self._advance_to_next_decisions()
         
@@ -166,7 +240,10 @@ class DTAMarkovGameEnv(ParallelEnv):
             obs_all[deciding] = obs_deciding
         
         # Action masks for deciding agents
-        masks = self._action_mgr.get_action_masks_batched(deciding)  # [K, max_deg]
+        if self._formulation == "path-based":
+            masks = self._build_path_masks(deciding)
+        else:
+            masks = self._action_mgr.get_action_masks_batched(deciding)  # [K, max_deg]
         
         return obs_all, masks, deciding, self._active_indices.clone()
 
@@ -179,7 +256,8 @@ class DTAMarkovGameEnv(ParallelEnv):
         
         Args:
             action_indices: [K] agent indices that are acting
-            action_values:  [K] action values (local edge indices)
+            action_values:  [K] action values (link-based: local edge indices,
+                            path-based: path choice indices)
             
         Returns:
             obs_active:        [N_active_new, obs_dim]  observations for remaining active agents
@@ -193,7 +271,10 @@ class DTAMarkovGameEnv(ParallelEnv):
         
         # 1. Apply actions (vectorised)
         if action_indices.numel() > 0:
-            self._action_mgr.apply_actions_tensor(action_indices, action_values)
+            if self._formulation == "path-based":
+                self._apply_path_actions(action_indices, action_values)
+            else:
+                self._action_mgr.apply_actions_tensor(action_indices, action_values)
         
         # 2. Advance DNL
         n_ticks = self._advance_to_next_decisions()
@@ -229,12 +310,18 @@ class DTAMarkovGameEnv(ParallelEnv):
         elif self._active_indices.numel() == 0:
             deciding = torch.empty(0, device=self.dnl.device, dtype=torch.long)
         
+        # In path-based mode, auto-route deciding agents that already have a chosen path
+        if self._formulation == "path-based" and deciding.numel() > 0:
+            deciding = self._auto_route_path_agents(deciding)
+        
         n_active = self._active_indices.numel()
         obs_dim = self._obs_builder.obs_size
         
+        n_actions = self._top_k_paths if self._formulation == "path-based" else self.dnl.max_out_degree
+        
         if n_active == 0:
             obs_active = torch.empty((0, obs_dim), device=self.dnl.device)
-            masks = torch.empty((0, self.dnl.max_out_degree), device=self.dnl.device, dtype=torch.int8)
+            masks = torch.empty((0, n_actions), device=self.dnl.device, dtype=torch.int8)
             return obs_active, rewards, terminated_mask, truncated_mask, masks, deciding
         
         # Get deciding agents' observations
@@ -277,7 +364,10 @@ class DTAMarkovGameEnv(ParallelEnv):
                 obs_active[needs_obs, 2] = norm_time
         
         # 8. Action masks for deciding agents
-        masks = self._action_mgr.get_action_masks_batched(deciding)  # [K', max_deg]
+        if self._formulation == "path-based":
+            masks = self._build_path_masks(deciding)
+        else:
+            masks = self._action_mgr.get_action_masks_batched(deciding)  # [K', max_deg]
         
         return obs_active, rewards, terminated_mask, truncated_mask, masks, deciding
 
@@ -419,6 +509,107 @@ class DTAMarkovGameEnv(ParallelEnv):
         
         self._ticks_since_last_step = ticks
         return ticks
+
+    # ── Path-based helpers ───────────────────────────────────────────
+
+    def _build_path_masks(self, deciding: torch.Tensor) -> torch.Tensor:
+        """Build action masks for path-based formulation.
+        
+        Each action index corresponds to one of the top-k paths for the
+        agent's OD pair.  Mask is 1 if the path exists, 0 otherwise.
+        """
+        K = deciding.numel()
+        masks = torch.zeros((K, self._top_k_paths), device=self.dnl.device, dtype=torch.int8)
+        if K == 0:
+            return masks
+        
+        dec_np = deciding.cpu().numpy()
+        for i in range(K):
+            aid = int(dec_np[i])
+            od_key = (int(self._od_pairs[aid, 0]), int(self._od_pairs[aid, 1]))
+            paths = self._paths_per_od.get(od_key, [])
+            n_paths = min(len(paths), self._top_k_paths)
+            masks[i, :n_paths] = 1
+        
+        return masks
+
+    def _apply_path_actions(self, action_indices: torch.Tensor, action_values: torch.Tensor):
+        """Apply path-based actions: record chosen path and set next_edge."""
+        agent_ids = action_indices.cpu().numpy()
+        path_choices = action_values.cpu().numpy()
+        
+        for i in range(len(agent_ids)):
+            aid = int(agent_ids[i])
+            choice = int(path_choices[i])
+            od_key = (int(self._od_pairs[aid, 0]), int(self._od_pairs[aid, 1]))
+            paths = self._paths_per_od.get(od_key, [])
+            
+            if choice < len(paths):
+                self._agent_chosen_path[aid] = paths[choice]
+                self._agent_path_ptr[aid] = 0
+                # Set next_edge to the first edge of the chosen path
+                if len(paths[choice]) > 0:
+                    self.dnl.next_edge[aid] = paths[choice][0]
+            else:
+                # Fallback: choose first path
+                if paths:
+                    self._agent_chosen_path[aid] = paths[0]
+                    self._agent_path_ptr[aid] = 0
+                    if len(paths[0]) > 0:
+                        self.dnl.next_edge[aid] = paths[0][0]
+
+    def _auto_route_path_agents(self, deciding: torch.Tensor) -> torch.Tensor:
+        """For path-based mode: auto-set next_edge for agents following a chosen path.
+        
+        Agents that already have a chosen path don't need RL decisions —
+        they just follow the path.  Remove them from the deciding tensor
+        and set their next_edge directly.
+        
+        Returns:
+            deciding: filtered tensor with only agents that need a new path choice.
+        """
+        if deciding.numel() == 0:
+            return deciding
+        
+        dec_np = deciding.cpu().numpy()
+        needs_decision = []
+        
+        for i in range(len(dec_np)):
+            aid = int(dec_np[i])
+            path = self._agent_chosen_path[aid]
+            
+            if path is not None:
+                # Agent has a chosen path — advance pointer and set next_edge
+                ptr = self._agent_path_ptr[aid]
+                # Current node
+                curr_edge = self.dnl.current_edge[aid].item()
+                curr_to_node = self.dnl.edge_endpoints[curr_edge, 1].item()
+                
+                # Find the next edge in the path that starts at curr_to_node
+                found = False
+                for j in range(ptr, len(path)):
+                    e_from = self.dnl.edge_endpoints[path[j], 0].item()
+                    if e_from == curr_to_node:
+                        self.dnl.next_edge[aid] = path[j]
+                        self._agent_path_ptr[aid] = j + 1
+                        found = True
+                        break
+                
+                if not found:
+                    # Agent is at the end of path or off-path, needs new decision
+                    self._agent_chosen_path[aid] = None
+                    needs_decision.append(aid)
+            else:
+                # No path chosen yet — needs a decision
+                needs_decision.append(aid)
+        
+        if len(needs_decision) == len(dec_np):
+            return deciding  # All need decisions
+        
+        if len(needs_decision) == 0:
+            return torch.empty(0, device=self.dnl.device, dtype=torch.long)
+        
+        return torch.tensor(needs_decision, device=self.dnl.device, dtype=torch.long)
 
     def close(self):
         """Clean up resources."""

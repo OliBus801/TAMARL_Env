@@ -33,8 +33,8 @@ from tamarl.rl_models.sb3_agent import SB3Agent
 def run_episode(env: DTAMarkovGameEnv, agent):
     """Run a single episode using the appropriate API for the agent type.
 
-    Uses the batched tensor API for agents that support it (SB3, Random, MSA),
-    falls back to the dict-based PettingZoo API for Q-learning.
+    Uses the batched tensor API for agents that support it (SB3, Random, MSA, Q-learning),
+    falls back to the dict-based PettingZoo API for legacy agents.
     """
     use_batched = hasattr(agent, 'get_actions_batched')
 
@@ -52,6 +52,11 @@ def _run_episode_batched(env: DTAMarkovGameEnv, agent):
     n_decisions = 0
     is_sb3 = isinstance(agent, SB3Agent)
     is_msa = isinstance(agent, MSAAgent)
+    is_ql = isinstance(agent, QLearningAgent)
+
+    # Reset Q-learning per-episode state
+    if is_ql and hasattr(agent, 'reset_episode'):
+        agent.reset_episode()
 
     while env.has_active_agents():
         K = deciding.numel()
@@ -66,6 +71,12 @@ def _run_episode_batched(env: DTAMarkovGameEnv, agent):
                 actions = agent.get_actions_batched(obs_deciding, masks, deciding, leg_indices)
             else:
                 actions = agent.get_actions_batched(obs_deciding, masks, deciding)
+
+            # Path-based: record chosen paths in Q-learning agent
+            if is_ql and agent.formulation == 'path-based':
+                path_choices = actions.cpu().numpy()
+                for idx, aid in enumerate(deciding.cpu().numpy()):
+                    agent.set_chosen_path(int(aid), int(path_choices[idx]))
 
             n_decisions += K
         else:
@@ -82,11 +93,16 @@ def _run_episode_batched(env: DTAMarkovGameEnv, agent):
         # Accumulate rewards
         cumulative_rewards[prev_active] += rewards
 
-        # SB3 learning update
+        # Learning updates
         if is_sb3:
             agent.update_batched(
                 obs_active, rewards, terminated, truncated,
                 masks, deciding, prev_active,
+            )
+        elif is_ql:
+            agent.update_batched(
+                obs_active, rewards, terminated, truncated,
+                masks, deciding, prev_active, env._active_indices,
             )
 
     # Decay exploration after each episode
@@ -186,6 +202,9 @@ def train(
     ql_epsilon_end: float = 0.05,
     ql_epsilon_decay: float = 0.995,
     ql_n_bins: int = 5,
+    # Formulation
+    formulation: str = "link-based",
+    top_k_paths: int = 3,
     # MSA
     msa_alpha_max: float = 1.0,
     msa_alpha_min: float = 0.05,
@@ -240,6 +259,8 @@ def train(
         'seed': seed,
         'log_interval': log_interval,
         'agent_type': agent_type,
+        'formulation': formulation,
+        'top_k_paths': top_k_paths,
         'relative_gap': relative_gap,
     }
     if agent_type == 'qlearning':
@@ -280,6 +301,10 @@ def train(
     print(f"  Device:        {device} | Seed: {seed}")
     if agent_type == 'qlearning':
         print(f"  Q-Learning:    α={ql_alpha}, γ={ql_gamma}, ε={ql_epsilon_start}→{ql_epsilon_end} (decay={ql_epsilon_decay})")
+        if formulation == 'path-based':
+            print(f"  Formulation:   path-based (top-k={top_k_paths})")
+        else:
+            print(f"  Formulation:   link-based")
     elif agent_type == 'msa':
         print(f"  MSA:         α_max={msa_alpha_max}, α_min={msa_alpha_min}, decay={msa_decay}")
     elif agent_type == 'aon':
@@ -307,18 +332,30 @@ def train(
         device=device,
         seed=seed,
         track_events=need_events,
+        formulation=formulation,
+        top_k_paths=top_k_paths,
     )
 
     # ── Agent ──
     if agent_type == 'qlearning':
+        # Determine n_actions based on formulation
+        if formulation == 'path-based':
+            ql_n_actions = top_k_paths
+        else:
+            ql_n_actions = env.dnl.max_out_degree
         agent = QLearningAgent(
-            n_actions=env.dnl.max_out_degree,
+            n_actions=ql_n_actions,
+            n_agents=env.dnl.num_agents,
+            od_pairs=env.od_pairs,
             alpha=ql_alpha,
             gamma=ql_gamma,
             epsilon_start=ql_epsilon_start,
             epsilon_end=ql_epsilon_end,
             epsilon_decay=ql_epsilon_decay,
             n_congestion_bins=ql_n_bins,
+            formulation=formulation,
+            paths_per_od=env.paths_per_od,
+            top_k=top_k_paths,
             seed=seed,
         )
     elif agent_type == 'msa':
@@ -348,6 +385,7 @@ def train(
         agent = SB3Agent(
             algorithm=agent_type,
             env=env,
+            od_pairs=env.od_pairs,
             learning_rate=sb3_lr,
             gamma=sb3_gamma,
             net_arch=sb3_net_arch,
@@ -389,6 +427,8 @@ def train(
     # ── Training loop ──
     all_stats = []
     window_stats = []  # stats accumulated between log intervals
+    
+    aon_cached_stats = None
 
     pbar = tqdm(range(n_episodes), desc="Training", unit="ep", dynamic_ncols=True)
 
@@ -396,36 +436,43 @@ def train(
         # Determine if this episode requires full metric logging
         is_log_step = ((ep + 1) % log_interval == 0) or (ep == n_episodes - 1)
         
-        # Configure env to collect metric if RGap is enabled or if using MSA
-        needs_tt = (relative_gap and is_log_step) or (agent_type == 'msa')
-        if needs_tt:
-            env.dnl.collect_link_tt = True
-            if getattr(env.dnl, 'interval_tt_sum', None) is None:
-                env.dnl.max_intervals = 100
-                import torch
-                env.dnl.interval_tt_sum = torch.zeros((env.dnl.max_intervals, env.dnl.num_edges), device=env.dnl.device, dtype=torch.float32)
-                env.dnl.interval_tt_count = torch.zeros((env.dnl.max_intervals, env.dnl.num_edges), device=env.dnl.device, dtype=torch.float32)
+        if agent_type == 'aon' and aon_cached_stats is not None:
+            stats = aon_cached_stats.copy()
+            time.sleep(0.005)  # small delay for tqdm to update smoothly
         else:
-            env.dnl.collect_link_tt = False
+            # Configure env to collect metric if RGap is enabled or if using MSA
+            needs_tt = (relative_gap and is_log_step) or (agent_type == 'msa') or (agent_type == 'aon' and ep == 0 and relative_gap)
+            if needs_tt:
+                env.dnl.collect_link_tt = True
+                if getattr(env.dnl, 'interval_tt_sum', None) is None:
+                    env.dnl.max_intervals = 100
+                    import torch
+                    env.dnl.interval_tt_sum = torch.zeros((env.dnl.max_intervals, env.dnl.num_edges), device=env.dnl.device, dtype=torch.float32)
+                    env.dnl.interval_tt_count = torch.zeros((env.dnl.max_intervals, env.dnl.num_edges), device=env.dnl.device, dtype=torch.float32)
+            else:
+                env.dnl.collect_link_tt = False
 
-        t0 = time.time()
-        stats = run_episode(env, agent)
-        wall_time = time.time() - t0
+            t0 = time.time()
+            stats = run_episode(env, agent)
+            wall_time = time.time() - t0
 
-        # Add agent-specific stats
-        if hasattr(agent, 'epsilon'):
-            stats['epsilon'] = agent.epsilon
-        if hasattr(agent, 'q_table_size'):
-            stats['q_table_size'] = agent.q_table_size
+            # Add agent-specific stats
+            if hasattr(agent, 'epsilon'):
+                stats['epsilon'] = agent.epsilon
+            if hasattr(agent, 'q_table_size'):
+                stats['q_table_size'] = agent.q_table_size
 
-        if relative_gap and is_log_step:
-            rgap = compute_relative_gap(env.dnl, link_tt_interval=300.0)
-            stats['relative_gap'] = rgap
+            if relative_gap and (is_log_step or (agent_type == 'aon' and ep == 0)):
+                rgap = compute_relative_gap(env.dnl, link_tt_interval=300.0)
+                stats['relative_gap'] = rgap
 
-        stats['wall_time'] = wall_time
-        
-        if agent_type == 'msa':
-            agent.end_episode(env.dnl, is_init=False)
+            stats['wall_time'] = wall_time
+            
+            if agent_type == 'msa':
+                agent.end_episode(env.dnl, is_init=False)
+                
+            if agent_type == 'aon' and ep == 0:
+                aon_cached_stats = stats.copy()
 
         all_stats.append(stats)
         window_stats.append(stats)
@@ -587,6 +634,8 @@ def load_config(config_path: str) -> dict:
         "timestep": "timestep",
         "device": "device",
         "seed": "seed",
+        "formulation": "formulation",
+        "top_k_paths": "top_k_paths",
     }
     for json_key, kwarg_key in _map.items():
         if json_key in tr:
@@ -701,6 +750,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ql_epsilon_decay", type=float, default=None, help="Epsilon decay per episode")
     parser.add_argument("--ql_n_bins", type=int, default=None, help="Congestion discretisation bins")
 
+    # Formulation
+    parser.add_argument("--formulation", default=None, choices=["link-based", "path-based"],
+                        help="Formulation: 'link-based' (default) or 'path-based'")
+    parser.add_argument("--top_k_paths", type=int, default=None,
+                        help="Number of top-k loopless paths for path-based formulation (default: 3)")
+
     # MSA parameters
     parser.add_argument("--msa_alpha_max", type=float, default=None, help="Initial MSA update probability")
     parser.add_argument("--msa_alpha_min", type=float, default=None, help="Minimum MSA update probability")
@@ -755,6 +810,8 @@ _CLI_TO_KWARGS = {
     "ql_epsilon_end": "ql_epsilon_end",
     "ql_epsilon_decay": "ql_epsilon_decay",
     "ql_n_bins": "ql_n_bins",
+    "formulation": "formulation",
+    "top_k_paths": "top_k_paths",
     "msa_alpha_max": "msa_alpha_max",
     "msa_alpha_min": "msa_alpha_min",
     "msa_decay": "msa_decay",
