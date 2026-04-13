@@ -98,7 +98,7 @@ class SB3Agent:
                     verbose=verbose,
                 )
             elif algorithm == "dqn":
-                self.models[od_tuple] = DQN(
+                dqn_model = DQN(
                     "MlpPolicy",
                     self._gym_env,
                     learning_rate=learning_rate,
@@ -114,6 +114,11 @@ class SB3Agent:
                     exploration_fraction=0.5,
                     exploration_final_eps=0.05,
                 )
+                # SB3 sets exploration_rate=0.0 by default and only
+                # updates it during .learn(), which we never call.
+                # Manually initialise to the configured starting value.
+                dqn_model.exploration_rate = dqn_model.exploration_initial_eps
+                self.models[od_tuple] = dqn_model
             elif algorithm == "a2c":
                 self.models[od_tuple] = A2C(
                     "MlpPolicy",
@@ -569,11 +574,6 @@ class SB3Agent:
         ):
             target_param.data.copy_(tau * param.data + (1.0 - tau) * target_param.data)
 
-        model.exploration_rate = max(
-            model.exploration_final_eps,
-            model.exploration_rate * 0.999,
-        )
-
         policy.set_training_mode(False)
 
     def _train_on_policy(self, model, buffer):
@@ -629,8 +629,21 @@ class SB3Agent:
         policy.set_training_mode(False)
 
     def decay_epsilon(self):
-        """No-op — SB3 handles exploration internally."""
-        pass
+        """Decay epsilon for all DQN models using a multiplicative schedule.
+
+        Called once per episode from the training loop.  Uses the model's
+        own ``exploration_initial_eps`` / ``exploration_final_eps`` as bounds
+        and applies a multiplicative decay factor (0.995 per episode) so
+        that exploration is gradually reduced over training.
+        """
+        if self.algorithm_name != "dqn":
+            return
+        decay_factor = 0.995
+        for model in self.models.values():
+            model.exploration_rate = max(
+                model.exploration_final_eps,
+                model.exploration_rate * decay_factor,
+            )
 
     @property
     def epsilon(self) -> float:

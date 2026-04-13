@@ -42,7 +42,6 @@
         "log_interval": 100,
         "wandb_enabled": false,
         "wandb_project": "tamarl",
-        "wandb_run_name": null,
         "wandb_tags": null
     },
     "rendering": {

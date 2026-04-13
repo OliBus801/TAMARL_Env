@@ -17,7 +17,9 @@ class WandbLogger:
     def __init__(
         self,
         project: str = "tamarl",
-        run_name: Optional[str] = None,
+        run_name: str = "undefined",
+        scenario_id: str = "undefined",
+        agent_type: str = "undefined",
         config: Optional[Dict[str, Any]] = None,
         enabled: bool = True,
         tags: Optional[List[str]] = None,
@@ -34,8 +36,14 @@ class WandbLogger:
             self._wandb = wandb
             self._run = wandb.init(
                 project=project,
+                group=scenario_id,
+                job_type="train",
                 name=run_name,
-                config=config or {},
+                config={
+                    "scenario": scenario_id,
+                    "agent": agent_type,
+                    **(config or {}),
+                },
                 tags=tags,
                 reinit=True,
             )

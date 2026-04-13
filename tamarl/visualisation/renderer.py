@@ -890,7 +890,7 @@ def render_live(scenario_folder: str, output_folder: str,
     def on_play_pause(event):
         state['playing'] = not state['playing']
         if state['playing']:
-            btn_play.label.set_text('⏸ Pause')
+            btn_play.label.set_text('Pause')
             # Reset to start if at end
             if state['current_frame'] >= total_steps - 1:
                 state['current_frame'] = 0

@@ -227,7 +227,6 @@ def train(
     # W&B
     wandb_enabled: bool = False,
     wandb_project: str = "tamarl",
-    wandb_run_name: Optional[str] = None,
     wandb_tags: Optional[list] = None,
     # Metrics
     relative_gap: bool = True,
@@ -245,9 +244,14 @@ def train(
         log_interval: compute & log detailed metrics every N episodes (default 100)
         wandb_enabled: enable Weights & Biases logging
         wandb_project: W&B project name
-        wandb_run_name: W&B run name (auto-generated if None)
         wandb_tags: W&B run tags
     """
+    scenario_name = os.path.basename(scenario_path.rstrip('/'))
+
+    scenario_id = scenario_name
+    if population_filter:
+        scenario_id = f"{scenario_name}-{population_filter}"
+
     # ── Config ──
     config = {
         'scenario_path': scenario_path,
@@ -316,7 +320,9 @@ def train(
     # ── W&B init ──
     logger = WandbLogger(
         project=wandb_project,
-        run_name=wandb_run_name,
+        run_name=f"{agent_type}-seed{seed}",
+        scenario_id=scenario_id,
+        agent_type=agent_type,
         config=config,
         enabled=wandb_enabled,
         tags=wandb_tags,
@@ -434,7 +440,7 @@ def train(
 
     for ep in pbar:
         # Determine if this episode requires full metric logging
-        is_log_step = ((ep + 1) % log_interval == 0) or (ep == n_episodes - 1)
+        is_log_step = (ep == 0) or ((ep + 1) % log_interval == 0) or (ep == n_episodes - 1)
         
         if agent_type == 'aon' and aon_cached_stats is not None:
             stats = aon_cached_stats.copy()
@@ -540,7 +546,7 @@ def train(
                     render_fps=render_fps,
                     render_hours=render_hours,
                     render_speed=render_speed,
-                    filename=f"{wandb_run_name}_{ep+1}" if wandb_run_name else f"{agent_type}_{scenario_name}_{ep+1}",
+                    filename=f"{agent_type}-{scenario_id}-{ep + 1}",
                 )
 
             window_stats = []
@@ -593,7 +599,7 @@ def train(
             render_fps=render_fps,
             render_hours=render_hours,
             render_speed=render_speed,
-            filename=f"{wandb_run_name}_{n_episodes}" if wandb_run_name else f"{agent_type}_{scenario_name}_{n_episodes}",
+            filename=f"{agent_type}-{scenario_id}-{n_episodes}",
         )
 
     env.close()
@@ -688,8 +694,6 @@ def load_config(config_path: str) -> dict:
         kwargs["wandb_enabled"] = log["wandb_enabled"]
     if "wandb_project" in log:
         kwargs["wandb_project"] = log["wandb_project"]
-    if "wandb_run_name" in log:
-        kwargs["wandb_run_name"] = log["wandb_run_name"]
     if "wandb_tags" in log:
         kwargs["wandb_tags"] = log["wandb_tags"]
 
@@ -774,7 +778,6 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--wandb", action="store_true", default=None,
                         help="Enable Weights & Biases logging")
     parser.add_argument("--wandb_project", default=None, help="W&B project name")
-    parser.add_argument("--wandb_run_name", default=None, help="W&B run name")
 
     # Render
     parser.add_argument("--render", default=None, choices=["interval", "end"],
@@ -823,7 +826,6 @@ _CLI_TO_KWARGS = {
     "sb3_n_steps": "sb3_n_steps",
     "wandb": "wandb_enabled",
     "wandb_project": "wandb_project",
-    "wandb_run_name": "wandb_run_name",
     "render": "render",
     "render_format": "render_format",
     "render_fps": "render_fps",
