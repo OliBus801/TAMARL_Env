@@ -81,16 +81,21 @@ def render_episode(
     if render_hours is not None:
         time_range = (render_hours[0] * 3600.0, render_hours[1] * 3600.0)
 
-    # Write events to a temp CSV in the output dir
-    events_csv_path = os.path.join(output_dir, f'events_ep{episode}.csv')
+    # Write events to a system temp CSV
+    fd, events_csv_path = tempfile.mkstemp(suffix='.csv', prefix=f'events_ep{episode}_')
+    os.close(fd)
     has_events = write_events_csv(dnl, events_csv_path, idx_to_link_id)
 
     if not has_events:
         print(f"⚠️  No events for episode {episode}, skipping render.")
+        try:
+            os.remove(events_csv_path)
+        except OSError:
+            pass
         return
 
     if fmt == 'live':
-        render_live(scenario_path, output_dir, time_range=time_range, initial_speed=render_speed)
+        render_live(scenario_path, output_dir, time_range=time_range, initial_speed=render_speed, events_file=events_csv_path)
     else:
         if filename:
             output_path = os.path.join(output_dir, f"{filename}.{fmt}")
@@ -106,6 +111,7 @@ def render_episode(
             dpi=100,
             time_range=time_range,
             speed=render_speed,
+            events_file=events_csv_path,
         )
 
     # Clean up the events CSV after rendering

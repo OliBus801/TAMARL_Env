@@ -294,6 +294,17 @@ def train(
             'sb3_n_steps': sb3_n_steps,
         })
 
+    # ── AON / MSA override ─────────────────────────────────────
+    # MSA and AON agents manage their own shortest-path routing
+    # internally and return link-level actions.  The path-based
+    # env formulation expects path-choice indices, so we force
+    # link-based to avoid misinterpretation of actions.
+    if agent_type in ('aon', 'msa') and formulation == 'path-based':
+        print(f"  ⚠  {agent_type.upper()} agent is inherently path-based; "
+              f"overriding formulation to 'link-based'.")
+        formulation = 'link-based'
+        config['formulation'] = 'link-based'
+
     print(f"{'='*65}")
     print(f"  DTA Markov Game — Training Runner")
     print(f"{'='*65}")
@@ -391,7 +402,6 @@ def train(
         agent = SB3Agent(
             algorithm=agent_type,
             env=env,
-            od_pairs=env.od_pairs,
             learning_rate=sb3_lr,
             gamma=sb3_gamma,
             net_arch=sb3_net_arch,

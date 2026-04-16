@@ -4,9 +4,12 @@ Adapts Stable-Baselines3 algorithms (PPO, DQN, A2C) to the same interface
 used by RandomAgent, QLearningAgent, and MSAAgent: namely ``get_actions()``
 and ``update()``.
 
-Internally uses parameter sharing — one NN handles all agents.  Action
-masking is supported natively for PPO (via MaskablePPO) and manually for
-DQN and A2C (invalid actions masked to -inf before argmax / softmax).
+Internally uses **full parameter sharing** — a single neural network handles
+ALL agents regardless of their OD pair.  Each agent's observation (which
+includes its current node, destination, etc.) is fed through the shared
+policy to obtain an action.  Action masking is supported natively for PPO
+(via MaskablePPO) and manually for DQN and A2C (invalid actions masked to
+-inf before argmax / softmax).
 """
 from __future__ import annotations
 
@@ -32,9 +35,9 @@ class SB3Agent:
 
     Supported algorithms: ``'ppo'``, ``'dqn'``, ``'a2c'``.
 
-    This agent uses **parameter sharing**: a single neural network is shared
-    across all agents. Each agent's observation is fed through the same
-    policy to obtain an action, with action masking applied.
+    This agent uses **full parameter sharing**: a single neural network is
+    shared across ALL agents.  Each agent's observation is fed through the
+    same policy to obtain an action, with action masking applied.
     """
 
     SUPPORTED = ("ppo", "dqn", "a2c")
@@ -43,7 +46,6 @@ class SB3Agent:
         self,
         algorithm: str,
         env: DTAMarkovGameEnv,
-        od_pairs: Optional[np.ndarray] = None,
         learning_rate: float = 3e-4,
         gamma: float = 1.0,
         net_arch: Optional[list] = None,
@@ -53,6 +55,8 @@ class SB3Agent:
         buffer_size: int = 10_000,
         n_steps: int = 128,
         verbose: int = 0,
+        # Legacy kwarg — kept for backward compat, ignored
+        od_pairs: Optional[np.ndarray] = None,
     ):
         algorithm = algorithm.lower()
         if algorithm not in self.SUPPORTED:
@@ -66,71 +70,61 @@ class SB3Agent:
 
         if net_arch is None:
             net_arch = [64, 64]
-            
-        if od_pairs is None:
-            raise ValueError("od_pairs must be provided to use OD-pair parameter sharing.")
-        self.od_pairs = torch.as_tensor(od_pairs, dtype=torch.long, device=device)
-        self.unique_ods = torch.unique(self.od_pairs, dim=0)
 
         # Wrap the parallel env into a single-agent Gymnasium env
         self._gym_env = DTASingleAgentWrapper(env)
 
         policy_kwargs = dict(net_arch=net_arch)
 
-        self.models = {}
-        self._transitions_buffer = {}
-        
-        for od in self.unique_ods:
-            od_tuple = (int(od[0].item()), int(od[1].item()))
-            self._transitions_buffer[od_tuple] = []
-            
-            if algorithm == "ppo":
-                self.models[od_tuple] = MaskablePPO(
-                    "MlpPolicy",
-                    self._gym_env,
-                    learning_rate=learning_rate,
-                    gamma=gamma,
-                    n_steps=n_steps,
-                    batch_size=batch_size,
-                    policy_kwargs=policy_kwargs,
-                    device=device,
-                    seed=seed,
-                    verbose=verbose,
-                )
-            elif algorithm == "dqn":
-                dqn_model = DQN(
-                    "MlpPolicy",
-                    self._gym_env,
-                    learning_rate=learning_rate,
-                    gamma=gamma,
-                    batch_size=batch_size,
-                    buffer_size=buffer_size,
-                    policy_kwargs=policy_kwargs,
-                    device=device,
-                    seed=seed,
-                    verbose=verbose,
-                    learning_starts=50,
-                    exploration_initial_eps=1.0,
-                    exploration_fraction=0.5,
-                    exploration_final_eps=0.05,
-                )
-                # SB3 sets exploration_rate=0.0 by default and only
-                # updates it during .learn(), which we never call.
-                # Manually initialise to the configured starting value.
-                dqn_model.exploration_rate = dqn_model.exploration_initial_eps
-                self.models[od_tuple] = dqn_model
-            elif algorithm == "a2c":
-                self.models[od_tuple] = A2C(
-                    "MlpPolicy",
-                    self._gym_env,
-                    learning_rate=learning_rate,
-                    gamma=gamma,
-                    n_steps=n_steps,
-                    policy_kwargs=policy_kwargs,
-                    device=device,
-                    seed=seed,
-                    verbose=verbose,
-                )
+        # Single shared model for ALL agents
+        self._transitions_buffer: list = []
+
+        if algorithm == "ppo":
+            self.model = MaskablePPO(
+                "MlpPolicy",
+                self._gym_env,
+                learning_rate=learning_rate,
+                gamma=gamma,
+                n_steps=n_steps,
+                batch_size=batch_size,
+                policy_kwargs=policy_kwargs,
+                device=device,
+                seed=seed,
+                verbose=verbose,
+            )
+        elif algorithm == "dqn":
+            self.model = DQN(
+                "MlpPolicy",
+                self._gym_env,
+                learning_rate=learning_rate,
+                gamma=gamma,
+                batch_size=batch_size,
+                buffer_size=buffer_size,
+                policy_kwargs=policy_kwargs,
+                device=device,
+                seed=seed,
+                verbose=verbose,
+                learning_starts=50,
+                exploration_initial_eps=1.0,
+                exploration_fraction=0.5,
+                exploration_final_eps=0.05,
+            )
+            # SB3 sets exploration_rate=0.0 by default and only
+            # updates it during .learn(), which we never call.
+            # Manually initialise to the configured starting value.
+            self.model.exploration_rate = self.model.exploration_initial_eps
+        elif algorithm == "a2c":
+            self.model = A2C(
+                "MlpPolicy",
+                self._gym_env,
+                learning_rate=learning_rate,
+                gamma=gamma,
+                n_steps=n_steps,
+                policy_kwargs=policy_kwargs,
+                device=device,
+                seed=seed,
+                verbose=verbose,
+            )
 
         # Track transitions for manual training (batched)
         self._prev_obs_t: Optional[torch.Tensor] = None    # [K, obs_dim]
@@ -173,26 +167,15 @@ class SB3Agent:
         if K == 0:
             return torch.empty(0, device=obs.device, dtype=torch.long)
 
-        actions = torch.empty(K, device=obs.device, dtype=torch.long)
-        
-        batch_ods = self.od_pairs[deciding_indices]
-        unique_batch_ods = torch.unique(batch_ods, dim=0)
+        obs_f = obs.to(self.model.device, dtype=torch.float32)
+        masks_b = masks.to(self.model.device, dtype=torch.bool)
 
-        for od in unique_batch_ods:
-            od_tuple = (int(od[0].item()), int(od[1].item()))
-            model = self.models[od_tuple]
-            
-            match = (batch_ods == od).all(dim=1)
-            
-            obs_match = obs[match].to(model.device, dtype=torch.float32)
-            masks_match = masks[match].to(model.device, dtype=torch.bool)
-            
-            if self.algorithm_name == "ppo":
-                actions[match] = self._predict_batch_ppo(obs_match, masks_match, model)
-            elif self.algorithm_name == "dqn":
-                actions[match] = self._predict_batch_dqn(obs_match, masks_match, model)
-            elif self.algorithm_name == "a2c":
-                actions[match] = self._predict_batch_a2c(obs_match, masks_match, model)
+        if self.algorithm_name == "ppo":
+            actions = self._predict_batch_ppo(obs_f, masks_b, self.model)
+        elif self.algorithm_name == "dqn":
+            actions = self._predict_batch_dqn(obs_f, masks_b, self.model)
+        elif self.algorithm_name == "a2c":
+            actions = self._predict_batch_a2c(obs_f, masks_b, self.model)
 
         # Store for update
         self._prev_obs_t = obs.detach()
@@ -331,13 +314,9 @@ class SB3Agent:
             max_deg = self.env.dnl.max_out_degree
             masks_next = torch.ones((store_idx.numel(), max_deg), device=prev_obs.device, dtype=torch.int8)
 
-            # Store transitions
+            # Store transitions into single shared buffer
             for j in range(store_idx.numel()):
-                aidx = store_idx[j].item()
-                od_t = self.od_pairs[aidx]
-                od_tuple = (int(od_t[0].item()), int(od_t[1].item()))
-                
-                self._transitions_buffer[od_tuple].append({
+                self._transitions_buffer.append({
                     "obs": store_obs[j].cpu().numpy(),
                     "action": int(store_act[j].item()),
                     "reward": float(store_reward[j].item()),
@@ -351,8 +330,7 @@ class SB3Agent:
             self._accumulated_reward_t[store_idx] = 0.0
 
         # Trigger model update when buffer is large enough
-        total_transitions = sum(len(buf) for buf in self._transitions_buffer.values())
-        if total_transitions >= self._update_every:
+        if len(self._transitions_buffer) >= self._update_every:
             self._train_from_buffer()
 
     # ══════════════════════════════════════════════════════════════════
@@ -376,12 +354,7 @@ class SB3Agent:
             if obs is None:
                 continue
 
-            agent_int_id = int(agent_id.split('_')[1])
-            od_t = self.od_pairs[agent_int_id]
-            od_tuple = (int(od_t[0].item()), int(od_t[1].item()))
-            model = self.models[od_tuple]
-
-            action = self._predict_with_mask(obs, mask, model)
+            action = self._predict_with_mask(obs, mask, self.model)
             actions[agent_id] = action
 
             self._prev_obs[agent_id] = obs
@@ -469,12 +442,8 @@ class SB3Agent:
                 obs_next = np.zeros_like(self._prev_obs[agent_id])
 
             accum_r = self._accumulated_reward[agent_id]
-            
-            agent_int_id = int(agent_id.split('_')[1])
-            od_t = self.od_pairs[agent_int_id]
-            od_tuple = (int(od_t[0].item()), int(od_t[1].item()))
 
-            self._transitions_buffer[od_tuple].append(
+            self._transitions_buffer.append(
                 {
                     "obs": self._prev_obs[agent_id],
                     "action": self._prev_action[agent_id],
@@ -495,8 +464,7 @@ class SB3Agent:
                 self._prev_action.pop(agent_id, None)
                 self._accumulated_reward.pop(agent_id, None)
 
-        total_transitions = sum(len(buf) for buf in self._transitions_buffer.values())
-        if total_transitions >= self._update_every:
+        if len(self._transitions_buffer) >= self._update_every:
             self._train_from_buffer()
 
     # ══════════════════════════════════════════════════════════════════
@@ -504,19 +472,17 @@ class SB3Agent:
     # ══════════════════════════════════════════════════════════════════
 
     def _train_from_buffer(self):
-        """Train models from collected transitions using manual gradient steps."""
-        for od_tuple, buffer in self._transitions_buffer.items():
-            if not buffer:
-                continue
+        """Train the single shared model from collected transitions."""
+        if not self._transitions_buffer:
+            return
 
-            model = self.models[od_tuple]
-            if self.algorithm_name == "dqn":
-                self._train_dqn(model, buffer)
-            elif self.algorithm_name in ("ppo", "a2c"):
-                self._train_on_policy(model, buffer)
-            
-            # Clear buffer after training
-            buffer.clear()
+        if self.algorithm_name == "dqn":
+            self._train_dqn(self.model, self._transitions_buffer)
+        elif self.algorithm_name in ("ppo", "a2c"):
+            self._train_on_policy(self.model, self._transitions_buffer)
+
+        # Clear buffer after training
+        self._transitions_buffer.clear()
 
     def _train_dqn(self, model, buffer):
         """Train DQN from buffered transitions."""
@@ -629,7 +595,7 @@ class SB3Agent:
         policy.set_training_mode(False)
 
     def decay_epsilon(self):
-        """Decay epsilon for all DQN models using a multiplicative schedule.
+        """Decay epsilon for the DQN model using a multiplicative schedule.
 
         Called once per episode from the training loop.  Uses the model's
         own ``exploration_initial_eps`` / ``exploration_final_eps`` as bounds
@@ -639,28 +605,23 @@ class SB3Agent:
         if self.algorithm_name != "dqn":
             return
         decay_factor = 0.995
-        for model in self.models.values():
-            model.exploration_rate = max(
-                model.exploration_final_eps,
-                model.exploration_rate * decay_factor,
-            )
+        self.model.exploration_rate = max(
+            self.model.exploration_final_eps,
+            self.model.exploration_rate * decay_factor,
+        )
 
     @property
     def epsilon(self) -> float:
-        """Return average exploration rate for logging (DQN only)."""
-        if self.algorithm_name == "dqn" and self.models:
-            eps_sum = sum(model.exploration_rate for model in self.models.values())
-            return eps_sum / len(self.models)
+        """Return exploration rate for logging (DQN only)."""
+        if self.algorithm_name == "dqn":
+            return self.model.exploration_rate
         return 0.0
 
     def __repr__(self) -> str:
         algo = self.algorithm_name.upper()
-        if not self.models:
-            return f"SB3Agent(algorithm={algo})"
-        first_model = next(iter(self.models.values()))
         return (
             f"SB3Agent(algorithm={algo}, "
-            f"models={len(self.models)}, "
-            f"lr={first_model.learning_rate}, "
-            f"γ={first_model.gamma})"
+            f"sharing=full, "
+            f"lr={self.model.learning_rate}, "
+            f"γ={self.model.gamma})"
         )

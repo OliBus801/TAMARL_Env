@@ -1,6 +1,7 @@
 """Observation builder for the DTA Markov Game environment."""
 
 from typing import Dict, Tuple
+import heapq
 import numpy as np
 import torch
 from gymnasium import spaces
@@ -13,18 +14,76 @@ class ObservationBuilder:
     Observation vector for each agent:
         [current_node_id, destination_node_id, normalized_time,
          outgoing_edge_occupancies (max_out_degree),
-         outgoing_ff_times (max_out_degree)]
+         outgoing_ff_times (max_out_degree),
+         aon_recommended_edge_one_hot (max_out_degree)]
     
-    Total obs size = 3 + 2 * max_out_degree
+    Total obs size = 3 + 3 * max_out_degree
     """
 
     def __init__(self, dnl: TorchDNLMATSim, max_steps: int = 86400):
         self.dnl = dnl
         self.max_steps = max_steps
-        self.obs_size = 3 + 2 * dnl.max_out_degree
+        self.obs_size = 3 + 3 * dnl.max_out_degree
 
         # Pre-compute normalised free-flow times (immutable across episodes)
         self._ff_norm = dnl.ff_travel_time_steps.float() / max_steps  # [E]
+        
+        # Pre-compute AoN Shortest Paths
+        self._precompute_aon_gps()
+
+    def _precompute_aon_gps(self):
+        """Pre-computes Reverse Dijkstra for all unique destinations to provide AoN GPS signal."""
+        dnl = self.dnl
+        unique_dests = torch.unique(dnl.destinations).cpu().numpy()
+        
+        # Matrix to store the local index [0..max_deg-1] of the best outgoing edge for (node, dest)
+        self._aon_edge_idx = torch.full(
+            (dnl.num_nodes, dnl.num_nodes), -1, dtype=torch.long, device=dnl.device
+        )
+        
+        # Build reverse adjacency list: rev_adj[v] = [(u, edge_id, ff_time), ...]
+        rev_adj = [[] for _ in range(dnl.num_nodes)]
+        endpoints = dnl.edge_endpoints.cpu().numpy()
+        ff_times = dnl.ff_travel_time_steps.cpu().numpy()
+        
+        for e in range(dnl.num_edges):
+            u, v = endpoints[e]
+            rev_adj[int(v)].append((int(u), e, float(ff_times[e])))
+            
+        out_edges_tensor = dnl.node_out_edges.cpu().numpy()  # [num_nodes, max_deg]
+            
+        for dest in unique_dests:
+            dest = int(dest)
+            if dest == -1: 
+                continue  # Skip padding
+                
+            dist = {dest: 0.0}
+            pq = [(0.0, dest)]
+            best_edge = {}  # node -> edge_id taking node to shortest path
+            
+            # Standard Dijkstra on reverse graph (from dest to all nodes)
+            while pq:
+                d, v = heapq.heappop(pq)
+                if d > dist.get(v, float('inf')):
+                    continue
+                    
+                for u, edge_id, ff in rev_adj[v]:
+                    new_d = d + ff
+                    if new_d < dist.get(u, float('inf')):
+                        dist[u] = new_d
+                        best_edge[u] = edge_id
+                        heapq.heappush(pq, (new_d, u))
+                        
+            # Map global edge_id back to local out-degree relative index [0..max_deg-1]
+            aon_arr = np.full(dnl.num_nodes, -1, dtype=np.int64)
+            for u, edge_id in best_edge.items():
+                out_edges_u = out_edges_tensor[u]
+                pos = np.where(out_edges_u == edge_id)[0]
+                if len(pos) > 0:
+                    aon_arr[u] = pos[0]
+            
+            # Move to device tensor
+            self._aon_edge_idx[:, dest] = torch.from_numpy(aon_arr).to(dnl.device)
 
     def observation_space(self) -> spaces.Box:
         """Return the Gymnasium observation space."""
@@ -78,6 +137,16 @@ class ObservationBuilder:
         ff = self._ff_norm[safe_edges]                                 # [K, max_deg]
         ff_times = torch.where(valid_mask, ff, torch.zeros_like(ff))   # [K, max_deg]
 
+        # AoN GPS Indicator ── one-hot mapping
+        aon_idx = self._aon_edge_idx[nodes, dests]                     # [K]
+        aon_one_hot = torch.zeros((K, max_deg), device=dnl.device)
+        valid_aon = aon_idx >= 0
+        if valid_aon.any():
+            # scatter expects [K, 1], so we unsqueeze and convert to int64
+            aon_one_hot[valid_aon] = aon_one_hot[valid_aon].scatter_(
+                1, aon_idx[valid_aon].unsqueeze(1), 1.0
+            )
+
         # Assemble observation tensor  ──  [K, obs_size]
         obs = torch.zeros((K, self.obs_size), device=dnl.device)
         obs[:, 0] = nodes.float()
@@ -85,6 +154,7 @@ class ObservationBuilder:
         obs[:, 2] = norm_time
         obs[:, 3:3 + max_deg] = occupancies
         obs[:, 3 + max_deg:3 + 2 * max_deg] = ff_times
+        obs[:, 3 + 2 * max_deg:3 + 3 * max_deg] = aon_one_hot
 
         return obs
 
@@ -108,12 +178,22 @@ class ObservationBuilder:
         ff = self._ff_norm[safe_edges]
         ff_times = torch.where(valid_mask, ff, torch.zeros_like(ff))
 
+        # AoN GPS Indicator
+        aon_idx = self._aon_edge_idx[origin_nodes, dests]
+        aon_one_hot = torch.zeros((N, max_deg), device=dnl.device)
+        valid_aon = aon_idx >= 0
+        if valid_aon.any():
+            aon_one_hot[valid_aon] = aon_one_hot[valid_aon].scatter_(
+                1, aon_idx[valid_aon].unsqueeze(1), 1.0
+            )
+
         obs = torch.zeros((N, self.obs_size), device=dnl.device)
         obs[:, 0] = origin_nodes.float()
         obs[:, 1] = dests.float()
         # obs[:, 2] = 0.0  already zero
         # obs[:, 3:3+max_deg] = 0.0  occupancy is zero at reset
         obs[:, 3 + max_deg:3 + 2 * max_deg] = ff_times
+        obs[:, 3 + 2 * max_deg:3 + 3 * max_deg] = aon_one_hot
 
         return obs
 

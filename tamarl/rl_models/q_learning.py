@@ -6,9 +6,9 @@ Supports two formulations:
     paths from origin to destination.  The chosen path is then followed
     automatically for the rest of the trip.
 
-In both formulations, agents with the same Origin-Destination (OD) pair share a
-single Q-table (parameter sharing), which is standard in traffic assignment
-literature and yields faster convergence with fewer tables.
+Uses **full parameter sharing**: a single Q-table is shared by ALL agents.
+The state key naturally includes destination information, so different
+OD pairs map to distinct entries without needing separate tables.
 
 State discretisation (link-based):
     (current_node, destination_node, congestion_level_per_outgoing_edge)
@@ -35,11 +35,11 @@ def _make_q_table(n_actions: int):
 
 
 class QLearningAgent:
-    """Tabular Q-Learning with OD-pair shared Q-tables.
+    """Tabular Q-Learning with full parameter sharing.
 
-    All agents that share the same (origin, destination) pair use the same
-    Q-table.  This dramatically reduces the number of tables and accelerates
-    both learning and computation.
+    A single Q-table is shared by ALL agents.  The state key includes
+    destination information, so different OD pairs naturally occupy
+    distinct entries.
 
     Supports both the **batched tensor API** (``get_actions_batched`` /
     ``update_batched``) and the legacy PettingZoo dict API.
@@ -49,6 +49,7 @@ class QLearningAgent:
                    path-based: top_k)
         n_agents: total number of agents in the environment
         od_pairs: [N, 2] int array — (origin_node, dest_node) per agent
+                  (kept for backward compat, not used for table routing)
         alpha: learning rate
         gamma: discount factor
         epsilon_start: initial exploration rate
@@ -91,22 +92,16 @@ class QLearningAgent:
         self.top_k = top_k
         self.rng = np.random.default_rng(seed)
 
-        # ── OD-pair mapping ──────────────────────────────────────────
-        # od_pairs: [N, 2] — (origin_node, dest_node) per agent
+        # ── OD-pair data (kept for path-based helpers) ────────────────
         self._od_pairs = od_pairs.copy()
-        # Map each agent to its OD key (tuple)
         self._agent_od_keys: List[Tuple[int, int]] = [
             (int(od_pairs[i, 0]), int(od_pairs[i, 1])) for i in range(n_agents)
         ]
-        # Unique OD pairs
-        self._unique_ods = list(set(self._agent_od_keys))
 
-        # ── Q-tables: keyed by OD pair ───────────────────────────────
-        self.q_tables: Dict[Tuple[int, int], Dict[Tuple, np.ndarray]] = {}
-        for od in self._unique_ods:
-            self.q_tables[od] = defaultdict(
-                lambda: np.zeros(self.n_actions, dtype=np.float64)
-            )
+        # ── Single shared Q-table ────────────────────────────────────
+        self.q_table: Dict[Tuple, np.ndarray] = defaultdict(
+            lambda: np.zeros(self.n_actions, dtype=np.float64)
+        )
 
         # ── Path-based data ──────────────────────────────────────────
         self.paths_per_od = paths_per_od
@@ -129,10 +124,9 @@ class QLearningAgent:
         # Stats
         self.total_updates = 0
 
-    def _get_q_table(self, agent_idx: int):
-        """Get the shared Q-table for an agent (by its OD pair)."""
-        od_key = self._agent_od_keys[agent_idx]
-        return self.q_tables[od_key]
+    def _get_q_table(self, agent_idx: int = 0):
+        """Return the single shared Q-table (agent_idx ignored)."""
+        return self.q_table
 
     # ── State Discretisation ─────────────────────────────────────────
 
@@ -497,11 +491,9 @@ class QLearningAgent:
     # ── Persistence ──────────────────────────────────────────────────
 
     def save(self, path: str):
-        """Save all Q-tables to disk."""
+        """Save Q-table to disk."""
         data = {
-            "q_tables": {
-                str(od): dict(qt) for od, qt in self.q_tables.items()
-            },
+            "q_table": dict(self.q_table),
             "n_actions": self.n_actions,
             "n_agents": self.n_agents,
             "od_pairs": self._od_pairs,
@@ -523,7 +515,7 @@ class QLearningAgent:
     def load(
         cls, path: str, seed: Optional[int] = None
     ) -> "QLearningAgent":
-        """Load Q-tables from disk."""
+        """Load Q-table from disk."""
         with open(path, "rb") as f:
             data = pickle.load(f)
 
@@ -543,11 +535,20 @@ class QLearningAgent:
         )
         agent.epsilon = data["epsilon"]
         agent.total_updates = data["total_updates"]
-        for od_str, qt_dict in data["q_tables"].items():
-            od_key = eval(od_str)  # Convert string back to tuple
-            agent.q_tables[od_key] = defaultdict(
+        # Support both old per-OD format and new single-table format
+        if "q_table" in data:
+            agent.q_table = defaultdict(
                 lambda: np.zeros(agent.n_actions, dtype=np.float64),
-                qt_dict,
+                data["q_table"],
+            )
+        elif "q_tables" in data:
+            # Legacy: merge all OD tables into one
+            merged = {}
+            for od_str, qt_dict in data["q_tables"].items():
+                merged.update(qt_dict)
+            agent.q_table = defaultdict(
+                lambda: np.zeros(agent.n_actions, dtype=np.float64),
+                merged,
             )
         return agent
 
@@ -555,19 +556,14 @@ class QLearningAgent:
 
     @property
     def q_table_size(self) -> int:
-        """Total number of (OD-pair, state) entries across all Q-tables."""
-        return sum(len(qt) for qt in self.q_tables.values())
-
-    @property
-    def n_od_pairs(self) -> int:
-        """Number of unique OD pairs with Q-tables."""
-        return len(self.q_tables)
+        """Total number of state entries in the shared Q-table."""
+        return len(self.q_table)
 
     def __repr__(self) -> str:
         return (
             f"QLearningAgent(formulation={self.formulation}, "
+            f"sharing=full, "
             f"n_actions={self.n_actions}, α={self.alpha}, "
             f"γ={self.gamma}, ε={self.epsilon:.4f}, "
-            f"OD_pairs={self.n_od_pairs}, "
             f"total_states={self.q_table_size}, updates={self.total_updates})"
         )

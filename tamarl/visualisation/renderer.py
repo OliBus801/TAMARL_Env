@@ -104,19 +104,20 @@ def parse_network(scenario_folder: str):
 
 # ─── Events parsing ───────────────────────────────────────────────────────────
 
-def parse_events(output_folder: str):
+def parse_events(output_folder: str, events_file: str = None):
     """Parse a MATSim-style events CSV from the output folder using pandas.
 
     Returns:
         df: pandas DataFrame
         max_time: float
     """
-    candidates = glob.glob(os.path.join(output_folder, '*events*.csv'))
-    if not candidates:
-        raise FileNotFoundError(
-            f"No *events*.csv found in {output_folder}"
-        )
-    events_file = candidates[0]
+    if events_file is None:
+        candidates = glob.glob(os.path.join(output_folder, '*events*.csv'))
+        if not candidates:
+            raise FileNotFoundError(
+                f"No *events*.csv found in {output_folder}"
+            )
+        events_file = candidates[0]
     print(f"📄 Parsing events: {os.path.basename(events_file)}")
 
     df = pd.read_csv(events_file)
@@ -640,7 +641,8 @@ def render_animation(scenario_folder: str, output_folder: str,
                      text_scale_factor: float = 1.0, show_labels: bool = True,
                      fps: int = 5, dpi: int = 150, fade_steps: int = 5,
                      time_range: tuple = None, speed: int = 1,
-                     zoom_factor: float = 1.0, zoom_center: tuple = None):
+                     zoom_factor: float = 1.0, zoom_center: tuple = None,
+                     events_file: str = None):
     """Generate a GIF or MP4 animation of a simulation.
 
     Args:
@@ -666,7 +668,7 @@ def render_animation(scenario_folder: str, output_folder: str,
 
     # 1. Parse
     nodes, links = parse_network(scenario_folder)
-    events, max_time = parse_events(output_folder)
+    events, max_time = parse_events(output_folder, events_file=events_file)
 
     if events.empty:
         print("⚠️  No events found. Nothing to render.")
@@ -763,7 +765,8 @@ def render_animation(scenario_folder: str, output_folder: str,
 def render_live(scenario_folder: str, output_folder: str,
                 scale_factor: float = 1.0, text_scale_factor: float = 1.0,
                 show_labels: bool = True, initial_speed: int = 1,
-                time_range: tuple = None, zoom_factor: float = 1.0, zoom_center: tuple = None):
+                time_range: tuple = None, zoom_factor: float = 1.0, zoom_center: tuple = None,
+                events_file: str = None):
     """Open an interactive matplotlib window for live simulation playback.
 
     Args:
@@ -784,7 +787,7 @@ def render_live(scenario_folder: str, output_folder: str,
 
     # 1. Parse
     nodes, links = parse_network(scenario_folder)
-    events, max_time = parse_events(output_folder)
+    events, max_time = parse_events(output_folder, events_file=events_file)
 
     if events.empty:
         print("⚠️  No events found. Nothing to render.")
