@@ -127,16 +127,16 @@ class SB3Agent:
             )
 
         # Track transitions for manual training (batched)
-        self._prev_obs_t: Optional[torch.Tensor] = None    # [K, obs_dim]
-        self._prev_actions_t: Optional[torch.Tensor] = None  # [K]
-        self._prev_indices_t: Optional[torch.Tensor] = None  # [K]
+        self._has_prev_t = torch.zeros(env.dnl.num_agents, dtype=torch.bool, device=device)
+        self._prev_obs_t: Optional[torch.Tensor] = None    # [N, obs_dim]
+        self._prev_actions_t = torch.full((env.dnl.num_agents,), -1, dtype=torch.long, device=device)
         self._accumulated_reward_t = torch.zeros(
             env.dnl.num_agents, device=device, dtype=torch.float32
         )
 
         # For periodic SB3 updates
         self._step_count = 0
-        self._update_every = n_steps
+        self._update_every = n_steps if n_steps > 0 else 1024
 
         # Legacy dict-based tracking (for PettingZoo compat)
         self._prev_obs: Dict[str, np.ndarray] = {}
@@ -178,9 +178,12 @@ class SB3Agent:
             actions = self._predict_batch_a2c(obs_f, masks_b, self.model)
 
         # Store for update
-        self._prev_obs_t = obs.detach()
-        self._prev_actions_t = actions.detach()
-        self._prev_indices_t = deciding_indices.detach()
+        if self._prev_obs_t is None:
+            self._prev_obs_t = torch.zeros((self.env.dnl.num_agents, obs.shape[1]), device=obs.device)
+            
+        self._prev_obs_t[deciding_indices] = obs.detach()
+        self._prev_actions_t[deciding_indices] = actions.detach()
+        self._has_prev_t[deciding_indices] = True
 
         return actions
 
@@ -263,43 +266,36 @@ class SB3Agent:
             deciding_new:  [K']                      newly deciding indices
             active_old:    [N_active_old]             previous active indices
         """
-        if self._prev_indices_t is None or self._prev_indices_t.numel() == 0:
+        if not self._has_prev_t.any():
             return
 
-        prev_idx = self._prev_indices_t          # [K_prev]
-        prev_obs = self._prev_obs_t              # [K_prev, obs_dim]
-        prev_act = self._prev_actions_t          # [K_prev]
+        # Accumulate rewards for prev-active agents
+        has_prev_mask = self._has_prev_t[active_old]
+        valid_active_old = active_old[has_prev_mask]
+        valid_rewards = rewards[has_prev_mask]
+        self._accumulated_reward_t[valid_active_old] += valid_rewards
 
-        # Accumulate rewards for prev-deciding agents
-        # Map rewards (indexed by active_old) to prev_idx
-        # Find position of each prev_idx in active_old
-        # active_old[pos] == prev_idx[j] → reward = rewards[pos]
-        pos_in_active = (active_old.unsqueeze(1) == prev_idx.unsqueeze(0))  # [N_old, K_prev]
-        reward_per_prev = (rewards.unsqueeze(1) * pos_in_active.float()).sum(0)  # [K_prev]
-        self._accumulated_reward_t[prev_idx] += reward_per_prev
+        # Determine done status for agents
+        done_mask = terminated | truncated
+        is_done_global = torch.zeros(self.env.dnl.num_agents, dtype=torch.bool, device=active_old.device)
+        is_done_global[active_old] = done_mask
 
-        # Determine done status for prev-deciding agents
-        done_per_prev = (terminated.unsqueeze(1) * pos_in_active).any(0) | \
-                        (truncated.unsqueeze(1) * pos_in_active).any(0)
-
-        # Determine which prev-agents are now deciding again or done
+        is_deciding_global = torch.zeros(self.env.dnl.num_agents, dtype=torch.bool, device=active_old.device)
         if deciding_new.numel() > 0:
-            is_deciding_again = (prev_idx.unsqueeze(1) == deciding_new.unsqueeze(0)).any(1)
-        else:
-            is_deciding_again = torch.zeros(prev_idx.numel(), device=prev_idx.device, dtype=torch.bool)
+            is_deciding_global[deciding_new] = True
 
-        should_store = done_per_prev | is_deciding_again
+        should_store = self._has_prev_t & (is_done_global | is_deciding_global)
 
         if should_store.any():
-            store_idx = prev_idx[should_store]
-            store_obs = prev_obs[should_store]
-            store_act = prev_act[should_store]
+            store_idx = torch.nonzero(should_store).squeeze(-1)
+            store_obs = self._prev_obs_t[store_idx]
+            store_act = self._prev_actions_t[store_idx]
             store_reward = self._accumulated_reward_t[store_idx]
-            store_done = done_per_prev[should_store]
+            store_done = is_done_global[store_idx]
 
             # Get next obs for these agents
-            obs_dim = prev_obs.shape[1]
-            obs_next = torch.zeros((store_idx.numel(), obs_dim), device=prev_obs.device)
+            obs_dim = store_obs.shape[1]
+            obs_next = torch.zeros((store_idx.numel(), obs_dim), device=store_obs.device)
 
             if deciding_new.numel() > 0:
                 new_active = self.env._active_indices
@@ -312,22 +308,33 @@ class SB3Agent:
 
             # Get masks for next state
             max_deg = self.env.dnl.max_out_degree
-            masks_next = torch.ones((store_idx.numel(), max_deg), device=prev_obs.device, dtype=torch.int8)
+            masks_next = torch.ones((store_idx.numel(), max_deg), device=store_obs.device, dtype=torch.int8)
+
+            if deciding_new.numel() > 0:
+                for j in range(store_idx.numel()):
+                    pos = (deciding_new == store_idx[j]).nonzero(as_tuple=True)[0]
+                    if pos.numel() > 0:
+                        masks_next[j] = masks_new[pos[0]]
 
             # Store transitions into single shared buffer
             for j in range(store_idx.numel()):
+                scaled_reward = float(store_reward[j].item()) / float(self.env._max_steps)
                 self._transitions_buffer.append({
                     "obs": store_obs[j].cpu().numpy(),
                     "action": int(store_act[j].item()),
-                    "reward": float(store_reward[j].item()),
+                    "reward": scaled_reward,
                     "obs_next": obs_next[j].cpu().numpy(),
                     "done": bool(store_done[j].item()),
                     "mask": masks_next[j].cpu().numpy(),
                 })
                 self._step_count += 1
-
-            # Reset accumulated rewards for stored agents
-            self._accumulated_reward_t[store_idx] = 0.0
+                
+                # Reset state
+                aidx = store_idx[j].item()
+                self._accumulated_reward_t[aidx] = 0.0
+                if store_done[j]:
+                    self._has_prev_t[aidx] = False
+                    self._prev_actions_t[aidx] = -1
 
         # Trigger model update when buffer is large enough
         if len(self._transitions_buffer) >= self._update_every:
@@ -442,12 +449,13 @@ class SB3Agent:
                 obs_next = np.zeros_like(self._prev_obs[agent_id])
 
             accum_r = self._accumulated_reward[agent_id]
+            scaled_reward = accum_r / float(self.env._max_steps)
 
             self._transitions_buffer.append(
                 {
                     "obs": self._prev_obs[agent_id],
                     "action": self._prev_action[agent_id],
-                    "reward": accum_r,
+                    "reward": scaled_reward,
                     "obs_next": obs_next,
                     "done": done,
                     "mask": mask_next if mask_next is not None else np.ones(
@@ -478,11 +486,15 @@ class SB3Agent:
 
         if self.algorithm_name == "dqn":
             self._train_dqn(self.model, self._transitions_buffer)
+            # Off-policy: keep replay buffer up to max size
+            max_size = self.model.buffer_size
+            if len(self._transitions_buffer) > max_size:
+                self._transitions_buffer = self._transitions_buffer[-max_size:]
+                
         elif self.algorithm_name in ("ppo", "a2c"):
             self._train_on_policy(self.model, self._transitions_buffer)
-
-        # Clear buffer after training
-        self._transitions_buffer.clear()
+            # On-policy: clear rollout buffer completely
+            self._transitions_buffer.clear()
 
     def _train_dqn(self, model, buffer):
         """Train DQN from buffered transitions."""
@@ -553,12 +565,14 @@ class SB3Agent:
         rewards_array = np.array([t["reward"] for t in buffer])
         dones_array = np.array([t["done"] for t in buffer])
         next_obs_array = np.array([t["obs_next"] for t in buffer])
+        masks_array = np.array([t["mask"] for t in buffer])
 
         obs_t = torch.as_tensor(obs_array, dtype=torch.float32, device=model.device)
         actions_t = torch.as_tensor(actions_array, dtype=torch.long, device=model.device)
         rewards_t = torch.as_tensor(rewards_array, dtype=torch.float32, device=model.device)
         dones_t = torch.as_tensor(dones_array, dtype=torch.float32, device=model.device)
         next_obs_t = torch.as_tensor(next_obs_array, dtype=torch.float32, device=model.device)
+        masks_t = torch.as_tensor(masks_array, dtype=torch.bool, device=model.device)
 
         with torch.no_grad():
             next_values = policy.predict_values(next_obs_t).squeeze(-1)
@@ -570,12 +584,25 @@ class SB3Agent:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         if self.algorithm_name == "ppo":
+            # Baseline probabilities for the PPO clipping ratio
+            with torch.no_grad():
+                _, old_log_prob, _ = policy.evaluate_actions(obs_t, actions_t, action_masks=masks_t)
+                
             for _ in range(4):
-                _values, log_prob, entropy = policy.evaluate_actions(obs_t, actions_t)
-                policy_loss = -(log_prob * advantages.detach()).mean()
+                _values, log_prob, entropy = policy.evaluate_actions(obs_t, actions_t, action_masks=masks_t)
+                
+                # PPO Clipped Surrogate Objective
+                ratio = torch.exp(log_prob - old_log_prob)
+                policy_loss_1 = advantages * ratio
+                policy_loss_2 = advantages * torch.clamp(ratio, 1.0 - 0.2, 1.0 + 0.2)
+                policy_loss = -torch.min(policy_loss_1, policy_loss_2).mean()
+                
                 value_loss = torch.nn.functional.mse_loss(_values.squeeze(-1), returns.detach())
                 entropy_loss = -entropy.mean()
-                loss = policy_loss + 0.5 * value_loss + 0.0 * entropy_loss
+                
+                # Entropy coefficient at 0.01 allows the network to explore
+                loss = policy_loss + 0.5 * value_loss + 0.01 * entropy_loss
+                
                 policy.optimizer.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(policy.parameters(), 0.5)
@@ -586,7 +613,8 @@ class SB3Agent:
             policy_loss = -(log_prob * advantages.detach()).mean()
             value_loss = torch.nn.functional.mse_loss(_values.squeeze(-1), returns.detach())
             entropy_loss = -entropy.mean()
-            loss = policy_loss + 0.5 * value_loss - 0.01 * entropy_loss
+            loss = policy_loss + 0.5 * value_loss + 0.01 * entropy_loss
+            
             policy.optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(policy.parameters(), 0.5)
