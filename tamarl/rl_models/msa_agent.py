@@ -45,6 +45,7 @@ class MSAAgent:
         masks: torch.Tensor,
         deciding_indices: torch.Tensor,
         leg_indices: torch.Tensor = None,
+        deterministic: bool = False,
     ) -> torch.Tensor:
         """Select MSA path-following actions for all deciding agents.
 
@@ -53,6 +54,7 @@ class MSAAgent:
             masks:             [K, max_deg]  action masks (int8, 1=valid)
             deciding_indices:  [K]           agent indices
             leg_indices:       [K]           current leg per agent (optional)
+            deterministic:     bool          (unused, kept for API compat)
 
         Returns:
             actions: [K] tensor of action indices
@@ -100,7 +102,7 @@ class MSAAgent:
 
     # ── Dict API (legacy) ────────────────────────────────────────────
         
-    def get_actions(self, observations, infos):
+    def get_actions(self, observations, infos, deterministic: bool = False):
         actions = {}
         for agent_str, info in infos.items():
             mask = info.get("action_mask")

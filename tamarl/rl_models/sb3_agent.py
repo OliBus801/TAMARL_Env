@@ -319,8 +319,8 @@ class SB3Agent:
                             obs_next[j] = obs_new[pos[0]]
 
             # Get masks for next state
-            max_deg = self.env.dnl.max_out_degree
-            masks_next = torch.ones((store_idx.numel(), max_deg), device=store_obs.device, dtype=torch.int8)
+            n_actions = self._gym_env.action_space.n
+            masks_next = torch.ones((store_idx.numel(), n_actions), device=store_obs.device, dtype=torch.int8)
 
             if deciding_new.numel() > 0:
                 for j in range(store_idx.numel()):
@@ -475,7 +475,7 @@ class SB3Agent:
                     "obs_next": obs_next,
                     "done": done,
                     "mask": mask_next if mask_next is not None else np.ones(
-                        self.env.dnl.max_out_degree, dtype=np.int8
+                        self._gym_env.action_space.n, dtype=np.int8
                     ),
                 }
             )

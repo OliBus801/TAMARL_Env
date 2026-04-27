@@ -20,6 +20,10 @@ class ObservationBuilder:
     Total obs size = 3 + 3 * max_out_degree
     """
 
+    FREE_THRESH = 0.5
+    JAM_THRESH = 0.8
+    N_TIME_BINS = 48
+
     def __init__(self, dnl: TorchDNLMATSim, max_steps: int = 86400):
         self.dnl = dnl
         self.max_steps = max_steps
@@ -118,7 +122,9 @@ class ObservationBuilder:
         nodes = dnl.edge_endpoints[curr_edges, 1].long()               # [K]
         c_legs = dnl.current_leg[deciding_agent_indices]                # [K]
         dests = dnl.destinations[deciding_agent_indices, c_legs]        # [K]
-        norm_time = dnl.current_step / self.max_steps
+        
+        # Discretise time into 48 bins
+        norm_time = float(min((dnl.current_step * self.N_TIME_BINS) // self.max_steps, self.N_TIME_BINS - 1))
 
         # Outgoing edges for each node  ──  [K, max_deg], padded with -1
         out_edges = dnl.node_out_edges[nodes]                          # [K, max_deg]
@@ -135,8 +141,8 @@ class ObservationBuilder:
         
         # Discretise into 3 states: free (0.0), resistance (1.0), jam (2.0)
         discrete_density = torch.zeros_like(raw_density)
-        discrete_density[raw_density >= 0.5] = 1.0
-        discrete_density[raw_density > 0.8] = 2.0
+        discrete_density[raw_density >= self.FREE_THRESH] = 1.0
+        discrete_density[raw_density > self.JAM_THRESH] = 2.0
         
         occupancies = torch.where(valid_mask, discrete_density,
                                   torch.zeros_like(discrete_density))  # [K, max_deg]

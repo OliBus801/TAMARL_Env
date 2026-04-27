@@ -21,6 +21,7 @@ class RandomAgent:
         obs: torch.Tensor,
         masks: torch.Tensor,
         deciding_indices: torch.Tensor,
+        deterministic: bool = False,
     ) -> torch.Tensor:
         """Select random valid actions for all deciding agents (vectorised).
 
@@ -28,6 +29,7 @@ class RandomAgent:
             obs:               [K, obs_dim]  (unused, kept for API compat)
             masks:             [K, max_deg]  action masks (int8, 1=valid)
             deciding_indices:  [K]           agent indices
+            deterministic:     bool          (unused, kept for API compat)
 
         Returns:
             actions: [K] tensor of action indices
@@ -47,7 +49,8 @@ class RandomAgent:
     def get_actions(
         self, 
         observations: Dict[str, np.ndarray], 
-        infos: Dict[str, dict]
+        infos: Dict[str, dict],
+        deterministic: bool = False,
     ) -> Dict[str, int]:
         """Select random valid actions for all agents with action masks."""
         actions = {}

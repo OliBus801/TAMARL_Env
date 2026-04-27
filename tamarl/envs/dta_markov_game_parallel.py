@@ -357,7 +357,8 @@ class DTAMarkovGameEnv(ParallelEnv):
                 nodes = self.dnl.edge_endpoints[curr_edges, 1].float()
                 c_legs = self.dnl.current_leg[need_idx]
                 dests = self.dnl.destinations[need_idx, c_legs].float()
-                norm_time = self.dnl.current_step / self._max_steps
+                n_bins = self._obs_builder.N_TIME_BINS
+                norm_time = float(min((self.dnl.current_step * n_bins) // self._max_steps, n_bins - 1))
                 
                 obs_active[needs_obs, 0] = nodes
                 obs_active[needs_obs, 1] = dests

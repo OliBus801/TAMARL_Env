@@ -23,11 +23,12 @@ import torch
 #  Helper: adaptive alpha with numerical stability
 # ═══════════════════════════════════════════════════════════════════
 
-def _adaptive_alpha(x: float, lo: float = 0.05, hi: float = 0.95) -> float:
-    """Compute (1 + exp(-x)) / (1 - exp(-x)), clamped to [lo, hi]."""
-    x = max(x, 1e-8)  # avoid division by zero
-    e = np.exp(-x)
-    val = (1.0 - e) / (1.0 + e + 1e-12)
+def _adaptive_alpha(x: float, scale: float = 1.0, lo: float = 0.05, hi: float = 0.95) -> float:
+    """Compute an inverted sigmoid 2 / (1 + exp(-x/scale)) - 1, clamped to [lo, hi].
+    This provides a high learning rate when error is large, and decreases to `lo` as error -> 0.
+    """
+    x = max(x / scale, 1e-8)  # avoid division by zero and apply scale
+    val = 2.0 / (1.0 + np.exp(-x)) - 1.0
     return float(np.clip(val, lo, hi))
 
 
@@ -59,12 +60,12 @@ class _AdvisorBase:
     """
 
     FREE_THRESH = 0.5
-    RESIST_THRESH = 0.8
+    JAM_THRESH = 0.8
 
     def __init__(
         self,
         n_edges: int,
-        n_magnitudes: int = 5,
+        n_actions: int = 10,
         kappa_max: float = 1.0,
         gamma: float = 0.99,
         epsilon_start: float = 1.0,
@@ -72,15 +73,13 @@ class _AdvisorBase:
         epsilon_decay: float = 0.995,
     ):
         self.n_edges = n_edges
-        self.n_magnitudes = n_magnitudes
         self.kappa_max = kappa_max
         self.gamma = gamma
         self.epsilon = epsilon_start
         self.epsilon_end = epsilon_end
         self.epsilon_decay = epsilon_decay
 
-        # 2 directions × n_magnitudes
-        self.n_actions = 2 * n_magnitudes
+        self.n_actions = n_actions
         self.q_table: Dict[Tuple, np.ndarray] = defaultdict(
             lambda: np.zeros(self.n_actions, dtype=np.float64)
         )
@@ -95,18 +94,23 @@ class _AdvisorBase:
         """Bin edge densities into (free=0, resistance=1, jam=2)."""
         bins = np.zeros(len(density), dtype=np.int8)
         bins[density >= self.FREE_THRESH] = 1
-        bins[density >= self.RESIST_THRESH] = 2
+        bins[density > self.JAM_THRESH] = 2
         return tuple(bins.tolist())
 
     # ── action decode ─────────────────────────────────────────────
 
     def _decode_action(self, action: int) -> Tuple[int, float]:
-        """Decode integer action to (direction ∈ {-1,+1}, value)."""
-        dir_idx = action // self.n_magnitudes
-        mag_idx = action % self.n_magnitudes
+        """Decode integer action to (direction ∈ {-1,+1}, value).
+
+        Subclasses may override this to change the interpretation.
+        Default: 2 directions × (n_actions/2) magnitudes, linearly spaced.
+        """
+        n_magnitudes = self.n_actions // 2
+        dir_idx = action // n_magnitudes
+        mag_idx = action % n_magnitudes
         direction = -1 if dir_idx == 0 else 1
         # Value is linearly spaced in (0, kappa_max]
-        value = self.kappa_max * (mag_idx + 1) / self.n_magnitudes
+        value = self.kappa_max * (mag_idx + 1) / n_magnitudes
         return direction, value
 
     # ── epsilon-greedy select ─────────────────────────────────────
@@ -146,14 +150,20 @@ class _AdvisorBase:
 class TimeAdvisor(_AdvisorBase):
     """Adjusts t_critical — the maximum travel-time budget per OD pair.
 
-    α_i = clamp((1+exp(-Δυ)) / (1-exp(-Δυ)))
-    where Δυ = |t_critical - t̄_actual|.
+    kappa_max is auto-calibrated to ~10% of the max free-flow path cost,
+    so each magnitude step produces a meaningful change in t_critical.
+
+    α_i = inverted_sigmoid(|t_critical - t̄_actual|), clamped to [0.05, 0.95].
     """
 
-    def __init__(self, n_edges: int, **kwargs):
-        super().__init__(n_edges, **kwargs)
-        # t_critical per OD pair (starts at a large default)
-        self.t_critical: Dict[Tuple[int, int], float] = defaultdict(lambda: 1e6)
+    N_MAGNITUDES = 5  # 5 step sizes per direction → 10 actions total
+
+    def __init__(self, n_edges: int, default_t: float = 1e6,
+                 kappa_max_time: float = 100.0, **kwargs):
+        super().__init__(n_edges, n_actions=2 * self.N_MAGNITUDES,
+                         kappa_max=kappa_max_time, **kwargs)
+        # t_critical per OD pair (starts at a default value)
+        self.t_critical: Dict[Tuple[int, int], float] = defaultdict(lambda: default_t)
 
     def apply_action(self, od_key: Tuple[int, int], action: int):
         direction, value = self._decode_action(action)
@@ -163,7 +173,7 @@ class TimeAdvisor(_AdvisorBase):
 
     def compute_alpha(self, od_key: Tuple[int, int], mean_tt: float) -> float:
         delta = abs(self.t_critical[od_key] - mean_tt)
-        return _adaptive_alpha(delta)
+        return _adaptive_alpha(delta, scale=100.0)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -177,8 +187,11 @@ class SizeAdvisor(_AdvisorBase):
     **not** a fixed ``top_k`` CLI parameter.  The Size Advisor learns to
     shrink or expand |Π|_critical within [1, n_paths_for_od].
 
-    α_i = clamp((1+exp(-log(Δξ+1))) / (1-exp(-log(Δξ+1))))
-    where Δξ = ||Π|_critical - (|Π| - Σζ_p)|.
+    Action space: 3 discrete actions {shrink, hold, grow} with step ±1.
+    This avoids the degenerate magnitude encoding where all magnitudes
+    collapsed to the same ±1 step.
+
+    α_i = inverted_sigmoid(log(Δξ+1)), clamped to [0.05, 0.95].
     """
 
     def __init__(
@@ -187,28 +200,31 @@ class SizeAdvisor(_AdvisorBase):
         n_paths_per_od: Dict[Tuple[int, int], int],
         **kwargs,
     ):
-        super().__init__(n_edges, **kwargs)
+        # 3 actions: 0=shrink, 1=hold, 2=grow
+        super().__init__(n_edges, n_actions=3, kappa_max=1.0, **kwargs)
         self._n_paths_per_od = n_paths_per_od
         # |Π|_critical per OD (starts at the full path count — use all)
         self.pi_critical: Dict[Tuple[int, int], int] = {
             od: n for od, n in n_paths_per_od.items()
         }
 
+    def _decode_action(self, action: int) -> Tuple[int, float]:
+        """Decode 3-action space: 0=shrink(-1), 1=hold(0), 2=grow(+1)."""
+        direction = action - 1  # {-1, 0, +1}
+        return direction, 1.0
+
     def apply_action(self, od_key: Tuple[int, int], action: int):
-        direction, value = self._decode_action(action)
+        direction, _ = self._decode_action(action)
         n_max = self._n_paths_per_od.get(od_key, 1)
-        new_val = self.pi_critical.get(od_key, n_max) + int(
-            direction * max(1, round(value))
-        )
-        self.pi_critical[od_key] = max(1, min(n_max, new_val))
+        new_val = self.pi_critical.get(od_key, n_max) + direction
+        self.pi_critical[od_key] = int(max(1, min(n_max, new_val)))
 
     def compute_alpha(
         self, od_key: Tuple[int, int], n_valid: int, n_total: int
     ) -> float:
         effective = n_valid
         delta = abs(self.pi_critical.get(od_key, n_total) - effective)
-        log_delta = np.log(delta + 1.0)
-        return _adaptive_alpha(log_delta)
+        return _adaptive_alpha(delta, scale=2.0)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -218,7 +234,7 @@ class SizeAdvisor(_AdvisorBase):
 class ConstrainedMainAgent:
     """Path-based main agent with softmax policy over restricted action set.
 
-    Q-table is keyed by (destination,).  Each entry has ``max_paths``
+    Q-table is keyed by (origin, destination).  Each entry has ``max_paths``
     Q-values, where ``max_paths`` is the largest path count across all
     OD pairs (so the array is fixed-size).
 
@@ -257,7 +273,7 @@ class ConstrainedMainAgent:
         self._has_prev[:] = False
 
     def _state_key(self, obs: np.ndarray) -> Tuple:
-        return (int(obs[1]),)  # (destination,)
+        return (int(obs[0]), int(obs[1]))  # (origin, destination)
 
     def select_actions_softmax(
         self,
@@ -396,7 +412,24 @@ class HABAgent:
             epsilon_end=epsilon_end,
             epsilon_decay=epsilon_decay,
         )
-        self.time_advisor = TimeAdvisor(n_edges, **adv_kw)
+
+        # Calculate default t_critical (1.5 * global max free-flow)
+        all_ff = [c for od_costs in self._ff_path_costs.values() for c in od_costs.values()]
+        max_ff = max(all_ff) if all_ff else 1e6
+
+        # kappa_max for TimeAdvisor: 10% of max free-flow cost
+        # This gives meaningful step sizes (e.g. ~9-90s for max_ff=900)
+        kappa_max_time = max(1.0, max_ff * 0.10)
+
+        self.time_advisor = TimeAdvisor(
+            n_edges, default_t=1.5 * max_ff,
+            kappa_max_time=kappa_max_time, **adv_kw,
+        )
+        # Pre-populate with OD-specific max free-flow
+        for od_key, costs in self._ff_path_costs.items():
+            if costs:
+                self.time_advisor.t_critical[od_key] = 1.5 * max(costs.values())
+
         self.size_advisor = SizeAdvisor(
             n_edges, n_paths_per_od=self._n_paths_per_od, **adv_kw,
         )
@@ -428,9 +461,8 @@ class HABAgent:
     def reset_episode(self):
         self.main_agent.reset_episode()
         self._chosen_path_idx[:] = 0
-        self._prev_density_state = None
-        self._prev_time_actions.clear()
-        self._prev_size_actions.clear()
+        # Do not clear _prev_density_state or _prev_actions here!
+        # They are inter-episode state required for update_hab().
 
     def prepare_for_eval(self, env):
         """Prepare for deterministic evaluation by setting advisors to greedy choices."""
@@ -582,6 +614,8 @@ class HABAgent:
 
         # 2. Update advisors per OD
         advisor_rewards = []
+        alpha_t_list = []
+        alpha_s_list = []
         for od_key, metrics in od_metrics.items():
             delta_improve = improvements.get(od_key, 0.0)
             eta_sign = 1.0 if delta_improve >= 0 else -1.0
@@ -595,6 +629,7 @@ class HABAgent:
                 alpha_t = self.time_advisor.compute_alpha(
                     od_key, metrics.mean_travel_time
                 )
+                alpha_t_list.append(alpha_t)
                 self.time_advisor.update(
                     self._prev_density_state,
                     self._prev_time_actions[od_key],
@@ -614,6 +649,7 @@ class HABAgent:
                 alpha_s = self.size_advisor.compute_alpha(
                     od_key, n_valid, n_total
                 )
+                alpha_s_list.append(alpha_s)
                 self.size_advisor.update(
                     self._prev_density_state,
                     self._prev_size_actions[od_key],
@@ -633,16 +669,21 @@ class HABAgent:
             slack_weight=self.slack_weight,
         )
         main_updates = 0
+        main_rewards = []
+        alpha_m_list = []
         for i in range(self.n_agents):
             if not self.main_agent._has_prev[i]:
                 continue
             od_key = self._agent_od_keys[i]
             mu_i = od_metrics[od_key].cost_variance if od_key in od_metrics else 0.0
-            alpha_m = _adaptive_alpha(mu_i)
+            std_i = float(np.sqrt(mu_i))
+            alpha_m = _adaptive_alpha(std_i, scale=100.0)
+            alpha_m_list.append(alpha_m)
 
             delta_c = delta_base[i] + delta_slack[i]
             eta = 1.0 if delta_c >= 0 else -1.0
             reward = _hab_reward(delta_c, eta)
+            main_rewards.append(reward)
 
             state = self.main_agent._prev_state[i]
             action = int(self.main_agent._prev_action[i])
@@ -661,13 +702,19 @@ class HABAgent:
 
         # Stats
         avg_adv_r = float(np.mean(advisor_rewards)) if advisor_rewards else 0.0
+        avg_main_r = float(np.mean(main_rewards)) if main_rewards else 0.0
+        avg_alpha_t = float(np.mean(alpha_t_list)) if alpha_t_list else 0.0
+        avg_alpha_s = float(np.mean(alpha_s_list)) if alpha_s_list else 0.0
+        avg_alpha_m = float(np.mean(alpha_m_list)) if alpha_m_list else 0.0
 
         # Debug print: critical values (requested by user)
         t_vals = list(self.time_advisor.t_critical.values())
         pi_vals = list(self.size_advisor.pi_critical.values())
-        avg_t = t_vals[-1] if t_vals else 0.0
-        avg_pi = pi_vals[-1] if pi_vals else 0.0
-        print(f"DEBUG: t_critical={avg_t:.2f}, |Π|_critical={avg_pi:.2f}")
+        avg_t = float(np.mean(t_vals)) if t_vals else 0.0
+        unique_pi = list(int(v) for v in self.size_advisor.pi_critical.values())
+        print(f"DEBUG: avg_t_crit={avg_t:.2f}, Π_crit_vals={unique_pi} | "
+              f"r_adv={avg_adv_r:.3f}, r_main={avg_main_r:.3f} | "
+              f"α_t={avg_alpha_t:.3f}, α_s={avg_alpha_s:.3f}, α_m={avg_alpha_m:.3f}")
 
         return {
             'hab_advisor_reward': avg_adv_r,
