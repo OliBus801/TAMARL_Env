@@ -152,6 +152,7 @@ class SB3Agent:
         obs: torch.Tensor,
         masks: torch.Tensor,
         deciding_indices: torch.Tensor,
+        deterministic: bool = False,
     ) -> torch.Tensor:
         """Select actions for all deciding agents in a single batch forward pass.
 
@@ -171,11 +172,11 @@ class SB3Agent:
         masks_b = masks.to(self.model.device, dtype=torch.bool)
 
         if self.algorithm_name == "ppo":
-            actions = self._predict_batch_ppo(obs_f, masks_b, self.model)
+            actions = self._predict_batch_ppo(obs_f, masks_b, self.model, deterministic)
         elif self.algorithm_name == "dqn":
-            actions = self._predict_batch_dqn(obs_f, masks_b, self.model)
+            actions = self._predict_batch_dqn(obs_f, masks_b, self.model, deterministic)
         elif self.algorithm_name == "a2c":
-            actions = self._predict_batch_a2c(obs_f, masks_b, self.model)
+            actions = self._predict_batch_a2c(obs_f, masks_b, self.model, deterministic)
 
         # Store for update
         if self._prev_obs_t is None:
@@ -187,7 +188,7 @@ class SB3Agent:
 
         return actions
 
-    def _predict_batch_ppo(self, obs: torch.Tensor, masks: torch.Tensor, model) -> torch.Tensor:
+    def _predict_batch_ppo(self, obs: torch.Tensor, masks: torch.Tensor, model, deterministic: bool = False) -> torch.Tensor:
         """Batch PPO prediction using MaskablePPO's policy internals."""
         policy = model.policy
         policy.set_training_mode(False)
@@ -201,13 +202,16 @@ class SB3Agent:
             # Apply action masks: set invalid to -inf
             logits[~masks] = float("-inf")
 
-            # Sample from categorical distribution
-            dist = torch.distributions.Categorical(logits=logits)
-            actions = dist.sample()                                 # [K]
+            if deterministic:
+                actions = logits.argmax(dim=1)                     # [K]
+            else:
+                # Sample from categorical distribution
+                dist = torch.distributions.Categorical(logits=logits)
+                actions = dist.sample()                            # [K]
 
         return actions
 
-    def _predict_batch_dqn(self, obs: torch.Tensor, masks: torch.Tensor, model) -> torch.Tensor:
+    def _predict_batch_dqn(self, obs: torch.Tensor, masks: torch.Tensor, model, deterministic: bool = False) -> torch.Tensor:
         """Batch DQN prediction with epsilon-greedy and masking."""
         K = obs.shape[0]
 
@@ -216,7 +220,11 @@ class SB3Agent:
             q_values[~masks] = float("-inf")
 
         # Epsilon-greedy: decide which agents explore
-        explore = torch.rand(K, device=obs.device) < model.exploration_rate
+        if deterministic:
+            explore = torch.zeros(K, dtype=torch.bool, device=obs.device)
+        else:
+            explore = torch.rand(K, device=obs.device) < model.exploration_rate
+            
         greedy_actions = q_values.argmax(dim=1)                     # [K]
 
         # For exploring agents, sample uniformly from valid actions
@@ -229,7 +237,7 @@ class SB3Agent:
 
         return greedy_actions
 
-    def _predict_batch_a2c(self, obs: torch.Tensor, masks: torch.Tensor, model) -> torch.Tensor:
+    def _predict_batch_a2c(self, obs: torch.Tensor, masks: torch.Tensor, model, deterministic: bool = False) -> torch.Tensor:
         """Batch A2C prediction with masked sampling."""
         policy = model.policy
         policy.set_training_mode(False)
@@ -240,8 +248,12 @@ class SB3Agent:
             logits = policy.action_net(latent_pi)                  # [K, n_actions]
 
             logits[~masks] = float("-inf")
-            probs = torch.softmax(logits, dim=-1)
-            actions = torch.multinomial(probs, 1).squeeze(1)       # [K]
+            
+            if deterministic:
+                actions = logits.argmax(dim=1)                     # [K]
+            else:
+                probs = torch.softmax(logits, dim=-1)
+                actions = torch.multinomial(probs, 1).squeeze(1)       # [K]
 
         return actions
 
@@ -348,6 +360,7 @@ class SB3Agent:
         self,
         observations: Dict[str, np.ndarray],
         infos: Dict[str, dict],
+        deterministic: bool = False,
     ) -> Dict[str, int]:
         """Select actions (PettingZoo dict interface)."""
         actions = {}
@@ -361,7 +374,7 @@ class SB3Agent:
             if obs is None:
                 continue
 
-            action = self._predict_with_mask(obs, mask, self.model)
+            action = self._predict_with_mask(obs, mask, self.model, deterministic)
             actions[agent_id] = action
 
             self._prev_obs[agent_id] = obs
@@ -371,12 +384,12 @@ class SB3Agent:
 
         return actions
 
-    def _predict_with_mask(self, obs: np.ndarray, mask: np.ndarray, model) -> int:
+    def _predict_with_mask(self, obs: np.ndarray, mask: np.ndarray, model, deterministic: bool = False) -> int:
         """Get action from the model with action masking applied (single agent)."""
         if self.algorithm_name == "ppo":
             action, _ = model.predict(
                 obs, action_masks=mask.astype(bool),
-                deterministic=False,
+                deterministic=deterministic,
             )
             return int(action)
 
@@ -390,7 +403,7 @@ class SB3Agent:
             mask_tensor = torch.as_tensor(mask, dtype=torch.bool, device=model.device)
             q_values[0, ~mask_tensor] = float("-inf")
 
-            if np.random.random() < model.exploration_rate:
+            if not deterministic and np.random.random() < model.exploration_rate:
                 valid_idxs = np.where(mask > 0)[0]
                 return int(np.random.choice(valid_idxs))
             else:
@@ -411,8 +424,11 @@ class SB3Agent:
             mask_tensor = torch.as_tensor(mask, dtype=torch.bool, device=model.device)
             logits[0, ~mask_tensor] = float("-inf")
 
-            probs = torch.softmax(logits, dim=-1)
-            action = torch.multinomial(probs, 1).item()
+            if deterministic:
+                action = int(logits.argmax(dim=1).item())
+            else:
+                probs = torch.softmax(logits, dim=-1)
+                action = torch.multinomial(probs, 1).item()
             return int(action)
 
         raise ValueError(f"Unknown algorithm: {self.algorithm_name}")

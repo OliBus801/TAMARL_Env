@@ -193,6 +193,7 @@ class QLearningAgent:
         obs: torch.Tensor,
         masks: torch.Tensor,
         deciding_indices: torch.Tensor,
+        deterministic: bool = False,
     ) -> torch.Tensor:
         """Select actions for all deciding agents (vectorised epsilon-greedy).
 
@@ -215,8 +216,11 @@ class QLearningAgent:
         state_keys = self._discretise_obs_batch(obs)
 
         # Vectorised epsilon-greedy decision
-        rand_vals = self.rng.random(K)
-        explore_mask = rand_vals < self.epsilon
+        if deterministic or self.epsilon == 0:
+            explore_mask = np.zeros(K, dtype=bool)
+        else:
+            rand_vals = self.rng.random(K)
+            explore_mask = rand_vals < self.epsilon
 
         # Prepare masks for random sampling
         masks_np = masks.cpu().numpy().astype(np.float64)
@@ -355,6 +359,7 @@ class QLearningAgent:
         self,
         observations: Dict[str, np.ndarray],
         infos: Dict[str, dict],
+        deterministic: bool = False,
     ) -> Dict[str, int]:
         """Select actions using per-agent epsilon-greedy with action masking.
 
@@ -377,7 +382,7 @@ class QLearningAgent:
             q_table = self._get_q_table(agent_idx)
 
             # Epsilon-greedy over valid actions
-            if self.rng.random() < self.epsilon:
+            if not deterministic and self.rng.random() < self.epsilon:
                 action = int(self.rng.choice(valid_indices))
             else:
                 q_vals = q_table[state]

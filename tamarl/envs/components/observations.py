@@ -130,8 +130,16 @@ class ObservationBuilder:
         # Occupancy / capacity  ──  vectorised gather
         occ = dnl.edge_occupancy[safe_edges].float()                   # [K, max_deg]
         cap = dnl.storage_capacity[safe_edges].clamp(min=1.0)          # [K, max_deg]
-        occupancies = torch.where(valid_mask, occ / cap,
-                                  torch.zeros_like(occ))               # [K, max_deg]
+        
+        raw_density = occ / cap
+        
+        # Discretise into 3 states: free (0.0), resistance (1.0), jam (2.0)
+        discrete_density = torch.zeros_like(raw_density)
+        discrete_density[raw_density >= 0.5] = 1.0
+        discrete_density[raw_density > 0.8] = 2.0
+        
+        occupancies = torch.where(valid_mask, discrete_density,
+                                  torch.zeros_like(discrete_density))  # [K, max_deg]
 
         # Free-flow times  ──  vectorised gather
         ff = self._ff_norm[safe_edges]                                 # [K, max_deg]

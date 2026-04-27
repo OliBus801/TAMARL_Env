@@ -28,23 +28,25 @@ from tamarl.rl_models.q_learning import QLearningAgent
 from tamarl.rl_models.msa_agent import MSAAgent
 from tamarl.rl_models.aon_agent import AONAgent
 from tamarl.rl_models.sb3_agent import SB3Agent
+from tamarl.rl_models.hab_agent import HABAgent
 
 
-def run_episode(env: DTAMarkovGameEnv, agent):
+def run_episode(env: DTAMarkovGameEnv, agent, deterministic: bool = False):
     """Run a single episode using the appropriate API for the agent type.
 
     Uses the batched tensor API for agents that support it (SB3, Random, MSA, Q-learning),
     falls back to the dict-based PettingZoo API for legacy agents.
     """
     use_batched = hasattr(agent, 'get_actions_batched')
+    is_hab = isinstance(agent, HABAgent)
 
     if use_batched:
-        return _run_episode_batched(env, agent)
+        return _run_episode_batched(env, agent, deterministic=deterministic)
     else:
-        return _run_episode_dict(env, agent)
+        return _run_episode_dict(env, agent, deterministic=deterministic)
 
 
-def _run_episode_batched(env: DTAMarkovGameEnv, agent):
+def _run_episode_batched(env: DTAMarkovGameEnv, agent, deterministic: bool = False):
     """Run a single episode using the batched tensor API — no dicts, no string parsing."""
     obs_all, masks, deciding, active = env.reset_batched()
 
@@ -53,9 +55,12 @@ def _run_episode_batched(env: DTAMarkovGameEnv, agent):
     is_sb3 = isinstance(agent, SB3Agent)
     is_msa = isinstance(agent, MSAAgent)
     is_ql = isinstance(agent, QLearningAgent)
+    is_hab = isinstance(agent, HABAgent)
 
-    # Reset Q-learning per-episode state
+    # Reset per-episode state
     if is_ql and hasattr(agent, 'reset_episode'):
+        agent.reset_episode()
+    if is_hab:
         agent.reset_episode()
 
     while env.has_active_agents():
@@ -70,10 +75,14 @@ def _run_episode_batched(env: DTAMarkovGameEnv, agent):
                 leg_indices = env.dnl.current_leg[deciding]
                 actions = agent.get_actions_batched(obs_deciding, masks, deciding, leg_indices)
             else:
-                actions = agent.get_actions_batched(obs_deciding, masks, deciding)
+                actions = agent.get_actions_batched(obs_deciding, masks, deciding, deterministic=deterministic)
 
-            # Path-based: record chosen paths in Q-learning agent
+            # Path-based: record chosen paths in Q-learning / HAB agent
             if is_ql and agent.formulation == 'path-based':
+                path_choices = actions.cpu().numpy()
+                for idx, aid in enumerate(deciding.cpu().numpy()):
+                    agent.set_chosen_path(int(aid), int(path_choices[idx]))
+            elif is_hab:
                 path_choices = actions.cpu().numpy()
                 for idx, aid in enumerate(deciding.cpu().numpy()):
                     agent.set_chosen_path(int(aid), int(path_choices[idx]))
@@ -94,19 +103,24 @@ def _run_episode_batched(env: DTAMarkovGameEnv, agent):
         cumulative_rewards[prev_active] += rewards
 
         # Learning updates
-        if is_sb3:
-            agent.update_batched(
-                obs_active, rewards, terminated, truncated,
-                masks, deciding, prev_active,
-            )
-        elif is_ql:
-            agent.update_batched(
-                obs_active, rewards, terminated, truncated,
-                masks, deciding, prev_active, env._active_indices,
-            )
+        if not deterministic:
+            if is_sb3:
+                agent.update_batched(
+                    obs_active, rewards, terminated, truncated,
+                    masks, deciding, prev_active,
+                )
+            elif is_ql:
+                agent.update_batched(
+                    obs_active, rewards, terminated, truncated,
+                    masks, deciding, prev_active, env._active_indices,
+                )
+
+    # HAB post-episode update
+    if is_hab and not deterministic:
+        hab_stats = agent.update_hab(env)
 
     # Decay exploration after each episode
-    if hasattr(agent, 'decay_epsilon'):
+    if not deterministic and hasattr(agent, 'decay_epsilon'):
         agent.decay_epsilon()
 
     # ── Compute metrics ──
@@ -116,7 +130,7 @@ def _run_episode_batched(env: DTAMarkovGameEnv, agent):
     return _compute_stats(env, cum_dict, n_decisions)
 
 
-def _run_episode_dict(env: DTAMarkovGameEnv, agent):
+def _run_episode_dict(env: DTAMarkovGameEnv, agent, deterministic: bool = False):
     """Run a single episode using the PettingZoo dict API (Q-learning)."""
     obs, infos = env.reset()
 
@@ -125,7 +139,7 @@ def _run_episode_dict(env: DTAMarkovGameEnv, agent):
     is_learner = hasattr(agent, 'update')
 
     while env.agents:
-        actions = agent.get_actions(obs, infos)
+        actions = agent.get_actions(obs, infos, deterministic=deterministic)
         n_decisions += len(actions)
 
         obs, rewards, terminations, truncations, infos = env.step(actions)
@@ -133,10 +147,10 @@ def _run_episode_dict(env: DTAMarkovGameEnv, agent):
         for agent_id, r in rewards.items():
             cumulative_rewards[agent_id] = cumulative_rewards.get(agent_id, 0.0) + r
 
-        if is_learner:
+        if is_learner and not deterministic:
             agent.update(obs, rewards, terminations, truncations, infos)
 
-    if hasattr(agent, 'decay_epsilon'):
+    if not deterministic and hasattr(agent, 'decay_epsilon'):
         agent.decay_epsilon()
 
     return _compute_stats(env, cumulative_rewards, n_decisions)
@@ -284,6 +298,8 @@ def train(
         })
     elif agent_type == 'aon':
         pass  # AON doesn't have specific hyperparameters, uses FF times
+    elif agent_type == 'hab':
+        pass  # HAB uses its own internal hyperparameters
     elif agent_type in ('ppo', 'dqn', 'a2c'):
         config.update({
             'sb3_lr': sb3_lr,
@@ -305,6 +321,12 @@ def train(
         formulation = 'link-based'
         config['formulation'] = 'link-based'
 
+    # HAB forces path-based formulation
+    if agent_type == 'hab' and formulation != 'path-based':
+        print(f"  ⚠  HAB agent requires path-based formulation; overriding.")
+        formulation = 'path-based'
+        config['formulation'] = 'path-based'
+
     print(f"{'='*65}")
     print(f"  DTA Markov Game — Training Runner")
     print(f"{'='*65}")
@@ -324,6 +346,8 @@ def train(
         print(f"  MSA:         α_max={msa_alpha_max}, α_min={msa_alpha_min}, decay={msa_decay}")
     elif agent_type == 'aon':
         print(f"  AON:         Shortest Path at Free Flow")
+    elif agent_type == 'hab':
+        print(f"  HAB:         Hierarchical Advisory Behavior (path-based, top-k={top_k_paths})")
     elif agent_type in ('ppo', 'dqn', 'a2c'):
         print(f"  SB3 {agent_type.upper()}:    lr={sb3_lr}, γ={sb3_gamma}, net={sb3_net_arch or [64,64]}, batch={sb3_batch_size}")
     print(f"{'='*65}\n")
@@ -411,6 +435,30 @@ def train(
             buffer_size=sb3_buffer_size,
             n_steps=sb3_n_steps,
         )
+    elif agent_type == 'hab':
+        agent = HABAgent(
+            n_agents=env.dnl.num_agents,
+            n_edges=env.dnl.num_edges,
+            od_pairs=env.od_pairs,
+            paths_per_od=env.paths_per_od,
+            edge_endpoints=env.dnl.edge_endpoints.cpu().numpy(),
+            ff_times=env.dnl.edge_static[:, 4].cpu().numpy(),  # FF travel time in seconds
+            dt=timestep,
+            gamma=ql_gamma,
+            seed=seed,
+        )
+        # HAB needs dynamic link TT collection every episode
+        env.dnl.collect_link_tt = True
+        if getattr(env.dnl, 'interval_tt_sum', None) is None:
+            env.dnl.max_intervals = 100
+            env.dnl.interval_tt_sum = torch.zeros(
+                (env.dnl.max_intervals, env.dnl.num_edges),
+                device=env.dnl.device, dtype=torch.float32,
+            )
+            env.dnl.interval_tt_count = torch.zeros(
+                (env.dnl.max_intervals, env.dnl.num_edges),
+                device=env.dnl.device, dtype=torch.float32,
+            )
     else:
         agent = RandomAgent(seed=seed)
 
@@ -456,13 +504,12 @@ def train(
             stats = aon_cached_stats.copy()
             time.sleep(0.005)  # small delay for tqdm to update smoothly
         else:
-            # Configure env to collect metric if RGap is enabled or if using MSA
-            needs_tt = (relative_gap and is_log_step) or (agent_type == 'msa') or (agent_type == 'aon' and ep == 0 and relative_gap)
+            # Configure env to collect metric if RGap is enabled or if using MSA/HAB
+            needs_tt = (relative_gap and is_log_step) or (agent_type == 'msa') or (agent_type == 'aon' and ep == 0 and relative_gap) or (agent_type == 'hab')
             if needs_tt:
                 env.dnl.collect_link_tt = True
                 if getattr(env.dnl, 'interval_tt_sum', None) is None:
                     env.dnl.max_intervals = 100
-                    import torch
                     env.dnl.interval_tt_sum = torch.zeros((env.dnl.max_intervals, env.dnl.num_edges), device=env.dnl.device, dtype=torch.float32)
                     env.dnl.interval_tt_count = torch.zeros((env.dnl.max_intervals, env.dnl.num_edges), device=env.dnl.device, dtype=torch.float32)
             else:
@@ -516,6 +563,7 @@ def train(
                 tqdm.write(f"  │ RGap:       {agg['relative_gap_mean']:.4f} ± {agg['relative_gap_std']:.4f}")
             tqdm.write(f"  │ p95:        {agg.get('tt_p95_mean', 0):.1f} ± {agg.get('tt_p95_std', 0):.1f}")
             tqdm.write(f"  │ Arrival:    {agg['arrival_rate_mean']*100:.1f}%")
+            tqdm.write(f"  │ Length:     {agg['episode_length_mean']:.1f} ± {agg['episode_length_std']:.1f}")
             tqdm.write(f"  │ Reward:     {agg['mean_reward_mean']:.1f} ± {agg['mean_reward_std']:.1f}")
             tqdm.write(f"  └─────────────────────────────────────────────")
 
@@ -577,6 +625,7 @@ def train(
         print(f"  Relative Gap:     {np.mean(gap_vals):.4f} ± {np.std(gap_vals):.4f}")
     print(f"  TT p95:           {_fmt('tt_p95')}")
     print(f"  Arrival:          {np.mean([s['arrival_rate'] for s in all_stats])*100:.1f}%")
+    print(f"  Episode Length:   {_fmt('episode_length')}")
     print(f"  Mean Reward:      {_fmt('mean_reward')}")
     print(f"{'='*65}")
 
@@ -599,17 +648,44 @@ def train(
 
     # ── Render at end ──
     if render == 'end' and need_events:
-        print(f"\n🎬 Rendering final episode...")
+        print(f"\n🎬 Running and rendering final deterministic evaluation episode...")
+        
+        # Ensure events are tracked for this final evaluation episode
+        env.dnl.track_events = True
+        env.dnl.collect_link_tt = True
+        if getattr(env.dnl, 'interval_tt_sum', None) is None:
+            env.dnl.max_intervals = 100
+            env.dnl.interval_tt_sum = torch.zeros((env.dnl.max_intervals, env.dnl.num_edges), device=env.dnl.device, dtype=torch.float32)
+            env.dnl.interval_tt_count = torch.zeros((env.dnl.max_intervals, env.dnl.num_edges), device=env.dnl.device, dtype=torch.float32)
+            
+        if hasattr(agent, 'prepare_for_eval'):
+            agent.prepare_for_eval(env)
+            
+        stats = run_episode(env, agent, deterministic=True)
+        
+        # ── Evaluation Summary ──
+        print(f"\n{'='*65}")
+        print(f"  Evaluation Summary")
+        print(f"{'='*65}")
+
+        print(f"  TSTT:             {stats['tstt']:.0f}")
+        print(f"  Mean TT:          {stats['mean_travel_time']:.1f}")
+        print(f"  TT p95:           {stats['tt_p95']:.1f}")
+        print(f"  Arrival:          {stats['arrival_rate']*100:.1f}%")
+        print(f"  Episode Length:   {stats['episode_length']:.1f}")
+        print(f"  Mean Reward:      {stats['mean_reward']:.1f}")
+        print(f"{'='*65}")
+        
         render_episode(
             scenario_path=scenario_path,
             dnl=env.dnl,
             idx_to_link_id=idx_to_link_id,
-            episode=n_episodes,
+            episode='eval',
             fmt=render_format,
             render_fps=render_fps,
             render_hours=render_hours,
             render_speed=render_speed,
-            filename=f"{agent_type}-{scenario_id}-{n_episodes}",
+            filename=f"{agent_type}-{scenario_id}-eval",
         )
 
     env.close()
@@ -742,8 +818,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # Agent
     parser.add_argument("--agent", default=None,
-                        choices=["random", "qlearning", "msa", "ppo", "dqn", "a2c", "aon"],
-                        help="Agent type: 'random', 'qlearning', 'msa', 'ppo', 'dqn', 'a2c', or 'aon'")
+                        choices=["random", "qlearning", "msa", "ppo", "dqn", "a2c", "aon", "hab"],
+                        help="Agent type: 'random', 'qlearning', 'msa', 'ppo', 'dqn', 'a2c', 'aon', or 'hab'")
 
     # Training
     parser.add_argument("--episodes", type=int, default=None, help="Number of episodes")

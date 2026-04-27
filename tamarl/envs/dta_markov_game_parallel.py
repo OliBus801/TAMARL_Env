@@ -614,3 +614,15 @@ class DTAMarkovGameEnv(ParallelEnv):
     def close(self):
         """Clean up resources."""
         self.agents = []
+
+    def get_network_density(self) -> torch.Tensor:
+        """Compute per-link density ratio (vehicles / storage_capacity).
+
+        Returns a [E] float tensor where each entry is the occupancy ratio
+        of the corresponding link.  Values range from 0 (empty) upward
+        (can exceed 1.0 when the stuck-threshold forces agents onto a full
+        link).
+        """
+        occupancy = self.dnl.edge_occupancy.float()
+        capacity = self.dnl.storage_capacity.float().clamp(min=1.0)
+        return occupancy / capacity
