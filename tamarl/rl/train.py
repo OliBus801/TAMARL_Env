@@ -170,7 +170,7 @@ def _compute_stats(env: DTAMarkovGameEnv, cumulative_rewards: dict, n_decisions:
         'mean_travel_time': mean_tt,
         'arrival_rate': arr_rate,
         'mean_reward': mean_reward,
-        'episode_length': env.dnl.current_step,
+        'episode_length': env.dnl.current_step - getattr(env, '_start_step', 0),
         'n_decisions': n_decisions,
         'tt_std': tt_stats['std'],
         'tt_min': tt_stats['min'],
@@ -205,6 +205,7 @@ def train(
     population_filter: Optional[str] = None,
     n_episodes: int = 5,
     max_steps: int = 86400,
+    hours: Optional[tuple] = None,
     timestep: float = 1.0,
     device: str = "cpu",
     seed: Optional[int] = None,
@@ -272,6 +273,7 @@ def train(
         'population_filter': population_filter,
         'n_episodes': n_episodes,
         'max_steps': max_steps,
+        'hours': hours,
         'timestep': timestep,
         'device': device,
         'seed': seed,
@@ -334,6 +336,8 @@ def train(
     print(f"  Population:    {population_filter}")
     print(f"  Agent:         {agent_type}")
     print(f"  Episodes:      {n_episodes} | Max steps: {max_steps}")
+    if hours:
+        print(f"  Simulation Hours: {hours[0]} to {hours[1]}")
     print(f"  Log interval:  every {log_interval} episodes")
     print(f"  Device:        {device} | Seed: {seed}")
     if agent_type == 'qlearning':
@@ -370,6 +374,7 @@ def train(
         population_filter=population_filter,
         timestep=timestep,
         max_steps=max_steps,
+        hours=hours,
         device=device,
         seed=seed,
         track_events=need_events,
@@ -733,6 +738,9 @@ def load_config(config_path: str) -> dict:
         if json_key in tr:
             kwargs[kwarg_key] = tr[json_key]
 
+    if "hours" in tr:
+        kwargs["hours"] = tuple(tr["hours"]) if tr["hours"] is not None else None
+
     # ── Q-Learning ──
     ql = cfg.get("q_learning", {})
     _ql_map = {
@@ -824,6 +832,7 @@ def _build_parser() -> argparse.ArgumentParser:
     # Training
     parser.add_argument("--episodes", type=int, default=None, help="Number of episodes")
     parser.add_argument("--max_steps", type=int, default=None, help="Max ticks per episode")
+    parser.add_argument("--hours", nargs=2, type=float, metavar=("START", "END"), default=None, help="Start and end hours for the simulation (e.g. --hours 7 9)")
     parser.add_argument("--timestep", type=float, default=None, help="Simulation timestep (s)")
     parser.add_argument("--device", default=None, help="Device ('cpu' or 'cuda')")
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
@@ -889,6 +898,7 @@ _CLI_TO_KWARGS = {
     "agent": "agent_type",
     "episodes": "n_episodes",
     "max_steps": "max_steps",
+    "hours": "hours",
     "timestep": "timestep",
     "device": "device",
     "seed": "seed",

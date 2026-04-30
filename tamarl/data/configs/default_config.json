@@ -10,6 +10,7 @@
         "top_k_paths": 3,
         "episodes": 5,
         "max_steps": 86400,
+        "hours": null,
         "timestep": 1.0,
         "device": "cpu",
         "seed": null

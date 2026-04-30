@@ -27,8 +27,8 @@ class Rewarder:
         # Sum of all completed legs' TT
         tt_sum = self.dnl.leg_metrics[:, :, 1].sum(dim=1)
         
-        # Add active current leg (en-route or waiting for route)
-        active_mask = (self.dnl.status == 0) | (self.dnl.status == 1) | (self.dnl.status == 2)
+        # Add active current leg (en-route)
+        active_mask = (self.dnl.status == 1) | (self.dnl.status == 2)
         c_leg = self.dnl.current_leg
         deps = self.dnl.leg_departure_times.gather(1, c_leg.unsqueeze(1)).squeeze(1)
         

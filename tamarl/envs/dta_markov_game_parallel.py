@@ -48,6 +48,7 @@ class DTAMarkovGameEnv(ParallelEnv):
         timestep: float = 1.0,
         scale_factor: float = 1.0,
         max_steps: int = 3600,
+        hours: Optional[tuple] = None,
         device: str = "cpu",
         seed: Optional[int] = None,
         stuck_threshold: int = 10,
@@ -61,7 +62,12 @@ class DTAMarkovGameEnv(ParallelEnv):
         self._population_filter = population_filter
         self._timestep = timestep
         self._scale_factor = scale_factor
-        self._max_steps = max_steps
+        if hours is not None:
+            self._start_step = int(hours[0] * 3600)
+            self._max_steps = int(hours[1] * 3600)
+        else:
+            self._start_step = 0
+            self._max_steps = max_steps
         self._device = device
         self._seed = seed
         self._stuck_threshold = stuck_threshold
@@ -97,7 +103,7 @@ class DTAMarkovGameEnv(ParallelEnv):
         # Components
         self._scheduler = DecisionScheduler(self.dnl)
         self._action_mgr = ActionManager(self.dnl)
-        self._obs_builder = ObservationBuilder(self.dnl, max_steps=max_steps)
+        self._obs_builder = ObservationBuilder(self.dnl, max_steps=self._max_steps)
         self._rewarder = Rewarder(self.dnl)
         
         # ── OD pairs (computed once, used by Q-learning) ──
@@ -209,6 +215,9 @@ class DTAMarkovGameEnv(ParallelEnv):
         self.dnl.reset()
         if seed is not None:
             self.dnl.rng.manual_seed(seed)
+            
+        if self._start_step > 0:
+            self.dnl.current_step = self._start_step
         
         N = self.dnl.num_agents
         
