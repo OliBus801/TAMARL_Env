@@ -15,6 +15,7 @@ import sys
 import psutil
 import datetime
 import gc
+import pandas as pd
 
 from tamarl.core.jax_dnl import JaxDNL, create_params
 
@@ -165,7 +166,7 @@ def parse_population(pop_file, link_id_to_idx):
 
 
 def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_factor=1.0,
-                  start_hour=0, end_hour=24, seed=None, track_events=True):
+                  start_hour=0, end_hour=24, seed=None, track_events=True, output_folder="output"):
     process = psutil.Process(os.getpid())
 
     # 1. Locate files
@@ -193,6 +194,10 @@ def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_facto
 
     print(f"Selected Network: {os.path.basename(network_file)}")
     print(f"Selected Population: {os.path.basename(population_file)}")
+
+    # 1b. Setup Output Directory
+    output_dir = os.path.join(root_folder, output_folder)
+    os.makedirs(output_dir, exist_ok=True)
 
     # 2. Parse
     node_map, edges_data, link_id_to_idx = parse_network(network_file, scale_factor, timestep)
@@ -314,6 +319,20 @@ def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_facto
     mem_mb = process.memory_info().rss / 1024 / 1024
     print(f"\nPeak RAM: {mem_mb:.2f} MB")
 
+    # Save metrics
+    avg_speed = metrics['avg_travel_dist'] / metrics['avg_travel_time'] if metrics['avg_travel_time'] > 0 else 0.0
+    avg_metrics = pd.DataFrame({
+        'avg_trav_dist': [metrics['avg_travel_dist']],
+        'avg_trav_time': [metrics['avg_travel_time']],
+        'avg_trav_speed': [avg_speed],
+        'compute_time': [sim_end - sim_start],
+        'peak_memory': [mem_mb],
+        'peak_vram': [0.0],  # JAX CPU doesn't have VRAM metric easily accessible here
+    })
+    
+    avg_metrics.to_csv(os.path.join(output_dir, "average_metrics.csv"), index=False)
+    print(f"Saved average metrics to {os.path.join(output_dir, 'average_metrics.csv')}")
+
     # Events (if tracked)
     if is_eval:
         events = dnl.get_events()
@@ -329,6 +348,7 @@ if __name__ == "__main__":
     parser.add_argument("--timestep", type=float, default=1)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--track_events", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--output_folder", help="Output folder for results.", default="output")
 
     args = parser.parse_args()
     if not os.path.exists(args.root_folder):
@@ -339,4 +359,5 @@ if __name__ == "__main__":
             timestep=args.timestep, scale_factor=args.scale_factor,
             start_hour=args.hours[0], end_hour=args.hours[1],
             seed=args.seed, track_events=args.track_events,
+            output_folder=args.output_folder,
         )
