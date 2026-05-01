@@ -140,16 +140,13 @@ class ObservationBuilder:
         raw_density = occ / cap
         
         # Discretise into 3 states: free (0.0), resistance (1.0), jam (2.0)
-        discrete_density = torch.zeros_like(raw_density)
-        discrete_density[raw_density >= self.FREE_THRESH] = 1.0
-        discrete_density[raw_density > self.JAM_THRESH] = 2.0
-        
-        occupancies = torch.where(valid_mask, discrete_density,
-                                  torch.zeros_like(discrete_density))  # [K, max_deg]
+        boundaries = torch.tensor([self.FREE_THRESH, self.JAM_THRESH], device=dnl.device)
+        occupancies = torch.bucketize(raw_density, boundaries).float()
+        occupancies.masked_fill_(~valid_mask, 0.0)                     # [K, max_deg]
 
         # Free-flow times  ──  vectorised gather
         ff = self._ff_norm[safe_edges]                                 # [K, max_deg]
-        ff_times = torch.where(valid_mask, ff, torch.zeros_like(ff))   # [K, max_deg]
+        ff_times = ff.masked_fill(~valid_mask, 0.0)                    # [K, max_deg]
 
         # AoN GPS Indicator ── one-hot mapping
         aon_idx = self._aon_edge_idx[nodes, dests]                     # [K]
@@ -190,7 +187,7 @@ class ObservationBuilder:
         safe_edges = out_edges.clamp(min=0)
 
         ff = self._ff_norm[safe_edges]
-        ff_times = torch.where(valid_mask, ff, torch.zeros_like(ff))
+        ff_times = ff.masked_fill(~valid_mask, 0.0)
 
         # AoN GPS Indicator
         aon_idx = self._aon_edge_idx[origin_nodes, dests]

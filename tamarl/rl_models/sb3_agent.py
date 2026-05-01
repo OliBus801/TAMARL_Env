@@ -30,6 +30,96 @@ from tamarl.envs.sb3_gymnasium_wrapper import DTASingleAgentWrapper
 from tamarl.envs.dta_markov_game_parallel import DTAMarkovGameEnv
 
 
+
+class TorchCircularBuffer:
+    def __init__(self, capacity: int, obs_dim: int, n_actions: int, device: str):
+        self.capacity = capacity
+        self.device = device
+        self.obs = torch.zeros((capacity, obs_dim), dtype=torch.float32, device=device)
+        self.action = torch.zeros((capacity,), dtype=torch.long, device=device)
+        self.reward = torch.zeros((capacity,), dtype=torch.float32, device=device)
+        self.next_obs = torch.zeros((capacity, obs_dim), dtype=torch.float32, device=device)
+        self.done = torch.zeros((capacity,), dtype=torch.bool, device=device)
+        self.mask = torch.zeros((capacity, n_actions), dtype=torch.bool, device=device)
+        
+        self.pos = 0
+        self.full = False
+
+    def add(self, obs, action, reward, next_obs, done, mask):
+        n = obs.shape[0]
+        if n == 0: return
+        
+        if n > self.capacity:
+            obs = obs[-self.capacity:]
+            action = action[-self.capacity:]
+            reward = reward[-self.capacity:]
+            next_obs = next_obs[-self.capacity:]
+            done = done[-self.capacity:]
+            mask = mask[-self.capacity:]
+            n = self.capacity
+            
+        if self.pos + n > self.capacity:
+            rem = self.capacity - self.pos
+            self.obs[self.pos:] = obs[:rem]
+            self.action[self.pos:] = action[:rem]
+            self.reward[self.pos:] = reward[:rem]
+            self.next_obs[self.pos:] = next_obs[:rem]
+            self.done[self.pos:] = done[:rem]
+            self.mask[self.pos:] = mask[:rem]
+            
+            self.pos = 0
+            self.full = True
+            
+            rem2 = n - rem
+            self.obs[:rem2] = obs[rem:]
+            self.action[:rem2] = action[rem:]
+            self.reward[:rem2] = reward[rem:]
+            self.next_obs[:rem2] = next_obs[rem:]
+            self.done[:rem2] = done[rem:]
+            self.mask[:rem2] = mask[rem:]
+            self.pos = rem2
+        else:
+            self.obs[self.pos:self.pos+n] = obs
+            self.action[self.pos:self.pos+n] = action
+            self.reward[self.pos:self.pos+n] = reward
+            self.next_obs[self.pos:self.pos+n] = next_obs
+            self.done[self.pos:self.pos+n] = done
+            self.mask[self.pos:self.pos+n] = mask
+            self.pos += n
+            if self.pos == self.capacity:
+                self.pos = 0
+                self.full = True
+
+    def __len__(self):
+        return self.capacity if self.full else self.pos
+
+    def sample(self, batch_size):
+        high = len(self)
+        indices = torch.randint(0, high, (batch_size,), device=self.device)
+        return (
+            self.obs[indices],
+            self.action[indices],
+            self.reward[indices],
+            self.next_obs[indices],
+            self.done[indices],
+            self.mask[indices]
+        )
+
+    def get_all(self):
+        high = len(self)
+        return (
+            self.obs[:high],
+            self.action[:high],
+            self.reward[:high],
+            self.next_obs[:high],
+            self.done[:high],
+            self.mask[:high]
+        )
+
+    def clear(self):
+        self.pos = 0
+        self.full = False
+
 class SB3Agent:
     """Wrapper that adapts SB3 algorithms to the TAMARL training loop.
 
@@ -77,7 +167,11 @@ class SB3Agent:
         policy_kwargs = dict(net_arch=net_arch)
 
         # Single shared model for ALL agents
-        self._transitions_buffer: list = []
+        obs_dim = self._gym_env.observation_space.shape[0]
+        n_actions = self._gym_env.action_space.n
+        capacity = buffer_size if algorithm == "dqn" else n_steps * batch_size
+        if capacity <= 0: capacity = 1024
+        self._buffer = TorchCircularBuffer(capacity, obs_dim, n_actions, device)
 
         if algorithm == "ppo":
             self.model = MaskablePPO(
@@ -328,28 +422,22 @@ class SB3Agent:
                     if pos.numel() > 0:
                         masks_next[j] = masks_new[pos[0]]
 
-            # Store transitions into single shared buffer
-            for j in range(store_idx.numel()):
-                scaled_reward = float(store_reward[j].item()) / float(self.env._max_steps)
-                self._transitions_buffer.append({
-                    "obs": store_obs[j].cpu().numpy(),
-                    "action": int(store_act[j].item()),
-                    "reward": scaled_reward,
-                    "obs_next": obs_next[j].cpu().numpy(),
-                    "done": bool(store_done[j].item()),
-                    "mask": masks_next[j].cpu().numpy(),
-                })
-                self._step_count += 1
-                
-                # Reset state
-                aidx = store_idx[j].item()
-                self._accumulated_reward_t[aidx] = 0.0
-                if store_done[j]:
-                    self._has_prev_t[aidx] = False
-                    self._prev_actions_t[aidx] = -1
+            # Store transitions into TorchCircularBuffer
+            store_reward = store_reward / float(self.env._max_steps)
+            self._buffer.add(
+                store_obs, store_act, store_reward, obs_next, store_done, masks_next
+            )
+            self._step_count += store_idx.numel()
+
+            # Reset state
+            self._accumulated_reward_t[store_idx] = 0.0
+            done_idx = store_idx[store_done]
+            if done_idx.numel() > 0:
+                self._has_prev_t[done_idx] = False
+                self._prev_actions_t[done_idx] = -1
 
         # Trigger model update when buffer is large enough
-        if len(self._transitions_buffer) >= self._update_every:
+        if len(self._buffer) >= self._update_every:
             self._train_from_buffer()
 
     # ══════════════════════════════════════════════════════════════════
@@ -467,18 +555,16 @@ class SB3Agent:
             accum_r = self._accumulated_reward[agent_id]
             scaled_reward = accum_r / float(self.env._max_steps)
 
-            self._transitions_buffer.append(
-                {
-                    "obs": self._prev_obs[agent_id],
-                    "action": self._prev_action[agent_id],
-                    "reward": scaled_reward,
-                    "obs_next": obs_next,
-                    "done": done,
-                    "mask": mask_next if mask_next is not None else np.ones(
-                        self._gym_env.action_space.n, dtype=np.int8
-                    ),
-                }
-            )
+            device = self.model.device
+            obs_t = torch.as_tensor(self._prev_obs[agent_id], dtype=torch.float32, device=device).unsqueeze(0)
+            act_t = torch.tensor([self._prev_action[agent_id]], dtype=torch.long, device=device)
+            rew_t = torch.tensor([scaled_reward], dtype=torch.float32, device=device)
+            next_t = torch.as_tensor(obs_next, dtype=torch.float32, device=device).unsqueeze(0)
+            done_t = torch.tensor([done], dtype=torch.bool, device=device)
+            m_np = mask_next if mask_next is not None else np.ones(self._gym_env.action_space.n, dtype=np.int8)
+            mask_t = torch.as_tensor(m_np, dtype=torch.bool, device=device).unsqueeze(0)
+
+            self._buffer.add(obs_t, act_t, rew_t, next_t, done_t, mask_t)
 
             self._accumulated_reward[agent_id] = 0.0
             self._step_count += 1
@@ -488,7 +574,7 @@ class SB3Agent:
                 self._prev_action.pop(agent_id, None)
                 self._accumulated_reward.pop(agent_id, None)
 
-        if len(self._transitions_buffer) >= self._update_every:
+        if len(self._buffer) >= self._update_every:
             self._train_from_buffer()
 
     # ══════════════════════════════════════════════════════════════════
@@ -497,51 +583,25 @@ class SB3Agent:
 
     def _train_from_buffer(self):
         """Train the single shared model from collected transitions."""
-        if not self._transitions_buffer:
+        if len(self._buffer) == 0:
             return
 
         if self.algorithm_name == "dqn":
-            self._train_dqn(self.model, self._transitions_buffer)
-            # Off-policy: keep replay buffer up to max size
-            max_size = self.model.buffer_size
-            if len(self._transitions_buffer) > max_size:
-                self._transitions_buffer = self._transitions_buffer[-max_size:]
-                
+            self._train_dqn(self.model)
         elif self.algorithm_name in ("ppo", "a2c"):
-            self._train_on_policy(self.model, self._transitions_buffer)
+            self._train_on_policy(self.model)
             # On-policy: clear rollout buffer completely
-            self._transitions_buffer.clear()
+            self._buffer.clear()
 
-    def _train_dqn(self, model, buffer):
+    def _train_dqn(self, model):
         """Train DQN from buffered transitions."""
 
         policy = model.policy
         policy.set_training_mode(True)
 
-        obs_array = np.array([t["obs"] for t in buffer])
-        actions_array = np.array([t["action"] for t in buffer])
-        rewards_array = np.array([t["reward"] for t in buffer])
-        dones_array = np.array([t["done"] for t in buffer])
-        next_obs_array = np.array([t["obs_next"] for t in buffer])
-        masks_array = np.array([t["mask"] for t in buffer])
-
-        obs_t = torch.as_tensor(obs_array, dtype=torch.float32, device=model.device)
-        actions_t = torch.as_tensor(actions_array, dtype=torch.long, device=model.device).unsqueeze(-1)
-        rewards_t = torch.as_tensor(rewards_array, dtype=torch.float32, device=model.device)
-        dones_t = torch.as_tensor(dones_array, dtype=torch.float32, device=model.device)
-        next_obs_t = torch.as_tensor(next_obs_array, dtype=torch.float32, device=model.device)
-        masks_t = torch.as_tensor(masks_array, dtype=torch.bool, device=model.device)
-
-        n = len(buffer)
-        batch_size = min(n, model.batch_size)
-        indices = np.random.choice(n, batch_size, replace=False)
-
-        obs_batch = obs_t[indices]
-        actions_batch = actions_t[indices]
-        rewards_batch = rewards_t[indices]
-        dones_batch = dones_t[indices]
-        next_obs_batch = next_obs_t[indices]
-        masks_batch = masks_t[indices]
+        batch_size = min(len(self._buffer), model.batch_size)
+        obs_batch, actions_batch, rewards_batch, next_obs_batch, dones_batch, masks_batch = self._buffer.sample(batch_size)
+        actions_batch = actions_batch.unsqueeze(-1)
 
         with torch.no_grad():
             next_q_values = model.q_net_target(next_obs_batch)
@@ -550,7 +610,7 @@ class SB3Agent:
             next_q_max = torch.where(
                 torch.isinf(next_q_max), torch.zeros_like(next_q_max), next_q_max
             )
-            target_q = rewards_batch + model.gamma * next_q_max * (1.0 - dones_batch)
+            target_q = rewards_batch + model.gamma * next_q_max * (~dones_batch).float()
 
         current_q_all = model.q_net(obs_batch)
         current_q = current_q_all.gather(1, actions_batch).squeeze(-1)
@@ -570,29 +630,17 @@ class SB3Agent:
 
         policy.set_training_mode(False)
 
-    def _train_on_policy(self, model, buffer):
+    def _train_on_policy(self, model):
         """Train PPO/A2C from buffered transitions."""
 
         policy = model.policy
         policy.set_training_mode(True)
 
-        obs_array = np.array([t["obs"] for t in buffer])
-        actions_array = np.array([t["action"] for t in buffer])
-        rewards_array = np.array([t["reward"] for t in buffer])
-        dones_array = np.array([t["done"] for t in buffer])
-        next_obs_array = np.array([t["obs_next"] for t in buffer])
-        masks_array = np.array([t["mask"] for t in buffer])
-
-        obs_t = torch.as_tensor(obs_array, dtype=torch.float32, device=model.device)
-        actions_t = torch.as_tensor(actions_array, dtype=torch.long, device=model.device)
-        rewards_t = torch.as_tensor(rewards_array, dtype=torch.float32, device=model.device)
-        dones_t = torch.as_tensor(dones_array, dtype=torch.float32, device=model.device)
-        next_obs_t = torch.as_tensor(next_obs_array, dtype=torch.float32, device=model.device)
-        masks_t = torch.as_tensor(masks_array, dtype=torch.bool, device=model.device)
+        obs_t, actions_t, rewards_t, next_obs_t, dones_t, masks_t = self._buffer.get_all()
 
         with torch.no_grad():
             next_values = policy.predict_values(next_obs_t).squeeze(-1)
-            returns = rewards_t + model.gamma * next_values * (1.0 - dones_t)
+            returns = rewards_t + model.gamma * next_values * (~dones_t).float()
             values = policy.predict_values(obs_t).squeeze(-1)
             advantages = returns - values
 
