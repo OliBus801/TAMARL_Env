@@ -189,24 +189,23 @@ class TorchDNLMATSim:
              
         self.start_time.copy_(self.departure_times)
         
+        if first_edges is not None:
+            self._all_first_edges = first_edges.to(device).long()
+            self._first_edges = self._all_first_edges[:, 0]
+
+        if destinations is not None:
+            self.destinations = destinations.to(device).long()
+        else:
+            self.destinations = None
+
         # Pre-set first edge as next_edge for waiting agents
         if not self.rl_mode:
             self.next_edge[:] = self.paths[:, 0]
         else:
             # RL mode: first_edges must be provided
-            if first_edges is not None:
-                self._all_first_edges = first_edges.to(device).long()
-                # Use only the first leg element for initialization [A]
-                self._first_edges = self._all_first_edges[:, 0]
-            else:
+            if first_edges is None:
                 raise ValueError("first_edges is mandatory in RL mode (paths=None).")
             self.next_edge[:] = self._first_edges
-            
-            # Destinations for observation building
-            if destinations is not None:
-                self.destinations = destinations.to(device).long()
-            else:
-                self.destinations = None
             
             # Build outgoing-edges-per-node lookup for action masking
             self._build_node_out_edges()

@@ -1,0 +1,58 @@
+         2950432 function calls (2950398 primitive calls) in 53.049 seconds
+
+   Ordered by: cumulative time
+   List reduced from 537 to 50 due to restriction <50>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+      7/6    0.621    0.089  112.784   18.797 /home/olibuss/miniforge/envs/ml/lib/python3.12/threading.py:637(wait)
+      7/6    0.408    0.058   72.782   12.130 /home/olibuss/miniforge/envs/ml/lib/python3.12/threading.py:323(wait)
+      2/1    0.000    0.000   52.783   52.783 /home/olibuss/Documents/Code/TAMARL_Env/tamarl/rl/train_bandit.py:107(train)
+        1    0.000    0.000   52.776   52.776 /home/olibuss/Documents/Code/TAMARL_Env/tamarl/rl/train_bandit.py:31(run_episode)
+    86400    1.059    0.000   50.763    0.001 /home/olibuss/Documents/Code/TAMARL_Env/tamarl/core/dnl_matsim.py:839(step)
+    86400   25.947    0.000   42.350    0.000 /home/olibuss/Documents/Code/TAMARL_Env/tamarl/core/dnl_matsim.py:673(_schedule_demand_C)
+        1    0.000    0.000   22.775   22.775 /home/olibuss/Documents/Code/TAMARL_Env/tamarl/envs/vehicle_level_wrapper.py:189(step)
+    86415    7.871    0.000    7.871    0.000 {built-in method torch.argsort}
+    86400    3.079    0.000    4.368    0.000 /home/olibuss/Documents/Code/TAMARL_Env/tamarl/core/dnl_matsim.py:361(_process_nodes_A)
+   345600    4.133    0.000    4.133    0.000 {built-in method torch.nonzero}
+        1    0.057    0.057    2.774    2.774 /home/olibuss/Documents/Code/TAMARL_Env/tamarl/envs/dta_bandit_env.py:123(step)
+    86400    1.650    0.000    2.183    0.000 /home/olibuss/Documents/Code/TAMARL_Env/tamarl/core/dnl_matsim.py:521(_process_links_B)
+    86415    1.107    0.000    1.107    0.000 {built-in method torch.cummax}
+    86421    1.008    0.000    1.008    0.000 {built-in method torch.arange}
+   172836    0.874    0.000    0.874    0.000 {method 'long' of 'torch._C.TensorBase' objects}
+    86400    0.540    0.000    0.803    0.000 /home/olibuss/Documents/Code/TAMARL_Env/tamarl/core/dnl_matsim.py:347(_update_all_flow_accumulation)
+    86400    0.780    0.000    0.780    0.000 {method 'all' of 'torch._C.TensorBase' objects}
+    86406    0.660    0.000    0.660    0.000 {method 'any' of 'torch._C.TensorBase' objects}
+    86409    0.559    0.000    0.559    0.000 {built-in method torch.ceil}
+    86431    0.470    0.000    0.470    0.000 {built-in method torch.zeros}
+    86409    0.453    0.000    0.453    0.000 {built-in method torch.clamp}
+    86415    0.448    0.000    0.448    0.000 {built-in method torch.ones}
+   172840    0.334    0.000    0.334    0.000 {method 'scatter_add_' of 'torch._C.TensorBase' objects}
+    86400    0.263    0.000    0.263    0.000 {built-in method torch.minimum}
+        1    0.001    0.001    0.242    0.242 /home/olibuss/Documents/Code/TAMARL_Env/tamarl/envs/dta_bandit_env.py:35(__init__)
+        1    0.050    0.050    0.241    0.241 /home/olibuss/Documents/Code/TAMARL_Env/tamarl/envs/scenario_loader.py:177(load_scenario)
+        1    0.034    0.034    0.187    0.187 /home/olibuss/Documents/Code/TAMARL_Env/tamarl/envs/scenario_loader.py:83(parse_population)
+   432024    0.153    0.000    0.153    0.000 {method 'numel' of 'torch._C.TensorBase' objects}
+   172852    0.153    0.000    0.153    0.000 {method 'size' of 'torch._C.TensorBase' objects}
+    91402    0.145    0.000    0.145    0.000 {method 'item' of 'torch._C.TensorBase' objects}
+    30027    0.005    0.000    0.134    0.000 /home/olibuss/miniforge/envs/ml/lib/python3.12/xml/etree/ElementTree.py:1233(iterator)
+      123    0.076    0.001    0.111    0.001 /home/olibuss/miniforge/envs/ml/lib/python3.12/xml/etree/ElementTree.py:1278(feed)
+      123    0.035    0.000    0.035    0.000 {method 'feed' of 'xml.etree.ElementTree.XMLParser' objects}
+        1    0.014    0.014    0.022    0.022 /home/olibuss/Documents/Code/TAMARL_Env/tamarl/envs/vehicle_level_wrapper.py:48(__init__)
+    30152    0.010    0.000    0.017    0.000 /home/olibuss/miniforge/envs/ml/lib/python3.12/xml/etree/ElementTree.py:1302(read_events)
+     5000    0.004    0.000    0.005    0.000 /home/olibuss/Documents/Code/TAMARL_Env/tamarl/envs/scenario_loader.py:95(time_to_sec)
+    30105    0.005    0.000    0.005    0.000 {method 'get' of 'xml.etree.ElementTree.Element' objects}
+    25244    0.004    0.000    0.004    0.000 {method 'append' of 'list' objects}
+    30025    0.003    0.000    0.003    0.000 {method 'popleft' of 'collections.deque' objects}
+    30162    0.003    0.000    0.003    0.000 {built-in method builtins.isinstance}
+        9    0.000    0.000    0.003    0.000 /home/olibuss/miniforge/envs/ml/lib/python3.12/site-packages/tqdm/std.py:716(write)
+       20    0.001    0.000    0.003    0.000 {built-in method builtins.next}
+       13    0.000    0.000    0.003    0.000 /home/olibuss/miniforge/envs/ml/lib/python3.12/site-packages/tqdm/std.py:1464(display)
+    30168    0.003    0.000    0.003    0.000 {built-in method builtins.len}
+       12    0.000    0.000    0.003    0.000 /home/olibuss/miniforge/envs/ml/lib/python3.12/site-packages/tqdm/std.py:1325(refresh)
+        9    0.000    0.000    0.003    0.000 /home/olibuss/miniforge/envs/ml/lib/python3.12/contextlib.py:141(__exit__)
+    10005    0.002    0.000    0.002    0.000 {method 'split' of 'str' objects}
+        3    0.000    0.000    0.002    0.001 /home/olibuss/miniforge/envs/ml/lib/python3.12/site-packages/numpy/lib/_arraysetops_impl.py:145(unique)
+       18    0.000    0.000    0.002    0.000 /home/olibuss/miniforge/envs/ml/lib/python3.12/site-packages/tqdm/std.py:725(external_write_mode)
+       13    0.000    0.000    0.002    0.000 /home/olibuss/miniforge/envs/ml/lib/python3.12/site-packages/tqdm/std.py:1150(__str__)
+
+
