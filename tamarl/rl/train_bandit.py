@@ -24,8 +24,7 @@ from tamarl.envs.components.metrics import (
 from tamarl.envs.scenario_loader import load_scenario
 from tamarl.rl.wandb_logger import WandbLogger
 from tamarl.rl.render_helper import render_episode
-from tamarl.rl_models.random_agent import RandomAgent
-from tamarl.rl_models.sb3_agent import SB3Agent
+from tamarl.rl.agents.random_agent import RandomAgent
 
 
 def run_episode(env: VehicleLevelWrapper, agent, deterministic: bool = False):
@@ -270,7 +269,7 @@ def train(
             n_steps=sb3_n_steps,
         )
     elif agent_type == "epsilon_greedy":
-        from tamarl.rl_models.epsilon_greedy_agent import EpsilonGreedyAgent
+        from tamarl.rl.agents.epsilon_greedy_agent import EpsilonGreedyAgent
         agent = EpsilonGreedyAgent(
             epsilon_start=kwargs.get("epsilon_start", 1.0),
             epsilon_end=kwargs.get("epsilon_end", 0.05),
@@ -278,7 +277,7 @@ def train(
             seed=seed
         )
     elif agent_type == "ucb":
-        from tamarl.rl_models.ucb_agent import UCBAgent
+        from tamarl.rl.agents.ucb_agent import UCBAgent
         agent = UCBAgent(
             num_agents=env.num_envs,
             k_paths=top_k_paths,
@@ -286,7 +285,7 @@ def train(
             device=device
         )
     else:
-        from tamarl.rl_models.random_agent import RandomAgent
+        from tamarl.rl.agents.random_agent import RandomAgent
         agent = RandomAgent(num_agents=env.num_envs, k=top_k_paths, seed=seed)
 
     print(f"Environment: {env.bandit.num_agents} agents, "
