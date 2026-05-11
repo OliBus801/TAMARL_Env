@@ -33,7 +33,7 @@ from gymnasium import spaces
 from gymnasium.vector import VectorEnv
 
 from tamarl.envs.dta_bandit_env import DTABanditEnv
-from tamarl.envs.components.path_enumerator import enumerate_top_k_paths
+from tamarl.envs.components.path_enumerator import get_or_compute_top_k_paths
 from tamarl.envs.components.metrics import compute_empirical_nash_metrics
 
 
@@ -132,7 +132,8 @@ class CentralizedLevelWrapper(VectorEnv):
             scenario.edge_static[:, 4] / timestep
         ).numpy().astype(np.float64)
 
-        paths_dict = enumerate_top_k_paths(
+        paths_dict = get_or_compute_top_k_paths(
+            scenario_dir=bandit._scenario_path,
             num_nodes=scenario.num_nodes,
             edge_endpoints=edge_eps,
             ff_times=ff_times,
@@ -176,16 +177,12 @@ class CentralizedLevelWrapper(VectorEnv):
         self.fftt_matrix = np.zeros((num_unique_od, top_k), dtype=np.float32)
         edge_static_np = scenario.edge_static.numpy()
         for od_idx in range(num_unique_od):
-            first_leg_idx = np.where(inverse_od == od_idx)[0][0]
-            fe_id = self.leg_first_edges[first_leg_idx]
-            fe_fftt = edge_static_np[fe_id, 4]
-
             for k_idx in range(top_k):
                 if masks_np[od_idx, k_idx]:
                     path = cand_np[od_idx, k_idx]
                     valid_path = path[path != -1]
                     path_fftt = edge_static_np[valid_path, 4].sum()
-                    self.fftt_matrix[od_idx, k_idx] = fe_fftt + path_fftt
+                    self.fftt_matrix[od_idx, k_idx] = path_fftt
                 else:
                     self.fftt_matrix[od_idx, k_idx] = np.inf
 
