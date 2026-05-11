@@ -4,7 +4,6 @@ from typing import Dict, List, Optional
 import numpy as np
 import torch
 from tamarl.core.dnl_matsim import TorchDNLMATSim
-from tamarl.envs.components.time_dependent_dijkstra import build_adjacency_list, compute_td_shortest_paths
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -260,86 +259,94 @@ def _run_episode_with_deviation(env, policy, deviant_agent: str, rng) -> Optiona
         return float(valid_tt.sum().item() * env.dnl.dt)
     return None
 
-# ── Relative Gap ────────────────────────────────────────────────────────────
+# ── Nash Regret & Relative Gap (Empirical O(N)) ─────────────────────────────
 
-def compute_relative_gap(dnl: TorchDNLMATSim, link_tt_interval: float = 300.0) -> float:
-    """Computes the Relative Gap (RGap) metric over all arrived agents.
-    
-    RGap = sum(t_i - t_i_SP) / sum(t_i)
+
+
+def compute_empirical_nash_metrics(
+    travel_times: np.ndarray, 
+    actions: np.ndarray, 
+    od_indices: np.ndarray, 
+    num_od_pairs: int, 
+    k_paths: int, 
+    fftt_matrix: np.ndarray,
+    epsilon_threshold: float = 60.0
+) -> dict:
     """
-    if not getattr(dnl, 'collect_link_tt', False):
-        return float('inf')
+    Calcule le Nash Regret et le Relative Gap en O(N) via agrégation vectorisée.
+    Respecte l'architecture SOA (Structure of Arrays) de TAMARL-Env.
+    
+    Args:
+        travel_times: [N] Temps de trajet réels vécus par les agents (en secondes).
+        actions: [N] Index du chemin choisi (de 0 à K-1).
+        od_indices: [N] Index de la paire OD à laquelle appartient l'agent.
+        num_od_pairs: Nombre total de paires OD uniques dans le scénario.
+        k_paths: Nombre maximal de chemins (K) disponibles par OD.
+        fftt_matrix: [num_od_pairs, K] Temps en Free-Flow pré-calculés statiquement.
+    """
+    N = len(travel_times)
+    if N == 0:
+        return {
+            'relative_gap': 0.0,
+            'mean_regret': 0.0,
+            'max_regret': 0.0,
+            'epsilon_compliance_rate': 0.0
+        }
+    
+    # -------------------------------------------------------------------------
+    # ÉTAPE 1 : Construction de la Matrice Empirique [OD, K]
+    # -------------------------------------------------------------------------
+    # Création d'un index plat 1D pour chaque combinaison unique (OD, Action)
+    flat_indices = od_indices * k_paths + actions
+    max_flat_idx = num_od_pairs * k_paths
+    
+    # Agrégation O(N) : Somme des temps et compte des véhicules par route
+    sum_tt = np.bincount(flat_indices, weights=travel_times, minlength=max_flat_idx)
+    counts = np.bincount(flat_indices, minlength=max_flat_idx)
+    
+    # Calcul de la moyenne (on ignore temporairement les avertissements de division par zéro)
+    with np.errstate(invalid='ignore'):
+        mean_tt_flat = sum_tt / counts
         
-    tt_matrix = dnl.get_dynamic_link_travel_times()
-    if tt_matrix is None:
-        return float('inf')
-        
-    tt_matrix_np = tt_matrix.cpu().numpy()
+    # On remodèle en grille 2D [num_od_pairs, K]
+    empirical_matrix = mean_tt_flat.reshape(num_od_pairs, k_paths)
     
-    done_mask = (dnl.status == 3).cpu().numpy()
-    if not done_mask.any():
-        return 0.0
-        
-    done_agents = np.where(done_mask)[0]
-    leg_metrics = dnl.leg_metrics.cpu().numpy()
+    # Les routes où Count == 0 renvoient NaN. On les remplace par le temps Free-Flow (FFTT)
+    empty_routes = counts.reshape(num_od_pairs, k_paths) == 0
+    empirical_matrix[empty_routes] = fftt_matrix[empty_routes]
     
-    total_real_tt = 0.0
+    # -------------------------------------------------------------------------
+    # ÉTAPE 2 : Évaluation des Alternatives (Best-Response)
+    # -------------------------------------------------------------------------
+    # Chaque agent regarde la ligne de sa propre paire OD : matrice de taille [N, K]
+    agent_options = empirical_matrix[od_indices] 
     
-    start_times_list = []
-    origins_list = []
-    destinations_list = []
+    # RÈGLE D'OR : Un agent ne peut pas se comparer avec la route qu'il a lui-même congestionnée.
+    # On masque le chemin qu'il a réellement pris en mettant un coût infini.
+    agent_options[np.arange(N), actions] = np.inf
     
-    all_first_edges = dnl._all_first_edges.cpu().numpy()
-    dests = dnl.destinations.cpu().numpy()
-    edge_endpoints = dnl.edge_endpoints.cpu().numpy()
-    leg_departure_times = dnl.leg_departure_times.cpu().numpy()
-    num_legs = dnl.num_legs.cpu().numpy()
+    # Le meilleur temps alternatif est le minimum des K-1 chemins restants
+    best_alt_tt = np.min(agent_options, axis=1)
     
-    for agent_id in done_agents:
-        for leg_idx in range(num_legs[agent_id]):
-            real_tt = leg_metrics[agent_id, leg_idx, 1]
-            if real_tt <= 0:
-                continue
-                
-            first_edge = all_first_edges[agent_id, leg_idx]
-            # MATSim spawns agents into the capacity buffer of the their first link,
-            # meaning their physical start node is the destination of the first link.
-            origin_node = edge_endpoints[first_edge, 1]
-            dest_node = dests[agent_id, leg_idx]
-            dep_time_steps = leg_departure_times[agent_id, leg_idx]
-            dep_time_sec = dep_time_steps * dnl.dt
-            
-            start_times_list.append(dep_time_sec)
-            origins_list.append(origin_node)
-            destinations_list.append(dest_node)
-            
-            # Since real_tt is already in seconds, just add it
-            total_real_tt += real_tt
-            
-    if len(start_times_list) == 0 or total_real_tt <= 0:
-        return 0.0
-        
-    start_times_np = np.array(start_times_list, dtype=np.float32)
-    origins_np = np.array(origins_list, dtype=np.int32)
-    dests_np = np.array(destinations_list, dtype=np.int32)
+    # Le Regret = (Temps vécu) - (Meilleure alternative possible)
+    # Plafonné à 0 (l'agent a fait le meilleur choix possible)
+    regrets = np.maximum(0.0, travel_times - best_alt_tt)
     
-    adj = build_adjacency_list(dnl.num_nodes, edge_endpoints)
-    t_sp, _ = compute_td_shortest_paths(
-        adj=adj,
-        start_times=start_times_np,
-        origin_nodes=origins_np,
-        destination_nodes=dests_np,
-        tt_matrix=tt_matrix_np,
-        interval=float(link_tt_interval)
-    )
+    # -------------------------------------------------------------------------
+    # ÉTAPE 3 : Synthèse des Métriques pour WandB / Publication
+    # -------------------------------------------------------------------------
+    total_regret = np.sum(regrets)
+    total_tt = np.sum(travel_times)
     
-    # Exclude unreachable agents from the gap, though in a sane scenario all matched
-    valid_sp_mask = (t_sp != float('inf'))
-    if not valid_sp_mask.any():
-        return 0.0
-        
-    total_sp_tt = np.sum(t_sp[valid_sp_mask])
+    # Nouveau calcul robuste du Relative Gap
+    rgap = total_regret / total_tt if total_tt > 0 else 0.0
     
-    # Ensure RGap doesn't become negative due to precision
-    rgap = max(0.0, (total_real_tt - float(total_sp_tt)) / total_real_tt)
-    return float(rgap)
+    # Taux de conformité epsilon-Nash (pourcentage d'agents satisfaits de leur choix)
+    epsilon_compliance = np.mean(regrets <= epsilon_threshold)
+    
+    return {
+        'relative_gap': float(rgap),
+        'mean_regret': float(np.mean(regrets)),
+        'max_regret': float(np.max(regrets)),
+        'epsilon_compliance_rate': float(epsilon_compliance)
+    }

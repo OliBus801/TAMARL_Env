@@ -1,37 +1,62 @@
-"""Random agent for the one-shot bandit DTA environment.
+"""Random agent — Agnostic to aggregation level.
 
-Each vehicle independently samples a uniform random route index
-from {0, ..., K-1}.  Compatible with VehicleLevelWrapper
-(gymnasium.vector.VectorEnv).
+Agent sans état qui sélectionne une route uniforme aléatoire parmi les
+routes valides pour chaque véhicule. Agnostique au niveau d'agrégation :
+il reçoit aggregation_indices [N] mais ne l'utilise pas (pas de paramètres).
 """
 from __future__ import annotations
 
 from typing import Optional
 
-import numpy as np
+import torch
 
 
 class RandomAgent:
-    """Uniform random route selector for the VehicleLevelWrapper.
+    """Sélecteur de route uniforme aléatoire.
 
-    At each step, every vehicle picks a random path index uniformly
-    from the K candidate routes available for its OD pair.
+    À chaque pas, chaque véhicule choisit une route aléatoire parmi les
+    K chemins candidates valides pour sa paire OD.
+
+    Compatible avec l'interface get_actions_batched (mode vectorisé).
 
     Args:
-        num_agents: Number of vehicles (A).
-        k: Number of candidate routes per OD pair.
-        seed: Optional RNG seed for reproducibility.
+        num_agents:  Nombre de véhicules N (conservé pour rétrocompatibilité).
+        k:           Nombre de routes candidates K.
+        seed:        Graine aléatoire pour la reproductibilité.
     """
 
     def __init__(self, num_agents: int, k: int, seed: Optional[int] = None):
         self.num_agents = num_agents
         self.k = k
-        self.rng = np.random.default_rng(seed)
+        if seed is not None:
+            torch.manual_seed(seed)
 
-    def act(self) -> np.ndarray:
-        """Sample a random route for every vehicle.
+    def get_actions_batched(
+        self,
+        obs: torch.Tensor,
+        masks: torch.Tensor,
+        aggregation_indices: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Échantillonne une route valide uniformément pour chaque véhicule.
+
+        Args:
+            obs:                  [N, K] — ignoré.
+            masks:                [N, K] masque booléen des routes valides.
+            aggregation_indices:  [N] — ignoré (agent sans paramètres).
 
         Returns:
-            actions: [A] int array with values in {0, ..., K-1}.
+            actions: [N] tenseur long.
         """
-        return self.rng.integers(0, self.k, size=self.num_agents)
+        # Distribution uniforme sur les routes valides
+        valid_probs = masks.float()
+        row_sums = valid_probs.sum(dim=1, keepdim=True).clamp(min=1e-6)
+        valid_probs = valid_probs / row_sums
+        return torch.multinomial(valid_probs, 1).squeeze(1)
+
+    def act(self) -> torch.Tensor:
+        """Rétrocompatibilité : tirage uniforme sans masque."""
+        return torch.randint(0, self.k, (self.num_agents,))
+
+    def __repr__(self) -> str:
+        return f"RandomAgent(N={self.num_agents}, K={self.k})"

@@ -43,6 +43,7 @@ class DTABanditEnv:
         seed: Optional[int] = None,
         stuck_threshold: int = 10,
         track_events: bool = False,
+        link_tt_interval: float = 300.0,
     ):
         self._scenario_path = scenario_path
         self._max_steps = max_steps
@@ -63,6 +64,7 @@ class DTABanditEnv:
         self._timestep = timestep
         self._stuck_threshold = stuck_threshold
         self._track_events = track_events
+        self.link_tt_interval = link_tt_interval
         self.collect_link_tt = False
 
         # DNL will be created/configured in reset()
@@ -102,23 +104,11 @@ class DTABanditEnv:
             seed=self._seed,
             stuck_threshold=self._stuck_threshold,
             track_events=self._track_events,
+            collect_link_tt=self.collect_link_tt,
+            link_tt_interval=self.link_tt_interval,
         )
 
         self.dnl.num_nodes = self.scenario.num_nodes
-
-        if self.collect_link_tt:
-            self.dnl.collect_link_tt = True
-            self.dnl.max_intervals = 100
-            self.dnl.interval_tt_sum = torch.zeros(
-                (self.dnl.max_intervals, self.dnl.num_edges),
-                device=self.dnl.device,
-                dtype=torch.float32,
-            )
-            self.dnl.interval_tt_count = torch.zeros(
-                (self.dnl.max_intervals, self.dnl.num_edges),
-                device=self.dnl.device,
-                dtype=torch.float32,
-            )
 
     def step(self) -> torch.Tensor:
         """Run the simulation to completion and return rewards.

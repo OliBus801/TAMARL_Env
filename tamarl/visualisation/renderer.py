@@ -362,14 +362,14 @@ def _compute_agent_positions(agent_ids, link_ids, states_col, links_col, enters_
     N_MAX_STACK = 3
     pos_groups = defaultdict(list)
     for p in raw_positions:
-        key = (round(p['x'], 4), round(p['y'], 4))
+        key = (round(p['x'], 4), round(p['y'], 4), p['link'])
         pos_groups[key].append(p)
 
     result = []
     avg_link_len = np.mean([l['length'] for l in links.values()]) if links else 10
     spacing = avg_link_len * 0.06
 
-    for (gx, gy), group in pos_groups.items():
+    for key, group in pos_groups.items():
         n = len(group)
         if n == 1:
             result.append(group[0])
@@ -722,7 +722,7 @@ def render_animation(scenario_folder: str, output_folder: str,
     pbar = tqdm(total=num_frames, desc='🎞️  Rendering', unit='frame',
                 bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]')
 
-    disable_fanning = len(agent_ids) > 100 or len(links) > 200
+    disable_fanning = len(agent_ids) > 2000 or len(links) > 2000
 
     last_dynamic_artists = []
 
@@ -835,7 +835,7 @@ def render_live(scenario_folder: str, output_folder: str,
 
     # State
     state = {'playing': False, 'current_frame': 0, 'speed': initial_speed, 'timer': None, 'artists': []}
-    disable_fanning = len(agent_ids) > 100 or len(links) > 200
+    disable_fanning = len(agent_ids) > 2000 or len(links) > 2000
 
     def draw_current():
         for art in state['artists']:
