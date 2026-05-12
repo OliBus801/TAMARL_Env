@@ -133,23 +133,40 @@ def get_or_compute_top_k_paths(
     """Get top-k paths from cache, or compute and cache them if not found."""
     cache_path = os.path.join(scenario_dir, f"top_k_paths_k{k}.pkl")
     
+    paths_dict = {}
     if os.path.exists(cache_path):
         print(f"Loading cached top-{k} paths from {cache_path}")
         with open(cache_path, "rb") as f:
-            return pickle.load(f)
+            paths_dict = pickle.load(f)
             
-    print(f"Computing top-{k} paths with igraph (this may take a while for large networks)...")
-    paths_dict = enumerate_top_k_paths(
-        num_nodes=num_nodes,
-        edge_endpoints=edge_endpoints,
-        ff_times=ff_times,
-        od_pairs=od_pairs,
-        k=k,
-    )
-    
-    os.makedirs(scenario_dir, exist_ok=True)
-    with open(cache_path, "wb") as f:
-        pickle.dump(paths_dict, f)
-    print(f"Saved computed paths to {cache_path}")
+    # Check for missing OD pairs in the loaded cache
+    missing_od_pairs = []
+    for i in range(od_pairs.shape[0]):
+        o = int(od_pairs[i, 0])
+        d = int(od_pairs[i, 1])
+        if (o, d) not in paths_dict:
+            missing_od_pairs.append([o, d])
+            
+    if missing_od_pairs:
+        if len(paths_dict) > 0:
+            print(f"Found {len(missing_od_pairs)} missing OD pairs in cache. Computing paths for them...")
+        else:
+            print(f"Computing top-{k} paths with igraph (this may take a while for large networks)...")
+            
+        missing_od_pairs_np = np.array(missing_od_pairs, dtype=np.int32)
+        new_paths_dict = enumerate_top_k_paths(
+            num_nodes=num_nodes,
+            edge_endpoints=edge_endpoints,
+            ff_times=ff_times,
+            od_pairs=missing_od_pairs_np,
+            k=k,
+        )
+        
+        paths_dict.update(new_paths_dict)
+        
+        os.makedirs(scenario_dir, exist_ok=True)
+        with open(cache_path, "wb") as f:
+            pickle.dump(paths_dict, f)
+        print(f"Saved updated paths to {cache_path}")
         
     return paths_dict
