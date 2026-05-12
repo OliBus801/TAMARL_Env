@@ -47,7 +47,6 @@
         "speed": 1
     },
     "metrics": {
-        "relative_gap": true,
         "epsilon_ratio": 0.1,
         "link_tt_interval": 60.0
     }

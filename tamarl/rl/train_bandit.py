@@ -115,7 +115,7 @@ def _compute_stats(env: AgentLevelWrapper, rewards: np.ndarray, infos: dict, wal
     }
     
     # Pull empirical Nash metrics from infos (computed in AgentLevelWrapper.step)
-    for k in ['relative_gap', 'mean_regret', 'max_regret', 'epsilon_compliance_rate']:
+    for k in ['mean_regret', 'max_regret', 'epsilon_compliance_rate']:
         if k in infos:
             stats[k] = infos[k]
 
@@ -126,7 +126,7 @@ def _aggregate_stats(window: List[Dict]) -> Dict[str, float]:
     """Aggregate stats over a window of episodes."""
     keys = ['tstt', 'mean_travel_time', 'arrival_rate', 'mean_reward',
             'episode_length', 'n_decisions', 'tt_p90', 'tt_p95',
-            'wall_time', 'relative_gap', 'mean_regret', 'max_regret',
+            'wall_time', 'mean_regret', 'max_regret',
             'epsilon_compliance_rate']
     agg = {}
     for k in keys:
@@ -164,7 +164,6 @@ def train(
     wandb_project: str = "tamarl",
     wandb_tags: Optional[list] = None,
     # Metrics
-    relative_gap: bool = True,
     epsilon_ratio: float = 0.10,
     link_tt_interval: float = 60.0,
     # Epsilon Greedy
@@ -214,7 +213,6 @@ def train(
         'top_k_paths': top_k_paths,
         'formulation': formulation,
         'bandit_feedback': bandit_feedback,
-        'relative_gap': relative_gap,
         'epsilon_ratio': epsilon_ratio,
         'epsilon_alpha': epsilon_alpha,
         'ucb_c': ucb_c,
@@ -249,7 +247,7 @@ def train(
     )
 
     # ── Environment ──
-    need_events = render == 'interval'
+    need_events = render == 'interval' or agent_type in ['msa', 'evo_swap']
     need_render = render is not None
     
     # 1. Init DTABanditEnv
@@ -405,6 +403,17 @@ def train(
             device=device,
             seed=seed,
         )
+    elif agent_type == "evo_swap":
+        from tamarl.rl.agents.evo_swap_agent import EvoSwapAgent
+        agent = EvoSwapAgent(
+            env=env,
+            k_paths=top_k_paths,
+            device=device,
+            seed=seed,
+            epsilon_max=epsilon_start,
+            epsilon_min=epsilon_end,
+            epsilon_decay=epsilon_decay,
+        )
     else:
         from tamarl.rl.agents.random_agent import RandomAgent
         agent = RandomAgent(num_agents=env.num_envs, k=top_k_paths, seed=seed)
@@ -457,9 +466,9 @@ def train(
         is_log_step = (ep == 0) or ((ep + 1) % log_interval == 0) or (ep == n_episodes - 1)
         
         # Configure env to collect metric if RGap is enabled
-        needs_tt = (relative_gap and is_log_step)
-        # MSA agent always needs collect_link_tt (TD evaluator requirement)
-        if agent_type == "msa":
+        needs_tt = is_log_step
+        # MSA and EvoSwap agents always need collect_link_tt (TD evaluator requirement)
+        if agent_type in ["msa", "evo_swap"]:
             needs_tt = True
         env.bandit.collect_link_tt = needs_tt
 
@@ -485,8 +494,6 @@ def train(
         if hasattr(agent, "end_episode"):
             agent.end_episode()
 
-        if 'relative_gap' not in stats and relative_gap and is_log_step:
-            pass # RGap should be inside stats if compute_relative_gap succeeded
 
         all_stats.append(stats)
         window_stats.append(stats)
@@ -508,8 +515,6 @@ def train(
             )
             tqdm.write(f"  │ TSTT:       {agg['tstt_mean']:.0f} ± {agg['tstt_std']:.0f}")
             tqdm.write(f"  │ Mean TT:    {agg['mean_travel_time_mean']:.1f} ± {agg['mean_travel_time_std']:.1f}")
-            if 'relative_gap_mean' in agg:
-                tqdm.write(f"  │ RGap:       {agg['relative_gap_mean']:.4f} ± {agg['relative_gap_std']:.4f}")
             if 'mean_regret_mean' in agg:
                 tqdm.write(f"  │ Max Regret: {agg['max_regret_mean']:.1f}s")
                 tqdm.write(f"  │ Cum Regret: {stats['cumulative_max_regret']:.1f}s")
@@ -527,8 +532,6 @@ def train(
                 'metrics/Arrival Rate': agg['arrival_rate_mean'],
                 'metrics/Mean Reward': agg['mean_reward_mean'],
             }
-            if 'relative_gap_mean' in agg:
-                wandb_metrics['metrics/Relative Gap'] = agg['relative_gap_mean']
             if 'mean_regret_mean' in agg:
                 wandb_metrics['metrics/Mean Nash Regret'] = agg['mean_regret_mean']
                 wandb_metrics['metrics/Max Nash Regret'] = agg['max_regret_mean']
@@ -539,7 +542,7 @@ def train(
                 wandb_metrics['agent/epsilon'] = agent.epsilon
 
             for k, v in agg.items():
-                if k not in ['tstt_mean', 'mean_travel_time_mean', 'relative_gap_mean',
+                if k not in ['tstt_mean', 'mean_travel_time_mean',
                              'arrival_rate_mean', 'mean_reward_mean', 'mean_regret_mean',
                              'max_regret_mean', 'epsilon_compliance_rate_mean']:
                     nice_name = k.replace('_', ' ').title().replace('Tstt', 'TSTT').replace('Tt ', 'TT ')
@@ -575,10 +578,7 @@ def train(
 
     print(f"  TSTT:             {_fmt('tstt')}")
     print(f"  Mean TT:          {_fmt('mean_travel_time')}")
-    if relative_gap and any('relative_gap' in s for s in all_stats):
-        gap_vals = [s['relative_gap'] for s in all_stats if 'relative_gap' in s]
-        print(f"  Relative Gap:     {np.mean(gap_vals):.4f} ± {np.std(gap_vals):.4f}")
-    if relative_gap and any('max_regret' in s for s in all_stats):
+    if any('max_regret' in s for s in all_stats):
         print(f"  Max Regret:       {_fmt('max_regret')}s")
         print(f"  Cum Regret:       {cumulative_max_regret:.1f}s")
         compl_vals = [s['epsilon_compliance_rate'] for s in all_stats if 'epsilon_compliance_rate' in s]
@@ -597,10 +597,6 @@ def train(
         'metrics/Arrival Rate Mean': float(np.mean([s['arrival_rate'] for s in all_stats])),
         'metrics/Mean Reward Mean': float(np.mean([s['mean_reward'] for s in all_stats])),
     }
-    
-    if relative_gap and any('relative_gap' in s for s in all_stats):
-        gap_vals = [s['relative_gap'] for s in all_stats if 'relative_gap' in s]
-        summary['metrics/Relative Gap Mean'] = float(np.mean(gap_vals))
     
     if any('max_regret' in s for s in all_stats):
         summary['metrics/Cumulative Nash Regret Final'] = float(cumulative_max_regret)
@@ -722,8 +718,6 @@ def load_config(config_path: str) -> dict:
 
     # ── Metrics ──
     met = cfg.get("metrics", {})
-    if "relative_gap" in met:
-        kwargs["relative_gap"] = met["relative_gap"]
     if "epsilon_ratio" in met:
         kwargs["epsilon_ratio"] = met["epsilon_ratio"]
     if "link_tt_interval" in met:
@@ -750,8 +744,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # Agent
     parser.add_argument("--agent", default=None,
-                        choices=["random", "epsilon_greedy", "ucb", "aon", "frank_wolfe", "ts", "exp3", "msa"],
-                        help="Agent type: 'random', 'epsilon_greedy', 'ucb', 'aon', 'frank_wolfe', 'ts', 'exp3', or 'msa'")
+                        choices=["random", "epsilon_greedy", "ucb", "aon", "frank_wolfe", "ts", "exp3", "msa", "evo_swap"],
+                        help="Agent type: 'random', 'epsilon_greedy', 'ucb', 'aon', 'frank_wolfe', 'ts', 'exp3', 'msa', or 'evo_swap'")
 
     # Training
     parser.add_argument("--episodes", type=int, default=None, help="Number of episodes")
@@ -831,7 +825,6 @@ _CLI_TO_KWARGS = {
     "render_fps": "render_fps",
     "render_hours": "render_hours",
     "render_speed": "render_speed",
-    "relative_gap": "relative_gap",
     "epsilon_ratio": "epsilon_ratio",
     "link_tt_interval": "link_tt_interval",
 }

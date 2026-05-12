@@ -315,13 +315,17 @@ def _compute_agent_positions(agent_ids, link_ids, states_col, links_col, enters_
         link = links[link_id]
         x0, y0, x1, y1 = _link_geometry(nodes, link)
 
+        is_longitudinal_queue = False
+
         if st == STATE_WAITING:
             # Waiting at the origin node of their link
             px, py = x0, y0
+            is_longitudinal_queue = True
 
         elif st == STATE_DEPARTED:
             # Ping at origin node of their link
             px, py = x0, y0
+            is_longitudinal_queue = True
 
         elif st == STATE_TRAVELING:
             # Interpolate along [MARGIN, 1-MARGIN] of the link so
@@ -330,16 +334,20 @@ def _compute_agent_positions(agent_ids, link_ids, states_col, links_col, enters_
             elapsed = timestep - enters_col[idx]
             raw_progress = elapsed / ff_time if ff_time > 0 else 1.0
             raw_progress = min(max(raw_progress, 0.0), 1.0)
+            if raw_progress == 1.0:
+                is_longitudinal_queue = True
             progress = LINK_MARGIN + raw_progress * (1.0 - 2 * LINK_MARGIN)
             px, py = _interpolate_on_link(x0, y0, x1, y1, progress)
 
         elif st == STATE_BUFFER:
             # At the end of the link (destination node)
             px, py = x1, y1
+            is_longitudinal_queue = True
 
         elif st in (STATE_ARRIVED, STATE_STUCK):
             # Ping frame: show at end of link
             px, py = x1, y1
+            is_longitudinal_queue = True
 
         else:
             continue
@@ -352,6 +360,7 @@ def _compute_agent_positions(agent_ids, link_ids, states_col, links_col, enters_
             'color': color,
             'state': st,
             'link': link_id,
+            'is_longitudinal_queue': is_longitudinal_queue,
         })
 
     if disable_fanning or len(raw_positions) == 0:
@@ -383,12 +392,29 @@ def _compute_agent_positions(agent_ids, link_ids, states_col, links_col, enters_
             overflow = n - N_MAX_STACK if n > N_MAX_STACK else 0
             nv = len(visible)
 
-            for i, p in enumerate(visible):
-                offset = (i - (nv - 1) / 2.0) * spacing
-                ox, oy = _perpendicular_offset(x0, y0, x1, y1, offset)
-                p['x'] += ox
-                p['y'] += oy
-                result.append(p)
+            is_longitudinal = group[0].get('is_longitudinal_queue', False)
+
+            if is_longitudinal:
+                dx = x0 - x1
+                dy = y0 - y1
+                length = math.sqrt(dx * dx + dy * dy)
+                if length > 1e-9:
+                    ux = dx / length
+                    uy = dy / length
+                else:
+                    ux, uy = 0.0, 0.0
+                
+                for i, p in enumerate(visible):
+                    p['x'] += ux * i * spacing
+                    p['y'] += uy * i * spacing
+                    result.append(p)
+            else:
+                for i, p in enumerate(visible):
+                    offset = (i - (nv - 1) / 2.0) * spacing
+                    ox, oy = _perpendicular_offset(x0, y0, x1, y1, offset)
+                    p['x'] += ox
+                    p['y'] += oy
+                    result.append(p)
 
             # Tag last visible dot with overflow count
             if overflow > 0:

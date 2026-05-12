@@ -31,7 +31,8 @@ from gymnasium.vector import VectorEnv
 
 from tamarl.envs.dta_bandit_env import DTABanditEnv
 from tamarl.envs.components.path_enumerator import get_or_compute_top_k_paths
-from tamarl.envs.components.metrics import compute_empirical_nash_metrics
+from tamarl.envs.components.metrics import compute_empirical_nash_metrics_tensor
+from tamarl.envs.components.time_dependent_evaluator import TimeDependentEvaluator
 
 
 class ODLevelWrapper(VectorEnv):
@@ -196,6 +197,10 @@ class ODLevelWrapper(VectorEnv):
         self.render_mode = None
         self.closed = False
 
+        # Enforce event tracking for TimeDependentEvaluator (needed for Nash metrics)
+        self.bandit._track_events = True
+        self.evaluator = TimeDependentEvaluator.from_wrapper(self)
+
     def _get_obs(self) -> np.ndarray:
         """Fetch blind observation (only action masks) for each leg's OD pair."""
         # [TotalLegs, K]
@@ -323,13 +328,16 @@ class ODLevelWrapper(VectorEnv):
         }
 
         # ── Compute Path-Based Empirical Regret Metrics ──────────────
-        path_metrics = compute_empirical_nash_metrics(
-            travel_times=travel_times,
-            actions=actions,
-            od_indices=self.od_indices_all_legs.cpu().numpy(),
-            num_od_pairs=self.fftt_matrix.shape[0],
-            k_paths=self.K,
-            fftt_matrix=self.fftt_matrix
+        estimated_times, _ = self.evaluator.evaluate(
+            dnl=self.bandit.dnl,
+            departure_times=self.bandit.scenario.departure_times,
+            od_indices=self.od_indices_all_legs,
+        )
+        
+        path_metrics = compute_empirical_nash_metrics_tensor(
+            actual_travel_times=torch.tensor(travel_times, device=self._device),
+            actions=actions_t,
+            estimated_times=estimated_times
         )
         info.update(path_metrics)
 
