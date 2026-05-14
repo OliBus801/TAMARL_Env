@@ -2,7 +2,8 @@
     "_comment": "TAMARL Training Configuration — Default values for all parameters",
     "scenario": {
         "path": "tamarl/data/scenarios/equil/",
-        "population_filter": null
+        "population_filter": null,
+        "scale_factor": 1.0
     },
     "training": {
         "agent": "random",

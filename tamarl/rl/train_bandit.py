@@ -41,7 +41,8 @@ def run_episode(env, agent, epsilon_ratio: float = 0.10):
     L'agent ne voit jamais la distinction : il projette toujours ses poids
     [B, K] via self.weights[aggregation_indices] et agrège via scatter_add_.
     """
-    obs, infos = env.reset()
+    with torch.no_grad():
+        obs, infos = env.reset()
     device = getattr(env, "_device", "cpu")
 
     # ── Construction de aggregation_indices ──────────────────────────────
@@ -62,7 +63,7 @@ def run_episode(env, agent, epsilon_ratio: float = 0.10):
         actions = agent.get_actions_batched(
             obs_t, masks_t, aggregation_indices=aggregation_indices
         )
-        actions = actions.cpu().numpy()
+        actions = actions.detach().contiguous().cpu().numpy()
     elif hasattr(agent, 'act'):
         # Agents basiques (RandomAgent legacy)
         actions = agent.act()
@@ -72,8 +73,18 @@ def run_episode(env, agent, epsilon_ratio: float = 0.10):
     else:
         actions = env.action_space.sample()
 
+    # ── Blindage des actions ───────────────────────────────────────────
+    if isinstance(actions, torch.Tensor):
+        actions = actions.detach().contiguous().cpu().numpy()
+    elif isinstance(actions, np.ndarray):
+        pass # Already numpy
+    else:
+        # Probablement un scalaire ou une liste, on laisse tel quel ou on convertit si besoin
+        pass
+
     t0 = time.time()
-    obs, rewards, terminated, truncated, infos = env.step(actions)
+    with torch.no_grad():
+        obs, rewards, terminated, truncated, infos = env.step(actions)
     wall_time = time.time() - t0
 
     # ── Mise à jour de l'agent ───────────────────────────────────────────
@@ -144,6 +155,7 @@ def train(
     max_steps: int = 86400,
     stuck_threshold: int = 10,
     timestep: float = 1.0,
+    scale_factor: float = 1.0,
     device: str = "cpu",
     seed: Optional[int] = None,
     # Agent
@@ -206,6 +218,7 @@ def train(
         'max_steps': max_steps,
         'stuck_threshold': stuck_threshold,
         'timestep': timestep,
+        'scale_factor': scale_factor,
         'device': device,
         'seed': seed,
         'log_interval': log_interval,
@@ -232,7 +245,8 @@ def train(
     print(f"  Episodes:      {n_episodes} | Max steps: {max_steps} | Stuck threshold: {stuck_threshold}")
     print(f"  Log interval:  every {log_interval} episodes")
     print(f"  Device:        {device} | Seed: {seed}")
-    print(f"  Top-k Paths:   {top_k_paths} | Formulation: {formulation} | Feedback: {bandit_feedback}")
+    print(f"  Top-k Paths:   {top_k_paths} | Scale Factor: {scale_factor}")
+    print(f"  Formulation:   {formulation} | Feedback: {bandit_feedback}")
     print(f"{'='*65}\n")
 
     # ── W&B init ──
@@ -255,7 +269,7 @@ def train(
         scenario_path=scenario_path,
         population_filter=population_filter,
         timestep=timestep,
-        scale_factor=1.0,
+        scale_factor=scale_factor,
         max_steps=max_steps,
         stuck_threshold=stuck_threshold,
         device=device,
@@ -636,6 +650,8 @@ def load_config(config_path: str) -> dict:
         kwargs["scenario_path"] = sc["path"]
     if "population_filter" in sc:
         kwargs["population_filter"] = sc["population_filter"]
+    if "scale_factor" in sc:
+        kwargs["scale_factor"] = float(sc["scale_factor"])
 
     # ── Training ──
     tr = cfg.get("training", {})
@@ -752,6 +768,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max_steps", type=int, default=None, help="Max ticks per episode")
     parser.add_argument("--stuck_threshold", type=int, default=None, help="Steps before a stuck agent is removed")
     parser.add_argument("--timestep", type=float, default=None, help="Simulation timestep (s)")
+    parser.add_argument("--scale_factor", type=float, default=None, help="Network capacity scale factor (default: 1.0)")
     parser.add_argument("--device", default=None, help="Device ('cpu' or 'cuda')")
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
 
@@ -803,6 +820,7 @@ _CLI_TO_KWARGS = {
     "max_steps": "max_steps",
     "stuck_threshold": "stuck_threshold",
     "timestep": "timestep",
+    "scale_factor": "scale_factor",
     "device": "device",
     "seed": "seed",
     "log_interval": "log_interval",

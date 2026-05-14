@@ -43,8 +43,8 @@ def compute_n_curves(
     num_steps: int,
     num_edges: int,
     device: str
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Build N-Curves A(t) and D(t) from simulation events.
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build Sparse N-Curves A(t) and D(t) from simulation events.
     
     Args:
         events_tensor: Raw event buffer [N, 4].
@@ -52,63 +52,82 @@ def compute_n_curves(
         num_edges: Number of edges in the network.
         
     Returns:
-        A: [NumEdges, NumSteps] cumulative arrivals.
-        D: [NumEdges, NumSteps] cumulative departures.
+        A_shifted_sorted: 1D tensor of arrivals shifted by edge*num_steps.
+        A_offsets: 1D tensor of size [num_edges + 1] with offsets.
+        D_times_sorted: 1D tensor of departure times.
+        D_offsets: 1D tensor of size [num_edges + 1] with offsets.
     """
-    A_counts = torch.zeros((num_edges, num_steps), device=device, dtype=torch.float32)
-    D_counts = torch.zeros((num_edges, num_steps), device=device, dtype=torch.float32)
+    if events_tensor.numel() == 0:
+        empty_A = torch.empty(0, device=device, dtype=torch.long)
+        empty_D = torch.empty(0, device=device, dtype=torch.long)
+        zeros_off = torch.zeros(num_edges + 1, device=device, dtype=torch.long)
+        return empty_A, zeros_off, empty_D, zeros_off.clone()
+
+    times = events_tensor[:, 0].long().clamp(max=num_steps - 1)
+    event_types = events_tensor[:, 1].long()
+    edges = events_tensor[:, 3].long().clamp(min=0, max=num_edges - 1)
     
-    if events_tensor.numel() > 0:
-        times = events_tensor[:, 0].long().clamp(max=num_steps - 1)
-        event_types = events_tensor[:, 1].long()
-        edges = events_tensor[:, 3].long().clamp(min=0, max=num_edges - 1)
-        
-        # Arrivals: EVT_DEPARTURE (1), EVT_ENTERED_LINK (4)
-        mask_A = (event_types == 1) | (event_types == 4)
-        A_times = times[mask_A]
-        A_edges = edges[mask_A]
-        
-        # Departures: EVT_LEFT_LINK (3), EVT_LEAVES_TRAFFIC (5), EVT_STUCKANDABORT (8)
-        mask_D = (event_types == 3) | (event_types == 5) | (event_types == 8)
-        D_times = times[mask_D]
-        D_edges = edges[mask_D]
-        
-        A_counts.view(-1).scatter_add_(0, A_edges * num_steps + A_times, torch.ones_like(A_times, dtype=torch.float32))
-        D_counts.view(-1).scatter_add_(0, D_edges * num_steps + D_times, torch.ones_like(D_times, dtype=torch.float32))
-        
-    A = torch.cumsum(A_counts, dim=1)
-    D = torch.cumsum(D_counts, dim=1)
-    return A, D
+    # Arrivals: EVT_DEPARTURE (1), EVT_ENTERED_LINK (4)
+    mask_A = (event_types == 1) | (event_types == 4)
+    A_times = times[mask_A]
+    A_edges = edges[mask_A]
+    
+    # Departures: EVT_LEFT_LINK (3), EVT_LEAVES_TRAFFIC (5), EVT_STUCKANDABORT (8)
+    mask_D = (event_types == 3) | (event_types == 5) | (event_types == 8)
+    D_times = times[mask_D]
+    D_edges = edges[mask_D]
+    
+    # Sort arrivals by edge then time
+    A_shifted = A_edges * num_steps + A_times
+    A_shifted_sorted, A_sort_idx = torch.sort(A_shifted)
+    
+    A_counts = torch.bincount(A_edges[A_sort_idx], minlength=num_edges)
+    A_offsets = torch.zeros(num_edges + 1, device=device, dtype=torch.long)
+    A_offsets[1:] = torch.cumsum(A_counts, dim=0)
+    
+    # Sort departures by edge then time
+    D_shifted = D_edges * num_steps + D_times
+    D_shifted_sorted, D_sort_idx = torch.sort(D_shifted)
+    D_times_sorted = D_times[D_sort_idx]
+    
+    D_counts = torch.bincount(D_edges[D_sort_idx], minlength=num_edges)
+    D_offsets = torch.zeros(num_edges + 1, device=device, dtype=torch.long)
+    D_offsets[1:] = torch.cumsum(D_counts, dim=0)
+    
+    return A_shifted_sorted, A_offsets, D_times_sorted, D_offsets
 
 
 def evaluate_paths_time_dependent(
-    A: torch.Tensor,                # [NumEdges, NumSteps]
-    D: torch.Tensor,                # [NumEdges, NumSteps]
+    A_shifted_sorted: torch.Tensor,
+    A_offsets: torch.Tensor,
+    D_times_sorted: torch.Tensor,
+    D_offsets: torch.Tensor,
     routes: torch.Tensor,           # [Batch, K, MaxRouteLen] edge indices, -1 = padding
     first_edges: torch.Tensor,      # [Batch] first-edge index per leg
     departure_times_step: torch.Tensor,# [Batch] departure time in steps
     dt: float,                      # simulation timestep in seconds
+    num_edges: int,
+    num_steps: int,
+    ff_travel_time_steps: torch.Tensor, # [NumEdges] free-flow travel time
 ) -> torch.Tensor:
     """Evaluate K candidate routes for each element of a batch in O(Batch×K×L).
 
     Propagates a virtual traveller through each path using Newell's N-Curves.
-    Travel time on link e entering at time t is found by looking up n = A[e, t],
-    and finding the earliest exit time t_exit where D[e, t_exit] >= n.
 
     Args:
-        A:                  [NumEdges, NumSteps] cumulative arrivals.
-        D:                  [NumEdges, NumSteps] cumulative departures.
+        A_shifted_sorted, A_offsets, D_times_sorted, D_offsets: Sparse N-Curves.
         routes:             [Batch, K, MaxRouteLen] – edge IDs, -1 = padding sentinel.
         first_edges:        [Batch] – the mandatory first edge.
         departure_times_step: [Batch] – departure time in steps.
         dt:                 Simulation time step in seconds.
+        num_edges:          Total edges in the network.
+        num_steps:          Total steps in the simulation.
+        ff_travel_time_steps: [NumEdges] free flow travel time per edge in steps.
 
     Returns:
         path_costs: [Batch, K] – total travel time (s) for each (agent, path).
     """
-    num_edges, num_steps = A.shape
-    device = A.device
-
+    device = A_shifted_sorted.device
     Batch, K, MaxLen = routes.shape
 
     # Current simulated clock in steps for every (batch, k) pair
@@ -126,17 +145,28 @@ def evaluate_paths_time_dependent(
         flat_steps = cur_steps_b_k.reshape(-1)[valid_indices].clamp(min=0, max=num_steps - 1)
         
         # Arrival number n = A[e, t]
-        flat_A_idx = flat_edges * num_steps + flat_steps
-        n_vals = A.reshape(-1)[flat_A_idx]  # [M]
+        queries = flat_edges * num_steps + flat_steps
+        global_idx = torch.searchsorted(A_shifted_sorted, queries, right=True)
+        n_vals = global_idx - A_offsets[flat_edges]
         
-        # Find exit time t_exit where D[e, t_exit] >= n
-        D_rows = D[flat_edges]  # [M, num_steps]
-        t_exit = torch.searchsorted(D_rows, n_vals.unsqueeze(1)).squeeze(1)  # [M]
+        num_departures = D_offsets[flat_edges + 1] - D_offsets[flat_edges]
+        valid_mask = (n_vals > 0) & (n_vals <= num_departures)
         
-        # Clamp t_exit to num_steps - 1
+        t_exit = torch.zeros_like(flat_steps)
+        # Fallback: if arriving on completely empty link, assume free-flow travel time
+        t_exit[n_vals == 0] = flat_steps[n_vals == 0] + ff_travel_time_steps[flat_edges[n_vals == 0]]
+        t_exit[n_vals > num_departures] = num_steps - 1
+        
+        if valid_mask.any():
+            idx = D_offsets[flat_edges[valid_mask]] + n_vals[valid_mask] - 1
+            t_exit[valid_mask] = D_times_sorted[idx]
+            
         t_exit = t_exit.clamp(max=num_steps - 1)
-        
         step_tt_steps = t_exit - flat_steps
+        
+        # Make sure travel time is not negative, minimum is free flow travel time
+        min_tt = ff_travel_time_steps[flat_edges]
+        step_tt_steps = torch.maximum(step_tt_steps, min_tt)
         
         # Scatter back to [Batch, K]
         result = torch.zeros(Batch * K, device=device, dtype=torch.long)
@@ -162,6 +192,8 @@ def evaluate_paths_time_dependent(
     # Total travel time = final time − departure time
     path_costs = (current_step - departure_times_step.unsqueeze(1)).float() * dt  # [Batch, K]
     return path_costs
+
+
 
 
 
@@ -236,7 +268,8 @@ class TimeDependentEvaluator:
             
         # Add 1 to current_step to ensure enough capacity (steps are 0-indexed)
         num_steps = max(dnl.current_step + 1, 1)
-        A, D = compute_n_curves(events_tensor, num_steps, dnl.num_edges, self.device)
+        A_shifted_sorted, A_offsets, D_times_sorted, D_offsets = compute_n_curves(
+            events_tensor, num_steps, dnl.num_edges, self.device)
 
         # ── Per-leg routes and departure times ────────────────────────
         # routes: [TotalLegs, K, MaxRouteLen]
@@ -255,12 +288,17 @@ class TimeDependentEvaluator:
 
         # ── Evaluate ──────────────────────────────────────────────────
         path_costs = evaluate_paths_time_dependent(
-            A=A,
-            D=D,
+            A_shifted_sorted=A_shifted_sorted,
+            A_offsets=A_offsets,
+            D_times_sorted=D_times_sorted,
+            D_offsets=D_offsets,
             routes=routes,
             first_edges=fe,
             departure_times_step=dep,
             dt=dnl.dt,
+            num_edges=dnl.num_edges,
+            num_steps=num_steps,
+            ff_travel_time_steps=dnl.ff_travel_time_steps,
         )  # [TotalLegs, K]
 
         # Mask invalid paths (will have cost = 0 from zero first-edge edge index)

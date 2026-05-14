@@ -227,6 +227,7 @@ class TorchDNLMATSim:
         self._edge_priority_scratch = torch.zeros(self.num_edges, device=self.device, dtype=torch.float32)
 
         self.current_step = 0
+        self.active_agents_count = self.num_agents
 
     def _init_event_buffer(self):
         """Initialize event buffer as a pre-allocated tensor (or None if not tracking)."""
@@ -294,6 +295,7 @@ class TorchDNLMATSim:
         self.wakeup_time.copy_(self.departure_times)
         self._departure_emitted.fill_(False)
         self.current_step = 0
+        self.active_agents_count = self.num_agents
         self.stuck_count = 0
         if self.seed is not None:
             self.rng.manual_seed(self.seed)
@@ -398,6 +400,7 @@ class TorchDNLMATSim:
 
             # stuckAndAbort: remove from network
             self.status[stuck_agents] = 3
+            self.active_agents_count -= num_stuck
             self.wakeup_time[stuck_agents] = self.infinity
             c_legs_stuck = self.current_leg[stuck_agents]
             dep_times = self.leg_departure_times[stuck_agents, c_legs_stuck]
@@ -692,6 +695,7 @@ class TorchDNLMATSim:
             done_agents = exiters[~has_more]
             if done_agents.numel() > 0:
                 self.status[done_agents] = 3
+                self.active_agents_count -= done_agents.numel()
                 self.wakeup_time[done_agents] = self.infinity
                 
                 # Travel time for the final leg
