@@ -4,7 +4,6 @@ from typing import Dict, List, Optional
 import numpy as np
 import torch
 from tamarl.core.dnl_matsim import TorchDNLMATSim
-from tamarl.envs.components.time_dependent_dijkstra import build_adjacency_list, compute_td_shortest_paths
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -147,199 +146,44 @@ def compute_reward_stats(cumulative_rewards: Dict[str, float]) -> Dict[str, floa
     }
 
 
-# ── Nash Gap Approximation ──────────────────────────────────────────────────
 
-def compute_nash_gap_approx(
-    env,
-    policy,
-    n_episodes: int = 5,
-    n_agent_samples: int = 10,
-    seed: Optional[int] = None,
-) -> float:
-    """Approximate Nash Gap by sampling best-response improvements.
-    
-    For each sampled agent, try all alternative routes while holding
-    other agents' policies fixed. The Nash Gap is the maximum improvement
-    any agent can achieve by deviating.
-    
-    NashGap(π) = max_i [ max_{π'_i} J_i(π'_i, π_{-i}) - J_i(π_i, π_{-i}) ]
-    
-    This is expensive and should only be run post-training.
-    
-    Args:
-        env: DTAMarkovGameEnv instance
-        policy: policy that implements get_actions(obs, infos)
-        n_episodes: number of episodes to average over
-        n_agent_samples: number of agents to sample for best-response computation
-        seed: random seed for reproducibility
-        
-    Returns:
-        Approximate Nash Gap (max improvement from unilateral deviation)
+
+# ── Nash Regret & Relative Gap (Empirical O(N)) ─────────────────────────────
+
+
+
+def compute_empirical_nash_metrics_tensor(
+    actual_travel_times: torch.Tensor, # [N] Temps réels vécus
+    actions: torch.Tensor,             # [N] Index du chemin pris (0 à K-1)
+    estimated_times: torch.Tensor,     # [N, K] Temps estimés par les N-Curves via l'évaluateur
+    epsilon_threshold: float = 60.0
+) -> dict:
     """
-    rng = np.random.default_rng(seed)
-    
-    # Step 1: Run a baseline episode to get baseline travel times
-    baseline_travel_times = _run_episode_get_travel_times(env, policy)
-    
-    if not baseline_travel_times:
-        return 0.0
-    
-    # Select agents to sample
-    all_agents = list(baseline_travel_times.keys())
-    n_samples = min(n_agent_samples, len(all_agents))
-    sampled_agents = rng.choice(all_agents, size=n_samples, replace=False).tolist()
-    
-    max_improvement = 0.0
-    
-    for target_agent in sampled_agents:
-        baseline_tt = baseline_travel_times[target_agent]
-        
-        # Try random alternative routes for this agent
-        # Run multiple episodes where this agent deviates (random actions)
-        # while others follow the policy
-        best_alt_tt = baseline_tt
-        
-        for _ in range(n_episodes):
-            alt_tt = _run_episode_with_deviation(
-                env, policy, target_agent, rng
-            )
-            if alt_tt is not None and alt_tt < best_alt_tt:
-                best_alt_tt = alt_tt
-        
-        improvement = baseline_tt - best_alt_tt  # Positive = deviation is better
-        max_improvement = max(max_improvement, improvement)
-    
-    return max_improvement
-
-
-def _run_episode_get_travel_times(env, policy) -> Dict[str, float]:
-    """Run one episode, return per-agent travel times."""
-    obs, infos = env.reset()
-    
-    while env.agents:
-        actions = policy.get_actions(obs, infos)
-        obs, rewards, terminations, truncations, infos = env.step(actions)
-    
-    # Extract travel times from DNL
-    travel_times = {}
-    done_mask = (env.dnl.status == 3)
-    if done_mask.any():
-        for i in range(env.dnl.num_agents):
-            if env.dnl.status[i].item() == 3:
-                agent_tt = env.dnl.leg_metrics[i, :, 1]
-                valid_tt = agent_tt[agent_tt > 0]
-                travel_times[f"agent_{i}"] = float(valid_tt.sum().item() * env.dnl.dt)
-    
-    return travel_times
-
-
-def _run_episode_with_deviation(env, policy, deviant_agent: str, rng) -> Optional[float]:
-    """Run episode where deviant_agent uses random actions, others use policy.
-    
-    Returns the deviant agent's travel time, or None if it didn't arrive.
+    Calcule le Nash Regret et le Relative Gap de façon 100% tensorisée.
     """
-    obs, infos = env.reset()
-    
-    while env.agents:
-        actions = policy.get_actions(obs, infos)
-        
-        # Override deviant's action with random valid action
-        if deviant_agent in infos:
-            mask = infos[deviant_agent].get("action_mask")
-            if mask is not None and mask.sum() > 0:
-                valid = np.where(mask > 0)[0]
-                actions[deviant_agent] = int(rng.choice(valid))
-        
-        obs, rewards, terminations, truncations, infos = env.step(actions)
-    
-    # Get deviant's travel time
-    agent_idx = int(deviant_agent.split("_")[-1])
-    if env.dnl.status[agent_idx].item() == 3:
-        agent_tt = env.dnl.leg_metrics[agent_idx, :, 1]
-        valid_tt = agent_tt[agent_tt > 0]
-        return float(valid_tt.sum().item() * env.dnl.dt)
-    return None
+    N = actual_travel_times.shape[0]
+    if N == 0:
+        return {'mean_regret': 0.0, 'max_regret': 0.0, 'epsilon_compliance_rate': 0.0}
 
-# ── Relative Gap ────────────────────────────────────────────────────────────
-
-def compute_relative_gap(dnl: TorchDNLMATSim, link_tt_interval: float = 300.0) -> float:
-    """Computes the Relative Gap (RGap) metric over all arrived agents.
+    # 1. Copie pour ne pas altérer le tenseur de l'évaluateur
+    agent_options = estimated_times.clone()
     
-    RGap = sum(t_i - t_i_SP) / sum(t_i)
-    """
-    if not getattr(dnl, 'collect_link_tt', False):
-        return float('inf')
-        
-    tt_matrix = dnl.get_dynamic_link_travel_times()
-    if tt_matrix is None:
-        return float('inf')
-        
-    tt_matrix_np = tt_matrix.cpu().numpy()
+    # 2. RÈGLE D'OR : Masquer l'action prise avec infini
+    batch_indices = torch.arange(N, device=actions.device)
+    agent_options[batch_indices, actions] = float('inf')
     
-    done_mask = (dnl.status == 3).cpu().numpy()
-    if not done_mask.any():
-        return 0.0
-        
-    done_agents = np.where(done_mask)[0]
-    leg_metrics = dnl.leg_metrics.cpu().numpy()
+    # 3. Meilleure alternative (Best-Response)
+    best_alt_tt, _ = torch.min(agent_options, dim=1)
     
-    total_real_tt = 0.0
+    # 4. Regret (borné à 0)
+    regrets = torch.clamp(actual_travel_times - best_alt_tt, min=0.0)
     
-    start_times_list = []
-    origins_list = []
-    destinations_list = []
+    # 5. Synthèse
+    total_regret = regrets.sum()
+    epsilon_compliance = (regrets <= epsilon_threshold).float().mean().item()
     
-    all_first_edges = dnl._all_first_edges.cpu().numpy()
-    dests = dnl.destinations.cpu().numpy()
-    edge_endpoints = dnl.edge_endpoints.cpu().numpy()
-    leg_departure_times = dnl.leg_departure_times.cpu().numpy()
-    num_legs = dnl.num_legs.cpu().numpy()
-    
-    for agent_id in done_agents:
-        for leg_idx in range(num_legs[agent_id]):
-            real_tt = leg_metrics[agent_id, leg_idx, 1]
-            if real_tt <= 0:
-                continue
-                
-            first_edge = all_first_edges[agent_id, leg_idx]
-            # MATSim spawns agents into the capacity buffer of the their first link,
-            # meaning their physical start node is the destination of the first link.
-            origin_node = edge_endpoints[first_edge, 1]
-            dest_node = dests[agent_id, leg_idx]
-            dep_time_steps = leg_departure_times[agent_id, leg_idx]
-            dep_time_sec = dep_time_steps * dnl.dt
-            
-            start_times_list.append(dep_time_sec)
-            origins_list.append(origin_node)
-            destinations_list.append(dest_node)
-            
-            # Since real_tt is already in seconds, just add it
-            total_real_tt += real_tt
-            
-    if len(start_times_list) == 0 or total_real_tt <= 0:
-        return 0.0
-        
-    start_times_np = np.array(start_times_list, dtype=np.float32)
-    origins_np = np.array(origins_list, dtype=np.int32)
-    dests_np = np.array(destinations_list, dtype=np.int32)
-    
-    adj = build_adjacency_list(dnl.num_nodes, edge_endpoints)
-    t_sp, _ = compute_td_shortest_paths(
-        adj=adj,
-        start_times=start_times_np,
-        origin_nodes=origins_np,
-        destination_nodes=dests_np,
-        tt_matrix=tt_matrix_np,
-        interval=float(link_tt_interval)
-    )
-    
-    # Exclude unreachable agents from the gap, though in a sane scenario all matched
-    valid_sp_mask = (t_sp != float('inf'))
-    if not valid_sp_mask.any():
-        return 0.0
-        
-    total_sp_tt = np.sum(t_sp[valid_sp_mask])
-    
-    # Ensure RGap doesn't become negative due to precision
-    rgap = max(0.0, (total_real_tt - float(total_sp_tt)) / total_real_tt)
-    return float(rgap)
+    return {
+        'mean_regret': regrets.mean().item(),
+        'max_regret': regrets.max().item(),
+        'epsilon_compliance_rate': epsilon_compliance
+    }

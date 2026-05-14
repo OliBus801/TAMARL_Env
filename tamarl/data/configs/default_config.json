@@ -6,37 +6,32 @@
     },
     "training": {
         "agent": "random",
-        "formulation": "link-based",
         "top_k_paths": 3,
         "episodes": 5,
         "max_steps": 86400,
+        "stuck_threshold": 10,
         "timestep": 1.0,
         "device": "cpu",
-        "seed": null
+        "seed": null,
+        "formulation": "agent",
+        "bandit_feedback": "full"
     },
-    "q_learning": {
-        "alpha": 0.5,
-        "gamma": 1.0,
+    "epsilon_greedy": {
         "epsilon_start": 1.0,
         "epsilon_end": 0.05,
         "epsilon_decay": 0.995,
-        "n_bins": 5
+        "epsilon_alpha": 0.1
     },
-    "msa": {
-        "alpha_max": 1.0,
-        "alpha_min": 0.05,
-        "decay": 0.05
+    "ucb": {
+        "c": 100.0
     },
-    "sb3": {
-        "learning_rate": 3e-4,
-        "gamma": 1.0,
-        "net_arch": [
-            64,
-            64
-        ],
-        "batch_size": 64,
-        "buffer_size": 10000,
-        "n_steps": 128
+    "thompson_sampling": {
+        "prior_std": 10000.0,
+        "env_std": null
+    },
+    "exp3": {
+        "eta": 0.01,
+        "gamma": 0.05
     },
     "logging": {
         "log_interval": 100,
@@ -52,6 +47,7 @@
         "speed": 1
     },
     "metrics": {
-        "relative_gap": true
+        "epsilon_ratio": 0.1,
+        "link_tt_interval": 60.0
     }
 }

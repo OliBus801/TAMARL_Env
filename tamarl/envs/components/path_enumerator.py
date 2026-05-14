@@ -4,173 +4,64 @@ Provides utilities to enumerate the k-shortest loopless paths between
 origin-destination pairs in a directed graph, using free-flow travel
 times as edge weights.
 """
-
 from __future__ import annotations
 
-import heapq
-from typing import Dict, List, Set, Tuple
+import os
+import pickle
+from typing import Dict, List, Tuple
 
 import numpy as np
+import igraph as ig
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from tqdm import tqdm
 
+# Variable globale pour stocker le graphe en mémoire dans chaque worker.
+# Ceci évite la sérialisation (pickling) coûteuse du graphe complet
+# pour chaque tâche envoyée via ProcessPoolExecutor.
+_WORKER_GRAPH = None
 
-def _dijkstra_with_exclusions(
-    adj: List[List[Tuple[int, int]]],
-    edge_weights: np.ndarray,
-    origin: int,
-    destination: int,
-    excluded_nodes: Set[int],
-    excluded_edges: Set[int],
-) -> Tuple[float, List[int]]:
-    """Single-source shortest path avoiding excluded nodes and edges.
+def _init_worker(graph: ig.Graph):
+    """Initialise le graphe igraph dans la mémoire du worker."""
+    global _WORKER_GRAPH
+    _WORKER_GRAPH = graph
 
-    Args:
-        adj: adjacency list, adj[u] = [(v, edge_id), ...]
-        edge_weights: [E] array of edge weights (travel times)
-        origin: source node
-        destination: target node
-        excluded_nodes: nodes to avoid (except origin/destination)
-        excluded_edges: edges to avoid
-
-    Returns:
-        (cost, path) where path is a list of edge_ids. Returns (inf, []) if
-        no path exists.
-    """
-    dist = {origin: 0.0}
-    parent: Dict[int, Tuple[int, int]] = {}  # node -> (prev_node, edge_id)
-    pq = [(0.0, origin)]
-
-    while pq:
-        d, u = heapq.heappop(pq)
-
-        if u == destination:
-            # Reconstruct path
-            path = []
-            curr = destination
-            while curr in parent:
-                p, eid = parent[curr]
-                path.append(eid)
-                curr = p
-            path.reverse()
-            return d, path
-
-        if d > dist.get(u, float("inf")):
+def _compute_paths_for_chunk(od_chunk: np.ndarray, k: int) -> Dict[Tuple[int, int], List[List[int]]]:
+    """Exécute l'algorithme de Yen sur un lot d'OD pairs en utilisant igraph."""
+    global _WORKER_GRAPH
+    result = {}
+    
+    for i in range(od_chunk.shape[0]):
+        o = int(od_chunk[i, 0])
+        d = int(od_chunk[i, 1])
+        od_key = (o, d)
+        
+        if o == d:
+            result[od_key] = [[]]
             continue
-
-        for v, eid in adj[u]:
-            if eid in excluded_edges:
-                continue
-            if v in excluded_nodes:
-                continue
-            w = float(edge_weights[eid])
-            nd = d + w
-            if nd < dist.get(v, float("inf")):
-                dist[v] = nd
-                parent[v] = (u, eid)
-                heapq.heappush(pq, (nd, v))
-
-    return float("inf"), []
-
-
-def yen_k_shortest_paths(
-    adj: List[List[Tuple[int, int]]],
-    edge_endpoints: np.ndarray,
-    edge_weights: np.ndarray,
-    origin: int,
-    destination: int,
-    k: int,
-) -> List[Tuple[float, List[int]]]:
-    """Yen's algorithm for k-shortest loopless paths.
-
-    Args:
-        adj: adjacency list, adj[u] = [(v, edge_id), ...]
-        edge_endpoints: [E, 2] array (from_node, to_node)
-        edge_weights: [E] array of edge weights
-        origin: source node
-        destination: target node
-        k: number of shortest paths to find
-
-    Returns:
-        List of (cost, path) tuples, sorted by cost. Each path is a list
-        of edge indices. May return fewer than k paths if fewer exist.
-    """
-    if origin == destination:
-        return [(0.0, [])]
-
-    # Find the shortest path
-    cost0, path0 = _dijkstra_with_exclusions(
-        adj, edge_weights, origin, destination, set(), set()
-    )
-    if not path0:
-        return []
-
-    A = [(cost0, path0)]  # k-shortest paths found so far
-    B: List[Tuple[float, List[int]]] = []  # candidates
-
-    for i in range(1, k):
-        prev_path = A[i - 1][1]  # edge list of (i-1)-th shortest path
-
-        # Convert edge path to node path for spur operations
-        if prev_path:
-            node_path = [int(edge_endpoints[prev_path[0], 0])]
-            for eid in prev_path:
-                node_path.append(int(edge_endpoints[eid, 1]))
-        else:
-            node_path = [origin]
-
-        for j in range(len(node_path) - 1):
-            spur_node = node_path[j]
-            root_edges = prev_path[:j]  # edges from origin to spur_node
-
-            # Compute root cost
-            root_cost = sum(float(edge_weights[eid]) for eid in root_edges)
-
-            # Exclude edges from spur_node that are shared by existing
-            # shortest paths with the same root
-            excluded_edges: Set[int] = set()
-            for _, p in A:
-                # Convert p to node path
-                if len(p) >= j + 1:
-                    p_nodes = [int(edge_endpoints[p[0], 0])]
-                    for eid in p:
-                        p_nodes.append(int(edge_endpoints[eid, 1]))
-                    # Check if the root portion matches
-                    if p_nodes[: j + 1] == node_path[: j + 1]:
-                        # Exclude the edge leaving spur_node in this path
-                        if j < len(p):
-                            excluded_edges.add(p[j])
-
-            # Exclude nodes in root path (except spur_node) to ensure loopless
-            excluded_nodes: Set[int] = set()
-            for idx in range(j):
-                excluded_nodes.add(node_path[idx])
-
-            # Find spur path
-            spur_cost, spur_path = _dijkstra_with_exclusions(
-                adj, edge_weights, spur_node, destination,
-                excluded_nodes, excluded_edges,
+            
+        try:
+            # get_k_shortest_paths avec output="epath" (edge path) retourne directement
+            # les ID internes des arêtes igraph plutôt que les ID des sommets
+            paths_edges = _WORKER_GRAPH.get_k_shortest_paths(
+                o, to=d, k=k, weights="weight", output="epath"
             )
-
-            if spur_path:
-                total_path = root_edges + spur_path
-                total_cost = root_cost + spur_cost
-
-                # Check this path isn't already in B
-                is_dup = False
-                for bc, bp in B:
-                    if bp == total_path:
-                        is_dup = True
-                        break
-                if not is_dup:
-                    heapq.heappush(B, (total_cost, total_path))
-
-        if not B:
-            break
-
-        # Pop the best candidate
-        best_cost, best_path = heapq.heappop(B)
-        A.append((best_cost, best_path))
-
-    return A
+            
+            paths = []
+            for path in paths_edges:
+                if len(path) == 0:
+                    continue
+                # Reconversion des ID internes d'igraph vers les index originaux "edge_endpoints"
+                # en lisant l'attribut d'arête "original_id" qu'on a configuré lors de l'ajout
+                original_path = [_WORKER_GRAPH.es[edge_idx]["original_id"] for edge_idx in path]
+                paths.append(original_path)
+            
+            result[od_key] = paths
+        except Exception:
+            # igraph peut lever une exception (ex: InternalError ou ValueError)
+            # si les noeuds ne sont pas connectés du tout ou isolés.
+            result[od_key] = []
+            
+    return result
 
 
 def enumerate_top_k_paths(
@@ -180,40 +71,102 @@ def enumerate_top_k_paths(
     od_pairs: np.ndarray,
     k: int,
 ) -> Dict[Tuple[int, int], List[List[int]]]:
-    """Enumerate top-k loopless paths for each unique OD pair.
-
-    Args:
-        num_nodes: number of nodes in the graph
-        edge_endpoints: [E, 2] array (from_node, to_node)
-        ff_times: [E] array of free-flow travel times (edge weights)
-        od_pairs: [M, 2] array of unique (origin, destination) pairs
-        k: number of shortest paths per OD pair
-
-    Returns:
-        Dict mapping (origin, dest) → list of k paths (each path is a
-        list of edge indices). May have fewer than k entries if fewer
-        loopless paths exist.
-    """
-    # Build adjacency list
-    adj: List[List[Tuple[int, int]]] = [[] for _ in range(num_nodes)]
+    """Enumerate top-k loopless paths using igraph and multiprocessing."""
+    
+    # 1. Filtrer les arêtes parallèles en ne gardant que la plus rapide
+    # igraph accepte les arêtes parallèles, mais le filtrage natif ici garantit 
+    # la même logique que NetworkX et réduit la taille du graphe.
+    edge_dict = {}
     for e in range(edge_endpoints.shape[0]):
         u = int(edge_endpoints[e, 0])
         v = int(edge_endpoints[e, 1])
-        adj[u].append((v, e))
+        w = float(ff_times[e])
+        
+        if (u, v) not in edge_dict or w < edge_dict[(u, v)][1]:
+            edge_dict[(u, v)] = (e, w)
+            
+    filtered_edges = list(edge_dict.keys())
+    original_ids = [edge_dict[uv][0] for uv in filtered_edges]
+    weights = [edge_dict[uv][1] for uv in filtered_edges]
+    
+    # 2. Construire le graphe igraph
+    # L'argument n=num_nodes s'assure que les identifiants de noeuds 
+    # isolés existent bien pour ne pas briser la séquence d'index.
+    G = ig.Graph(n=num_nodes, directed=True)
+    
+    # add_edges() prend une liste de tuples. C'est l'opération de lot (batch) 
+    # au niveau C qui est bien plus performante qu'une boucle for.
+    G.add_edges(filtered_edges)
+    
+    # Assigner les attributs aux arêtes (stockés efficacement en C dans igraph)
+    G.es["weight"] = weights
+    G.es["original_id"] = original_ids
+    
+    # 3. Préparer les lots (chunks) pour le multiprocessing
+    num_workers = os.cpu_count() or 4
+    chunks = np.array_split(od_pairs, max(1, num_workers * 4))
+    
+    result = {}
+    
+    # 4. Exécuter en parallèle
+    # initargs passe le graphe igraph à _init_worker pour qu'il le stocke en global
+    with ProcessPoolExecutor(max_workers=num_workers, initializer=_init_worker, initargs=(G,)) as executor:
+        futures = [
+            executor.submit(_compute_paths_for_chunk, chunk, k)
+            for chunk in chunks if len(chunk) > 0
+        ]
+        
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Computing top-k paths (OD chunks)"):
+            result.update(future.result())
+            
+    return result
 
-    result: Dict[Tuple[int, int], List[List[int]]] = {}
 
+def get_or_compute_top_k_paths(
+    scenario_dir: str,
+    num_nodes: int,
+    edge_endpoints: np.ndarray,
+    ff_times: np.ndarray,
+    od_pairs: np.ndarray,
+    k: int,
+) -> Dict[Tuple[int, int], List[List[int]]]:
+    """Get top-k paths from cache, or compute and cache them if not found."""
+    cache_path = os.path.join(scenario_dir, f"top_k_paths_k{k}.pkl")
+    
+    paths_dict = {}
+    if os.path.exists(cache_path):
+        print(f"Loading cached top-{k} paths from {cache_path}")
+        with open(cache_path, "rb") as f:
+            paths_dict = pickle.load(f)
+            
+    # Check for missing OD pairs in the loaded cache
+    missing_od_pairs = []
     for i in range(od_pairs.shape[0]):
         o = int(od_pairs[i, 0])
         d = int(od_pairs[i, 1])
-        od_key = (o, d)
-
-        if od_key in result:
-            continue  # already computed
-
-        paths_with_costs = yen_k_shortest_paths(
-            adj, edge_endpoints, ff_times, o, d, k
+        if (o, d) not in paths_dict:
+            missing_od_pairs.append([o, d])
+            
+    if missing_od_pairs:
+        if len(paths_dict) > 0:
+            print(f"Found {len(missing_od_pairs)} missing OD pairs in cache. Computing paths for them...")
+        else:
+            print(f"Computing top-{k} paths with igraph (this may take a while for large networks)...")
+            
+        missing_od_pairs_np = np.array(missing_od_pairs, dtype=np.int32)
+        new_paths_dict = enumerate_top_k_paths(
+            num_nodes=num_nodes,
+            edge_endpoints=edge_endpoints,
+            ff_times=ff_times,
+            od_pairs=missing_od_pairs_np,
+            k=k,
         )
-        result[od_key] = [path for _, path in paths_with_costs]
-
-    return result
+        
+        paths_dict.update(new_paths_dict)
+        
+        os.makedirs(scenario_dir, exist_ok=True)
+        with open(cache_path, "wb") as f:
+            pickle.dump(paths_dict, f)
+        print(f"Saved updated paths to {cache_path}")
+        
+    return paths_dict
