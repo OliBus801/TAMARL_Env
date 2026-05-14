@@ -315,13 +315,17 @@ def _compute_agent_positions(agent_ids, link_ids, states_col, links_col, enters_
         link = links[link_id]
         x0, y0, x1, y1 = _link_geometry(nodes, link)
 
+        is_longitudinal_queue = False
+
         if st == STATE_WAITING:
             # Waiting at the origin node of their link
             px, py = x0, y0
+            is_longitudinal_queue = True
 
         elif st == STATE_DEPARTED:
             # Ping at origin node of their link
             px, py = x0, y0
+            is_longitudinal_queue = True
 
         elif st == STATE_TRAVELING:
             # Interpolate along [MARGIN, 1-MARGIN] of the link so
@@ -330,16 +334,20 @@ def _compute_agent_positions(agent_ids, link_ids, states_col, links_col, enters_
             elapsed = timestep - enters_col[idx]
             raw_progress = elapsed / ff_time if ff_time > 0 else 1.0
             raw_progress = min(max(raw_progress, 0.0), 1.0)
+            if raw_progress == 1.0:
+                is_longitudinal_queue = True
             progress = LINK_MARGIN + raw_progress * (1.0 - 2 * LINK_MARGIN)
             px, py = _interpolate_on_link(x0, y0, x1, y1, progress)
 
         elif st == STATE_BUFFER:
             # At the end of the link (destination node)
             px, py = x1, y1
+            is_longitudinal_queue = True
 
         elif st in (STATE_ARRIVED, STATE_STUCK):
             # Ping frame: show at end of link
             px, py = x1, y1
+            is_longitudinal_queue = True
 
         else:
             continue
@@ -352,6 +360,7 @@ def _compute_agent_positions(agent_ids, link_ids, states_col, links_col, enters_
             'color': color,
             'state': st,
             'link': link_id,
+            'is_longitudinal_queue': is_longitudinal_queue,
         })
 
     if disable_fanning or len(raw_positions) == 0:
@@ -362,14 +371,14 @@ def _compute_agent_positions(agent_ids, link_ids, states_col, links_col, enters_
     N_MAX_STACK = 3
     pos_groups = defaultdict(list)
     for p in raw_positions:
-        key = (round(p['x'], 4), round(p['y'], 4))
+        key = (round(p['x'], 4), round(p['y'], 4), p['link'])
         pos_groups[key].append(p)
 
     result = []
     avg_link_len = np.mean([l['length'] for l in links.values()]) if links else 10
     spacing = avg_link_len * 0.06
 
-    for (gx, gy), group in pos_groups.items():
+    for key, group in pos_groups.items():
         n = len(group)
         if n == 1:
             result.append(group[0])
@@ -383,12 +392,29 @@ def _compute_agent_positions(agent_ids, link_ids, states_col, links_col, enters_
             overflow = n - N_MAX_STACK if n > N_MAX_STACK else 0
             nv = len(visible)
 
-            for i, p in enumerate(visible):
-                offset = (i - (nv - 1) / 2.0) * spacing
-                ox, oy = _perpendicular_offset(x0, y0, x1, y1, offset)
-                p['x'] += ox
-                p['y'] += oy
-                result.append(p)
+            is_longitudinal = group[0].get('is_longitudinal_queue', False)
+
+            if is_longitudinal:
+                dx = x0 - x1
+                dy = y0 - y1
+                length = math.sqrt(dx * dx + dy * dy)
+                if length > 1e-9:
+                    ux = dx / length
+                    uy = dy / length
+                else:
+                    ux, uy = 0.0, 0.0
+                
+                for i, p in enumerate(visible):
+                    p['x'] += ux * i * spacing
+                    p['y'] += uy * i * spacing
+                    result.append(p)
+            else:
+                for i, p in enumerate(visible):
+                    offset = (i - (nv - 1) / 2.0) * spacing
+                    ox, oy = _perpendicular_offset(x0, y0, x1, y1, offset)
+                    p['x'] += ox
+                    p['y'] += oy
+                    result.append(p)
 
             # Tag last visible dot with overflow count
             if overflow > 0:
@@ -722,7 +748,7 @@ def render_animation(scenario_folder: str, output_folder: str,
     pbar = tqdm(total=num_frames, desc='🎞️  Rendering', unit='frame',
                 bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]')
 
-    disable_fanning = len(agent_ids) > 100 or len(links) > 200
+    disable_fanning = len(agent_ids) > 2000 or len(links) > 2000
 
     last_dynamic_artists = []
 
@@ -835,7 +861,7 @@ def render_live(scenario_folder: str, output_folder: str,
 
     # State
     state = {'playing': False, 'current_frame': 0, 'speed': initial_speed, 'timer': None, 'artists': []}
-    disable_fanning = len(agent_ids) > 100 or len(links) > 200
+    disable_fanning = len(agent_ids) > 2000 or len(links) > 2000
 
     def draw_current():
         for art in state['artists']:
