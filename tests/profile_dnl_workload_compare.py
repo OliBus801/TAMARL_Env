@@ -1,4 +1,4 @@
-"""Compare DNL workload profiles for fixed-route benchmark and RL training.
+"""Compare DNL workload profiles for fixed-route benchmark and bandit training.
 
 This script answers a question that cProfile alone does not: when
 ``dnl_matsim.step`` is slower in the RL loop, are the internal batches larger?
@@ -10,7 +10,8 @@ It instruments a ``TorchDNLMATSim`` instance at each tick and records:
 * every ``torch.argsort`` call made inside a DNL phase, including input size.
 
 The fixed-route benchmark run uses the MATSim route strings as ``paths``.
-The RL run uses ``DTAMarkovGameEnv`` and the batched random policy by default.
+The training run uses ``DTABanditEnv`` plus the selected bandit wrapper and
+profiles the ``TorchDNLMATSim`` instance created inside ``bandit.reset(paths)``.
 """
 
 from __future__ import annotations
@@ -26,14 +27,49 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-import numpy as np
-import torch
+np = None
+torch = None
+TorchDNLMATSim = None
+DTABanditEnv = None
+AgentLevelWrapper = None
+ODLevelWrapper = None
+CentralizedLevelWrapper = None
+RandomAgent = None
+parse_network = None
+load_config = None
 
-from tamarl.core.dnl_matsim import TorchDNLMATSim
-from tamarl.envs.dta_markov_game_parallel import DTAMarkovGameEnv
-from tamarl.envs.scenario_loader import parse_network
-from tamarl.rl.train import load_config
-from tamarl.rl_models.random_agent import RandomAgent
+
+def _load_runtime_deps() -> None:
+    """Import heavy runtime dependencies only after argparse has run."""
+    global np, torch, TorchDNLMATSim, DTABanditEnv, AgentLevelWrapper
+    global ODLevelWrapper, CentralizedLevelWrapper, RandomAgent, parse_network
+    global load_config
+
+    if torch is not None:
+        return
+
+    import numpy as _np
+    import torch as _torch
+
+    from tamarl.core.dnl_matsim import TorchDNLMATSim as _TorchDNLMATSim
+    from tamarl.envs.dta_bandit_env import DTABanditEnv as _DTABanditEnv
+    from tamarl.envs.agent_level_wrapper import AgentLevelWrapper as _AgentLevelWrapper
+    from tamarl.envs.od_level_wrapper import ODLevelWrapper as _ODLevelWrapper
+    from tamarl.envs.centralized_level_wrapper import CentralizedLevelWrapper as _CentralizedLevelWrapper
+    from tamarl.envs.scenario_loader import parse_network as _parse_network
+    from tamarl.rl.agents.random_agent import RandomAgent as _RandomAgent
+    from tamarl.rl.train_bandit import load_config as _load_config
+
+    np = _np
+    torch = _torch
+    TorchDNLMATSim = _TorchDNLMATSim
+    DTABanditEnv = _DTABanditEnv
+    AgentLevelWrapper = _AgentLevelWrapper
+    ODLevelWrapper = _ODLevelWrapper
+    CentralizedLevelWrapper = _CentralizedLevelWrapper
+    RandomAgent = _RandomAgent
+    parse_network = _parse_network
+    load_config = _load_config
 
 
 PHASES = ("nodes_A", "flow_update", "links_B", "demand_C")
@@ -266,6 +302,7 @@ def build_fixed_route_dnl(args: argparse.Namespace) -> TorchDNLMATSim:
         seed=args.seed,
         track_events=args.track_events,
         collect_link_tt=args.collect_link_tt,
+        link_tt_interval=args.link_tt_interval,
     )
 
 
@@ -308,6 +345,7 @@ class DNLWorkloadProfiler:
         self.wall_time = 0.0
         self.step_times: List[float] = []
         self.phase_times: Dict[str, List[float]] = defaultdict(list)
+        self.section_times: Dict[str, List[float]] = defaultdict(list)
         self.workloads: Dict[str, List[int]] = defaultdict(list)
         self.argsort_records: List[ArgsortRecord] = []
         self.final_status_counts: Dict[str, int] = {}
@@ -347,6 +385,9 @@ class DNLWorkloadProfiler:
             self.phase_times[phase].append(time.perf_counter() - t0)
             self.current_phase = None
 
+    def record_section_time(self, section: str, seconds: float) -> None:
+        self.section_times[section].append(seconds)
+
     def record_argsort(self, size: int, seconds: float) -> None:
         self.argsort_records.append(
             ArgsortRecord(self.current_phase or "outside_dnl_phase", size, seconds)
@@ -378,6 +419,10 @@ class DNLWorkloadProfiler:
             "step_times_s": _summary(self.step_times),
             "phase_times_s": {
                 phase: _summary(self.phase_times.get(phase, [])) for phase in PHASES
+            },
+            "section_times_s": {
+                section: _summary(values)
+                for section, values in sorted(self.section_times.items())
             },
             "workloads": {
                 key: _summary(self.workloads.get(key, [])) for key in WORKLOAD_KEYS
@@ -460,27 +505,10 @@ def run_benchmark_profile(args: argparse.Namespace) -> DNLWorkloadProfiler:
     return profiler
 
 
-def _get_random_actions(
-    agent: RandomAgent,
-    obs: torch.Tensor,
-    masks: torch.Tensor,
-    deciding: torch.Tensor,
-) -> torch.Tensor:
-    # Current RandomAgent does not accept a deterministic kwarg.
-    return agent.get_actions_batched(obs, masks, deciding)
-
-
 def run_training_profile(args: argparse.Namespace) -> DNLWorkloadProfiler:
     print("\n" + "=" * 72)
-    print("  RL training-loop workload profile")
+    print("  Bandit training-loop workload profile")
     print("=" * 72)
-
-    formulation = args.formulation
-    if formulation not in ("link-based", "path-based"):
-        print(
-            f"  Warning: formulation={formulation!r} is not implemented by "
-            "DTAMarkovGameEnv; using link-based semantics."
-        )
 
     if args.agent != "random":
         raise ValueError(
@@ -488,7 +516,7 @@ def run_training_profile(args: argparse.Namespace) -> DNLWorkloadProfiler:
             "Use the workload output to compare the simulator behavior first."
         )
 
-    env = DTAMarkovGameEnv(
+    bandit = DTABanditEnv(
         scenario_path=args.scenario,
         population_filter=args.population,
         timestep=args.timestep,
@@ -498,78 +526,118 @@ def run_training_profile(args: argparse.Namespace) -> DNLWorkloadProfiler:
         seed=args.seed,
         stuck_threshold=args.stuck_threshold,
         track_events=args.track_events,
-        formulation=formulation,
-        top_k_paths=args.top_k_paths,
+        link_tt_interval=args.link_tt_interval,
     )
-    env.dnl.collect_link_tt = args.collect_link_tt
-    if args.collect_link_tt and getattr(env.dnl, "interval_tt_sum", None) is None:
-        env.dnl.max_intervals = 100
-        env.dnl.interval_tt_sum = torch.zeros(
-            (env.dnl.max_intervals, env.dnl.num_edges),
-            device=env.dnl.device,
-            dtype=torch.float32,
+    bandit.collect_link_tt = args.collect_link_tt
+
+    if args.formulation == "agent":
+        env = AgentLevelWrapper(
+            bandit=bandit,
+            top_k=args.top_k_paths,
+            feedback_type=args.bandit_feedback,
         )
-        env.dnl.interval_tt_count = torch.zeros(
-            (env.dnl.max_intervals, env.dnl.num_edges),
-            device=env.dnl.device,
-            dtype=torch.float32,
+    elif args.formulation == "od_pair":
+        env = ODLevelWrapper(
+            bandit=bandit,
+            top_k=args.top_k_paths,
+            feedback_type=args.bandit_feedback,
         )
+    elif args.formulation == "centralized":
+        env = CentralizedLevelWrapper(
+            bandit=bandit,
+            top_k=args.top_k_paths,
+            feedback_type=args.bandit_feedback,
+        )
+    else:
+        raise ValueError(f"Unknown formulation: {args.formulation}")
 
     profiler = DNLWorkloadProfiler("training")
-    instrument_dnl(env.dnl, profiler)
-    agent = RandomAgent(seed=args.seed)
+
+    original_bandit_reset = bandit.reset
+    original_bandit_step = bandit.step
+    original_evaluate = getattr(env.evaluator, "evaluate", None)
+
+    def profiled_bandit_reset(paths):
+        t0_reset = time.perf_counter()
+        result = original_bandit_reset(paths)
+        profiler.record_section_time("bandit.reset", time.perf_counter() - t0_reset)
+        instrument_dnl(bandit.dnl, profiler)
+        profiler.extra["training_dnl_track_events"] = bool(bandit.dnl.track_events)
+        profiler.extra["training_dnl_collect_link_tt"] = bool(bandit.dnl.collect_link_tt)
+        return result
+
+    def profiled_bandit_step():
+        t0_step = time.perf_counter()
+        result = original_bandit_step()
+        profiler.record_section_time("bandit.step_total", time.perf_counter() - t0_step)
+        return result
+
+    bandit.reset = profiled_bandit_reset
+    bandit.step = profiled_bandit_step
+
+    if original_evaluate is not None:
+        def profiled_evaluate(*eval_args, **eval_kwargs):
+            t0_eval = time.perf_counter()
+            result = original_evaluate(*eval_args, **eval_kwargs)
+            profiler.record_section_time(
+                "time_dependent_evaluator.evaluate",
+                time.perf_counter() - t0_eval,
+            )
+            return result
+
+        env.evaluator.evaluate = profiled_evaluate
+
+    agent = RandomAgent(num_agents=env.num_envs, k=args.top_k_paths, seed=args.seed)
 
     macro_steps_total = 0
     decisions_total = 0
     t0 = time.perf_counter()
     with ArgsortPatch(profiler):
         for episode_idx in range(args.episodes):
-            obs_all, masks, deciding, _ = env.reset_batched(
-                seed=args.seed if episode_idx == 0 else None
+            t0_reset = time.perf_counter()
+            obs, infos = env.reset()
+            profiler.record_section_time("env.reset", time.perf_counter() - t0_reset)
+
+            if "od_indices" in infos:
+                aggregation_indices = torch.from_numpy(infos["od_indices"]).to(args.device)
+            else:
+                aggregation_indices = torch.arange(obs.shape[0], device=args.device)
+
+            obs_t = torch.from_numpy(obs).to(args.device)
+            masks_t = torch.from_numpy(infos["action_mask"]).to(args.device)
+
+            t0_action = time.perf_counter()
+            actions_t = agent.get_actions_batched(
+                obs_t,
+                masks_t,
+                aggregation_indices=aggregation_indices,
             )
-            macro_steps = 0
-            decisions = 0
+            profiler.record_section_time("agent.get_actions_batched", time.perf_counter() - t0_action)
 
-            while env.has_active_agents():
-                num_deciding = deciding.numel()
-                if num_deciding > 0:
-                    if obs_all.shape[0] == env.dnl.num_agents:
-                        obs_deciding = obs_all[deciding]
-                    else:
-                        obs_deciding = env._obs_builder.build_observations_batched(
-                            deciding
-                        )
-                    actions = _get_random_actions(agent, obs_deciding, masks, deciding)
-                    decisions += int(num_deciding)
-                else:
-                    actions = torch.empty(
-                        0, device=env.dnl.device, dtype=torch.long
-                    )
+            actions = actions_t.cpu().numpy()
+            t0_env_step = time.perf_counter()
+            env.step(actions)
+            profiler.record_section_time("env.step_total", time.perf_counter() - t0_env_step)
 
-                obs_all, _, _, _, masks, deciding = env.step_batched(
-                    deciding
-                    if num_deciding > 0
-                    else torch.empty(0, device=env.dnl.device, dtype=torch.long),
-                    actions,
-                )
-                macro_steps += 1
-
-            macro_steps_total += macro_steps
-            decisions_total += decisions
+            macro_steps_total += 1
+            decisions_total += int(actions_t.numel())
 
     profiler.wall_time = time.perf_counter() - t0
-    profiler.record_final_status(env.dnl)
+    if bandit.dnl is not None:
+        profiler.record_final_status(bandit.dnl)
     profiler.extra.update(
         {
-            "num_agents": env.dnl.num_agents,
-            "num_edges": env.dnl.num_edges,
-            "num_nodes": env.dnl.num_nodes,
-            "max_out_degree": env.dnl.max_out_degree,
-            "current_step": env.dnl.current_step,
+            "num_agents": bandit.num_agents,
+            "num_edges": bandit.scenario.num_edges,
+            "num_nodes": bandit.scenario.num_nodes,
+            "current_step": bandit.dnl.current_step if bandit.dnl is not None else None,
             "episodes": args.episodes,
             "macro_steps": macro_steps_total,
             "decisions": decisions_total,
-            "formulation": formulation,
+            "formulation": args.formulation,
+            "bandit_feedback": args.bandit_feedback,
+            "top_k_paths": args.top_k_paths,
+            "num_envs": env.num_envs,
             "agent": args.agent,
         }
     )
@@ -594,6 +662,17 @@ def print_run_report(summary: Dict[str, Any]) -> None:
     print(f"  Argsort total:    {summary['argsort_total_s']:.3f}s")
     print(f"  Argsort calls:    {summary['argsort_calls']}")
     print(f"  Final statuses:   {summary['final_status_counts']}")
+
+    if summary["section_times_s"]:
+        print("\n  Outer-loop timings")
+        print("  section                         calls      total_s      mean_ms")
+        for section, stats in summary["section_times_s"].items():
+            print(
+                f"  {section:<30s}"
+                f"{int(stats['count']):8d}"
+                f"{stats['total']:13.3f}"
+                f"{stats['mean'] * 1000:13.3f}"
+            )
 
     print("\n  Phase timings")
     print("  phase             calls      total_s      mean_ms      p95_ms")
@@ -667,6 +746,16 @@ def print_comparison(benchmark: Dict[str, Any], training: Dict[str, Any]) -> Non
         ),
     ]
 
+    for section in ("env.step_total", "bandit.step_total", "time_dependent_evaluator.evaluate"):
+        if section in training["section_times_s"]:
+            rows.append(
+                (
+                    f"training {section} s",
+                    0.0,
+                    training["section_times_s"][section]["total"],
+                )
+            )
+
     for phase in ("nodes_A", "links_B", "demand_C"):
         rows.append(
             (
@@ -734,24 +823,30 @@ def _apply_config(args: argparse.Namespace) -> argparse.Namespace:
         "seed": None,
         "stuck_threshold": 10,
         "agent": "random",
-        "formulation": "link-based",
+        "formulation": "agent",
+        "bandit_feedback": "full",
         "top_k_paths": 3,
         "episodes": 1,
+        "link_tt_interval": 60.0,
     }
 
     if args.config:
+        _load_runtime_deps()
         config_values = load_config(args.config)
         mapping = {
             "scenario_path": "scenario",
             "population_filter": "population",
             "max_steps": "max_steps",
+            "stuck_threshold": "stuck_threshold",
             "timestep": "timestep",
             "device": "device",
             "seed": "seed",
             "agent_type": "agent",
             "formulation": "formulation",
+            "bandit_feedback": "bandit_feedback",
             "top_k_paths": "top_k_paths",
             "n_episodes": "episodes",
+            "link_tt_interval": "link_tt_interval",
         }
         for source_key, target_key in mapping.items():
             if source_key in config_values:
@@ -788,9 +883,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stuck_threshold", "--stuck-threshold", dest="stuck_threshold", type=int)
 
     parser.add_argument("--agent", choices=("random",), default=None)
-    parser.add_argument("--formulation", default=None)
+    parser.add_argument(
+        "--formulation",
+        choices=("agent", "od_pair", "centralized"),
+        default=None,
+    )
+    parser.add_argument(
+        "--bandit_feedback",
+        "--bandit-feedback",
+        dest="bandit_feedback",
+        choices=("full", "semi"),
+        default=None,
+    )
     parser.add_argument("--top_k_paths", "--top-k-paths", dest="top_k_paths", type=int)
     parser.add_argument("--episodes", type=int, default=None)
+    parser.add_argument(
+        "--link_tt_interval",
+        "--link-tt-interval",
+        dest="link_tt_interval",
+        type=float,
+        default=None,
+    )
 
     parser.add_argument(
         "--mode",
@@ -824,6 +937,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = _apply_config(build_parser().parse_args())
+    _load_runtime_deps()
 
     print("=" * 72)
     print("  DNL workload comparison profiler")
@@ -835,6 +949,9 @@ def main() -> None:
     print(f"  Scale factor:  {args.scale_factor}")
     print(f"  Device:        {args.device}")
     print(f"  Seed:          {args.seed}")
+    print(f"  Formulation:   {args.formulation}")
+    print(f"  Feedback:      {args.bandit_feedback}")
+    print(f"  Top-k paths:   {args.top_k_paths}")
     print(f"  Mode:          {args.mode}")
 
     profilers: List[DNLWorkloadProfiler] = []
