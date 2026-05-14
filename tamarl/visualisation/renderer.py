@@ -485,7 +485,14 @@ def draw_network(ax, nodes, links, node_size, scale_factor=1.0, text_scale_facto
     # Link info labels
     if show_labels_links:
         link_fontsize = 5.5 * scale_factor * text_scale_factor
+        seen_node_pairs = set()
         for lid, link in links.items():
+            # Avoid overlapping labels on two-way or parallel links
+            pair = frozenset([link['from'], link['to']])
+            if pair in seen_node_pairs:
+                continue
+            seen_node_pairs.add(pair)
+
             x0, y0, x1, y1 = _link_geometry(nodes, link)
             mx, my = (x0 + x1) / 2, (y0 + y1) / 2
             label_offset = 0.3 * scale_factor

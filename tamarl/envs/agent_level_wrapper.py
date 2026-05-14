@@ -27,7 +27,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 from gymnasium import spaces
-from gymnasium.vector import VectorEnv
 
 from tamarl.envs.dta_bandit_env import DTABanditEnv
 from tamarl.envs.components.path_enumerator import get_or_compute_top_k_paths
@@ -35,7 +34,7 @@ from tamarl.envs.components.metrics import compute_empirical_nash_metrics_tensor
 from tamarl.envs.components.time_dependent_evaluator import TimeDependentEvaluator
 
 
-class AgentLevelWrapper(VectorEnv):
+class AgentLevelWrapper:
     """Vectorised Gym env: one leg = one sub-env choosing a route.
 
     This wrapper treats every leg of every vehicle as an independent sub-environment
@@ -238,7 +237,12 @@ class AgentLevelWrapper(VectorEnv):
         Args:
             actions: [TotalLegs] int array. Selects the route for each individual leg.
         """
-        actions_t = torch.tensor(actions, dtype=torch.long, device=self._device)
+        # ── Blindage de l'input ──────────────────────────────────────
+        if isinstance(actions, torch.Tensor):
+            actions_t = actions.detach().contiguous().to(self._device, dtype=torch.long)
+        else:
+            actions_t = torch.tensor(actions, dtype=torch.long, device=self._device)
+        
         A = self.bandit.num_agents
         
         # ── Get routes for EVERY leg ─────────────────────────────────
@@ -273,6 +277,8 @@ class AgentLevelWrapper(VectorEnv):
                 leg_ptr += 1
 
         # ── Run the bandit simulation ────────────────────────────────
+        # Blindage du tenseur paths avant passage au simulateur
+        paths = paths.detach().contiguous()
         self.bandit.reset(paths)
         _ = self.bandit.step()  # Returns [A] per-vehicle rewards, we ignore it
 

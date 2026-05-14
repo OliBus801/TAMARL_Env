@@ -122,8 +122,8 @@ class DTABanditEnv:
 
         # Tight simulation loop — no Python-side interruptions
         while self.dnl.current_step < self._max_steps:
-            # Early exit when every agent is done (status ≥ 3)
-            if (self.dnl.status >= 3).all().item():
+            # Early exit when every agent is done
+            if self.dnl.active_agents_count == 0:
                 break
             self.dnl.step()
 
