@@ -276,13 +276,14 @@ class TimeDependentEvaluator:
         routes = self.candidate_routes[od_idx]  # [TotalLegs, K, MaxRouteLen]
 
         # Map agent departure times (steps) to [TotalLegs].
-        dep_all = departure_times.long()  # [A] steps
+        dep_all = departure_times.long().to(self.device)  # [A] steps — must be on device before indexing
         if dep_all.shape[0] == routes.shape[0]:
             # Single-leg scenario shortcut
-            dep = dep_all.to(self.device)
+            dep = dep_all
         else:
             # Multi-leg: expand using the stored leg→agent index map
-            dep = dep_all[self._leg_agent_map].to(self.device)  # [TotalLegs]
+            # Both dep_all and _leg_agent_map are now on self.device — safe indexing
+            dep = dep_all[self._leg_agent_map]  # [TotalLegs]
 
         fe = self.first_edges.to(self.device)     # [TotalLegs]
 

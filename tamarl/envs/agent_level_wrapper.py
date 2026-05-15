@@ -92,6 +92,15 @@ class AgentLevelWrapper:
 
         self.num_envs = len(self.leg_to_agent)
 
+        # ── GPU index tensors for vectorized reward extraction (Opt-1) ─
+        # Pre-computed once; used in step() to replace the Python loop.
+        self._leg_agent_idx = torch.tensor(
+            [i for i, _ in self.leg_to_agent], dtype=torch.long
+        )  # [TotalLegs]  (moved to device after _device is confirmed)
+        self._leg_leg_idx = torch.tensor(
+            [j for _, j in self.leg_to_agent], dtype=torch.long
+        )  # [TotalLegs]
+
         # ── Enumerate top-K paths for all unique ODs ─────────────────
         unique_od, inverse_od = np.unique(
             np.stack([leg_origins, leg_dests], axis=1), 
@@ -178,6 +187,84 @@ class AgentLevelWrapper:
             max_total = max(max_total, total)
         self._max_path_len = int(max_total)
 
+        # ── Pre-compute scatter plan for vectorized path assembly (Opt-2) ──
+        # For every (agent, leg) we record:
+        #   - which agent row in `paths`  → _scatter_agent_row
+        #   - the column offset for first_edge  → _scatter_fe_col
+        #   - for each route edge position e: column offset → _scatter_route_cols[e]
+        # All stored on CPU first, moved to device after.
+        # Layout per leg inside paths[i]:
+        #   [leg-sep?] [first_edge] [route_edge_0 … route_edge_{MaxRouteLen-1}]
+        # where leg-sep (-2) is written for leg_j > 0.
+        # We compute column offsets exactly as the old Python loop did.
+        _max_rl = max_route_len  # shorthand
+        scatter_agent = []   # destination row in paths  [NumSlots]
+        scatter_col   = []   # destination col in paths  [NumSlots]
+        scatter_src_type = []  # 0=fe, 1=route_edge, 2=separator
+        scatter_route_pos = []  # position in route (for type==1 slots)
+        scatter_leg_ptr   = []  # index into leg_to_agent list (for fe/route)
+
+        leg_ptr = 0
+        for i in range(A):
+            n = num_legs_np[i]
+            ptr = 0
+            for leg_j in range(n):
+                if leg_j > 0:
+                    # leg separator slot
+                    scatter_agent.append(i)
+                    scatter_col.append(ptr)
+                    scatter_src_type.append(2)   # constant -2
+                    scatter_route_pos.append(0)
+                    scatter_leg_ptr.append(leg_ptr)
+                    ptr += 1
+                # first-edge slot
+                scatter_agent.append(i)
+                scatter_col.append(ptr)
+                scatter_src_type.append(0)       # fe index from first_edges_all_legs
+                scatter_route_pos.append(0)
+                scatter_leg_ptr.append(leg_ptr)
+                ptr += 1
+                # route-edge slots (one per position in MaxRouteLen)
+                for e in range(_max_rl):
+                    scatter_agent.append(i)
+                    scatter_col.append(ptr)
+                    scatter_src_type.append(1)   # selected_routes[leg_ptr, e]
+                    scatter_route_pos.append(e)
+                    scatter_leg_ptr.append(leg_ptr)
+                    ptr += 1
+                leg_ptr += 1
+
+        _st = torch.tensor(scatter_src_type, dtype=torch.uint8)
+        # Separate the three slot categories for efficient scatter
+        _fe_mask  = (_st == 0)
+        _re_mask  = (_st == 1)
+        _sep_mask = (_st == 2)
+
+        # FE slots
+        self._fe_agent_col = torch.stack([
+            torch.tensor([scatter_agent[k] for k in range(len(_st)) if _fe_mask[k]],  dtype=torch.long),
+            torch.tensor([scatter_col[k]   for k in range(len(_st)) if _fe_mask[k]],  dtype=torch.long),
+        ], dim=1)  # [NumLegs, 2]
+        self._fe_leg_ptr = torch.tensor(
+            [scatter_leg_ptr[k] for k in range(len(_st)) if _fe_mask[k]], dtype=torch.long
+        )  # [NumLegs]
+
+        # Route-edge slots
+        _re_indices = [k for k in range(len(_st)) if _re_mask[k]]
+        self._re_agent_col = torch.stack([
+            torch.tensor([scatter_agent[k]    for k in _re_indices], dtype=torch.long),
+            torch.tensor([scatter_col[k]      for k in _re_indices], dtype=torch.long),
+        ], dim=1)  # [NumLegs*MaxRouteLen, 2]
+        self._re_leg_ptr  = torch.tensor([scatter_leg_ptr[k]   for k in _re_indices], dtype=torch.long)
+        self._re_route_pos = torch.tensor([scatter_route_pos[k] for k in _re_indices], dtype=torch.long)
+
+        # Separator slots
+        _sep_indices = [k for k in range(len(_st)) if _sep_mask[k]]
+        self._sep_agent_col = torch.stack([
+            torch.tensor([scatter_agent[k] for k in _sep_indices], dtype=torch.long),
+            torch.tensor([scatter_col[k]   for k in _sep_indices], dtype=torch.long),
+        ], dim=1)  # [NumSeps, 2] — may be empty
+
         # ── Gymnasium VectorEnv setup ────────────────────────────────
         self.single_observation_space = spaces.Box(
             low=0, high=np.inf, shape=(top_k,), dtype=np.float32
@@ -192,7 +279,21 @@ class AgentLevelWrapper:
         self.spec = None
         self.render_mode = None
         self.closed = False
-        
+
+        # ── Move pre-computed index tensors to device ─────────────────
+        dev = self._device
+        self._leg_agent_idx = self._leg_agent_idx.to(dev)
+        self._leg_leg_idx   = self._leg_leg_idx.to(dev)
+        self._fe_agent_col  = self._fe_agent_col.to(dev)
+        self._fe_leg_ptr    = self._fe_leg_ptr.to(dev)
+        self._re_agent_col  = self._re_agent_col.to(dev)
+        self._re_leg_ptr    = self._re_leg_ptr.to(dev)
+        self._re_route_pos  = self._re_route_pos.to(dev)
+        if len(_sep_indices) > 0:
+            self._sep_agent_col = self._sep_agent_col.to(dev)
+        else:
+            self._sep_agent_col = torch.zeros((0, 2), dtype=torch.long, device=dev)
+
         # Enforce event tracking for TimeDependentEvaluator (needed for Nash metrics)
         self.bandit._track_events = True
         self.evaluator = TimeDependentEvaluator.from_wrapper(self)
@@ -249,49 +350,41 @@ class AgentLevelWrapper:
         # [TotalLegs, MaxRouteLen]
         selected_routes = self.candidate_routes[self.od_indices_all_legs, actions_t]
 
-        # ── Assemble full multi-leg paths tensor [A, MaxPathLen] ─────
+        # ── Assemble full multi-leg paths tensor [A, MaxPathLen] — GPU Opt-2 ──
+        # Vectorized scatter: no Python loop over agents or legs.
         paths = torch.full(
             (A, self._max_path_len), -1,
             dtype=torch.long, device=self._device
         )
-
-        leg_ptr = 0
-        for i in range(A):
-            n_legs = self.bandit.scenario.num_legs[i].item()
-            ptr = 0
-            for leg_j in range(n_legs):
-                if leg_j > 0:
-                    paths[i, ptr] = -2  # leg separator
-                    ptr += 1
-                
-                paths[i, ptr] = self.first_edges_all_legs[leg_ptr]
-                ptr += 1
-                
-                route = selected_routes[leg_ptr]
-                # Filter out padding (-1)
-                valid_edges = route[route != -1]
-                L = valid_edges.size(0)
-                paths[i, ptr : ptr + L] = valid_edges
-                ptr += L
-                
-                leg_ptr += 1
+        # 1) Write separators (-2) at pre-computed positions
+        if self._sep_agent_col.shape[0] > 0:
+            paths[self._sep_agent_col[:, 0], self._sep_agent_col[:, 1]] = -2
+        # 2) Write first edges
+        paths[self._fe_agent_col[:, 0], self._fe_agent_col[:, 1]] = (
+            self.first_edges_all_legs[self._fe_leg_ptr]
+        )
+        # 3) Write route edges — only valid (non -1) positions contribute
+        #    re_values: [NumRouteSlots] – raw route edge values (may be -1 for padding)
+        re_values = selected_routes[self._re_leg_ptr, self._re_route_pos]  # [NumRouteSlots]
+        # We only scatter valid edges; padding (-1) leaves paths at its -1 default.
+        valid_re = re_values >= 0
+        if valid_re.any():
+            paths[
+                self._re_agent_col[valid_re, 0],
+                self._re_agent_col[valid_re, 1]
+            ] = re_values[valid_re]
 
         # ── Run the bandit simulation ────────────────────────────────
-        # Blindage du tenseur paths avant passage au simulateur
         paths = paths.detach().contiguous()
         self.bandit.reset(paths)
         _ = self.bandit.step()  # Returns [A] per-vehicle rewards, we ignore it
 
-        # ── Extract per-leg rewards and update history ───────────────
-        # leg_metrics shape: [A, MaxLegs, 2] -> [:, :, 1] is final travel time
+        # ── Extract per-leg rewards — GPU Opt-1 ─────────────────────
+        # leg_metrics shape: [A, MaxLegs, 2] → [:, :, 1] is final travel time
         tt_matrix = self.bandit.dnl.leg_metrics[:, :, 1]
-        
-        rewards = np.zeros(self.num_envs, dtype=np.float32)
-        tt_obs = torch.zeros(self.num_envs, device=self._device)
-        for idx, (i, leg_j) in enumerate(self.leg_to_agent):
-            tt = float(tt_matrix[i, leg_j].item())
-            rewards[idx] = -tt
-            tt_obs[idx] = tt
+        # Vectorized gather: zero Python loop, single GPU index op
+        tt_obs = tt_matrix[self._leg_agent_idx, self._leg_leg_idx]  # [TotalLegs] on device
+        rewards = (-tt_obs).cpu().numpy().astype(np.float32)         # one device→host copy
 
         # ── Extract edge costs for semi-bandit feedback ──
         semi_bandit_costs = None
@@ -336,7 +429,7 @@ class AgentLevelWrapper:
         )
         
         path_metrics = compute_empirical_nash_metrics_tensor(
-            actual_travel_times=torch.tensor(travel_times, device=self._device),
+            actual_travel_times=tt_obs,  # already on device, no numpy round-trip
             actions=actions_t,
             estimated_times=estimated_times
         )
