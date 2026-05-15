@@ -191,7 +191,8 @@ class AgentLevelWrapper:
         # Routes in paths[] MUST be compact (no -1 gaps before -2 separators).
         # We store "assumed" fe base columns (assuming max_rl per prior leg).
         # At step()-time we correct using actual route lengths via cumsum.
-        _max_rl = max_route_len
+        self._max_rl = max_route_len
+        _max_rl = self._max_rl  # local alias for the loop below
         leg_agent_list  = []
         leg_fe_base     = []   # fe col assuming max_rl per all prior legs of same agent
         leg_is_first    = []   # True if leg_j == 0 (no separator before fe)
@@ -369,6 +370,7 @@ class AgentLevelWrapper:
 
         # Column correction per leg: sum of (max_rl - actual_len) for all PRIOR legs of same agent.
         # This accounts for the difference between assumed (max_rl) and actual column positions.
+        _max_rl = self._max_rl  # max route length (set in __init__)
         savings = (_max_rl - actual_len_vals).long()  # [TotalLegs]
 
         # For each leg, correction = exclusive cumsum of savings within the same agent group.
