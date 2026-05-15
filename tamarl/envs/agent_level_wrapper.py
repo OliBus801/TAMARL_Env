@@ -375,7 +375,9 @@ class AgentLevelWrapper:
 
         # For each leg, correction = exclusive cumsum of savings within the same agent group.
         # Legs of the same agent are contiguous in our ordering.
-        agent_per_leg = self._leg_agent2[first_slot_indices]  # [TotalLegs]
+        # NOTE: first_slot_indices are positions in the FLAT re array (size TotalLegs*MaxRouteLen).
+        #       We must go through leg_ids to get actual leg IDs before indexing [TotalLegs]-sized tensors.
+        agent_per_leg = self._leg_agent2[leg_ids[first_slot_indices]]  # [TotalLegs] agent ID per leg
         savings_cumsum = torch.cumsum(savings, dim=0)          # global cumsum
 
         # Offset at first leg of each agent = savings_cumsum value JUST BEFORE that leg
