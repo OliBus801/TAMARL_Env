@@ -214,7 +214,12 @@ def load_scenario(
             else:
                 pop_candidates = [p for p in pop_candidates if population_filter in p]
         if pop_candidates:
-            population_file = os.path.join(root_folder, pop_candidates[0])
+            # Prioritize 'routed' files if available
+            routed_candidates = [p for p in pop_candidates if 'routed' in p.lower()]
+            if routed_candidates:
+                population_file = os.path.join(root_folder, routed_candidates[0])
+            else:
+                population_file = os.path.join(root_folder, pop_candidates[0])
 
     if not network_file:
         raise FileNotFoundError(f"No network file found in {root_folder}")
