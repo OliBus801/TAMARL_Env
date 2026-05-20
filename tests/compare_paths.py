@@ -216,7 +216,8 @@ def main():
                         
         results[label] = {
             'metrics': metrics,
-            'load': load_tensor.numpy()
+            'load': load_tensor.numpy(),
+            'paths_dict': paths_dict
         }
 
     # 1. Overlap Histogram (Jaccard Index)
@@ -226,9 +227,9 @@ def main():
         if jaccards:
             plt.hist(jaccards, bins=50, alpha=0.5, label=label, density=True)
     
-    plt.title('Distribution de l\'Indice de Jaccard Moyen (Overlapping)')
-    plt.xlabel('Indice de Jaccard (0 = Disjoint, 1 = Identique)')
-    plt.ylabel('Densité')
+    plt.title('Distribution of Mean Jaccard Index (Overlap)')
+    plt.xlabel('Jaccard Index (0 = Disjoint, 1 = Identical)')
+    plt.ylabel('Density')
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.savefig(os.path.join(args.save_dir, 'jaccard_histogram.png'), dpi=300, bbox_inches='tight')
@@ -245,9 +246,9 @@ def main():
         if dissim:
             plt.scatter(dissim, length_ratio, alpha=0.5, label=label, s=10)
         
-    plt.title('Trade-off: Diversité vs Allongement du Trajet')
-    plt.xlabel('Dissimilarité (1 - Indice de Jaccard)')
-    plt.ylabel('Ratio d\'Allongement (Coût Moyen / Coût Min)')
+    plt.title('Trade-off: Diversity vs Route Elongation')
+    plt.xlabel('Dissimilarity (1 - Jaccard Index)')
+    plt.ylabel('Elongation Ratio (Mean Cost / Min Cost)')
     plt.axhline(y=1.0, color='r', linestyle='--', alpha=0.5)
     plt.axvline(x=0.0, color='r', linestyle='--', alpha=0.5)
     plt.legend()
@@ -277,10 +278,83 @@ def main():
             
             # Save simple static map plot as well
             fig, ax = plt.subplots(figsize=(12, 12))
+            
+            # Plot base network
+            all_geoms = [geom for geom in edge_geometries if geom is not None]
+            base_gdf = gpd.GeoDataFrame(geometry=all_geoms)
+            base_gdf.plot(ax=ax, color='lightgray', linewidth=0.5, alpha=0.5)
+
             gdf.plot(column='load', cmap='hot_r', linewidth=gdf['load']/gdf['load'].max() * 5, ax=ax, legend=True)
-            plt.title(f'Heatmap de Densité des Chemins - {label}')
+            plt.title(f'Path Density Heatmap - {label}')
             ax.set_axis_off()
             plt.savefig(os.path.join(args.save_dir, f'heatmap_{label}.png'), dpi=300, bbox_inches='tight')
+            if args.show:
+                plt.show()
+            plt.close()
+
+    # 4. Random OD K-Paths Visualization
+    import random
+    
+    # We need to find an OD pair that has paths in ALL methods to make a fair comparison
+    common_ods = None
+    for data in results.values():
+        ods = set([od for od, paths in data['paths_dict'].items() if len(paths) > 0])
+        if common_ods is None:
+            common_ods = ods
+        else:
+            common_ods = common_ods.intersection(ods)
+            
+    if common_ods:
+        sample_od = random.choice(list(common_ods))
+        print(f"Selected random OD pair {sample_od} for K-paths visualization.")
+        
+        for label, data in results.items():
+            paths = data['paths_dict'].get(sample_od, [])
+            if not paths:
+                continue
+                
+            fig, ax = plt.subplots(figsize=(12, 12))
+            # Plot base network
+            all_geoms = [geom for geom in edge_geometries if geom is not None]
+            base_gdf = gpd.GeoDataFrame(geometry=all_geoms)
+            base_gdf.plot(ax=ax, color='lightgray', linewidth=0.5, alpha=0.5)
+            
+            # Plot K paths
+            colors = plt.cm.tab10(np.linspace(0, 1, len(paths)))
+            for p_idx, path in enumerate(paths):
+                path_geoms = [edge_geometries[eid] for eid in path if eid < len(edge_geometries) and edge_geometries[eid] is not None]
+                if path_geoms:
+                    p_gdf = gpd.GeoDataFrame(geometry=path_geoms)
+                    # We can add an offset to geometries so they don't exactly overlap, but line width or alpha also helps
+                    # We plot each path with decreasing line width so they all show up if they overlap perfectly
+                    lw = max(1.0, 5.0 - p_idx * 0.5)
+                    p_gdf.plot(ax=ax, color=colors[p_idx], linewidth=lw, alpha=0.8, label=f"Path {p_idx+1}")
+            
+            # Plot Origin & Destination red dots and labels
+            o_id = idx_to_u_id.get(sample_od[0])
+            d_id = idx_to_u_id.get(sample_od[1])
+            o_coord = nodes_coords.get(o_id) if o_id else None
+            d_coord = nodes_coords.get(d_id) if d_id else None
+            
+            if o_coord:
+                ax.plot(o_coord[0], o_coord[1], 'ro', markersize=10, zorder=5)
+                ax.text(o_coord[0], o_coord[1], ' Origin', color='red', fontsize=12, fontweight='bold', ha='left', va='bottom', zorder=6)
+            if d_coord:
+                ax.plot(d_coord[0], d_coord[1], 'ro', markersize=10, zorder=5)
+                ax.text(d_coord[0], d_coord[1], ' Destination', color='red', fontsize=12, fontweight='bold', ha='left', va='bottom', zorder=6)
+
+            plt.title(f'Top-K Paths for OD {sample_od} - {label}')
+            ax.set_axis_off()
+            
+            # Create custom legend
+            from matplotlib.lines import Line2D
+            custom_lines = [Line2D([0], [0], color=colors[i], lw=2) for i in range(len(paths))]
+            # Include Origin/Destination marker in legend as well
+            custom_lines.append(Line2D([0], [0], marker='o', color='red', linestyle='', markersize=10))
+            legend_labels = [f"Path {i+1}" for i in range(len(paths))] + ["O/D Nodes"]
+            ax.legend(custom_lines, legend_labels)
+            
+            plt.savefig(os.path.join(args.save_dir, f'k_paths_OD_{sample_od[0]}_{sample_od[1]}_{label}.png'), dpi=300, bbox_inches='tight')
             if args.show:
                 plt.show()
             plt.close()

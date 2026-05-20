@@ -36,7 +36,7 @@ wandb/
 graphs/
 output/
 *.csv
-
+*.geojson
 
 # C extensions
 *.so

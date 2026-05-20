@@ -127,19 +127,19 @@ def _enumerate_yen_paths(
 # ===========================================================================
 
 def _init_sidetrack_worker(
-    rx_graph, node_edge_map: Dict[Tuple[int, int], int]
+    nx_graph, node_edge_map: Dict[Tuple[int, int], int]
 ) -> None:
-    global _WORKER_RX_GRAPH
-    _WORKER_RX_GRAPH = (rx_graph, node_edge_map)
-
+    global _WORKER_NX_GRAPH
+    _WORKER_NX_GRAPH = (nx_graph, node_edge_map)
 
 def _compute_sidetrack_chunk(
     od_chunk: np.ndarray, k: int
 ) -> Dict[Tuple[int, int], List[List[int]]]:
-    import rustworkx as rx  # local import – only needed in worker subprocess
+    import networkx as nx
+    from itertools import islice
 
-    global _WORKER_RX_GRAPH
-    G, node_edge_map = _WORKER_RX_GRAPH
+    global _WORKER_NX_GRAPH
+    G, node_edge_map = _WORKER_NX_GRAPH
     result: Dict[Tuple[int, int], List[List[int]]] = {}
 
     for i in range(od_chunk.shape[0]):
@@ -149,9 +149,7 @@ def _compute_sidetrack_chunk(
             result[od_key] = [[]]
             continue
         try:
-            paths_nodes = rx.digraph_k_shortest_simple_paths(
-                G, o, d, k, weight_fn=lambda e: float(e)
-            )
+            paths_nodes = list(islice(nx.shortest_simple_paths(G, o, d, weight="weight"), k))
             paths = []
             for node_path in paths_nodes:
                 if len(node_path) < 2:
@@ -181,7 +179,7 @@ def _enumerate_sidetrack_paths(
     k: int,
 ) -> Dict[Tuple[int, int], List[List[int]]]:
     """Exact k-shortest loopless paths via rustworkx (Rust backend)."""
-    import rustworkx as rx
+    import networkx as nx
 
     # Filter parallel edges – keep only the fastest per (u, v)
     edge_dict: Dict[Tuple[int, int], Tuple[int, float]] = {}
@@ -191,11 +189,11 @@ def _enumerate_sidetrack_paths(
         if (u, v) not in edge_dict or w < edge_dict[(u, v)][1]:
             edge_dict[(u, v)] = (e, w)
 
-    G = rx.PyDiGraph()
-    G.add_nodes_from([None] * num_nodes)  # preserve node indices 0..num_nodes-1
+    G = nx.DiGraph()
+    G.add_nodes_from(range(num_nodes))
     node_edge_map: Dict[Tuple[int, int], int] = {}
     for (u, v), (orig_id, w) in edge_dict.items():
-        G.add_edge(u, v, w)
+        G.add_edge(u, v, weight=w)
         node_edge_map[(u, v)] = orig_id
 
     num_workers = os.cpu_count() or 4
@@ -287,15 +285,23 @@ def _compute_penalty_chunk(
         # Fresh copy of weights for each (o, d)
         weights = _WORKER_BASE_WEIGHTS.copy()
         paths: List[List[int]] = []
+        
+        max_attempts = k * 10
+        attempts = 0
 
-        for _ in range(k):
+        while len(paths) < k and attempts < max_attempts:
             path = _dijkstra_penalty(_WORKER_ADJ, weights, o, d)
+            attempts += 1
             if path is None:
                 break
-            paths.append(path)
-            # Penalize all edges used by this path
+                
+            # Penalize all edges used by this path to force exploration
             for eid in path:
                 weights[eid] *= penalty_factor
+                
+            # Only append if strictly distinct
+            if path not in paths:
+                paths.append(path)
 
         result[od_key] = paths
     return result
