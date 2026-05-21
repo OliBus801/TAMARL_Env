@@ -44,11 +44,13 @@ class DTABanditEnv:
         stuck_threshold: int = 10,
         track_events: bool = False,
         link_tt_interval: float = 300.0,
+        profile_memory: bool = False,
     ):
         self._scenario_path = scenario_path
         self._max_steps = max_steps
         self._device = device
         self._seed = seed
+        self._profile_memory = profile_memory
 
         # Load scenario (network + population)
         self.scenario = load_scenario(
@@ -132,6 +134,11 @@ class DTABanditEnv:
             # Early exit when every agent is done
             if self.dnl.active_agents_count == 0:
                 break
+                
+            if self._profile_memory and self.dnl.current_step % 10000 == 0 and self.dnl.current_step > 0:
+                from tamarl.core.memory_profiler import analyze_tensor_memory
+                analyze_tensor_memory(f"STEP {self.dnl.current_step}")
+                
             self.dnl.step()
 
         # Extract per-agent travel time from leg_metrics

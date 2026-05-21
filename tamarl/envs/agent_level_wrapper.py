@@ -338,7 +338,7 @@ class AgentLevelWrapper:
             
             # Compute rank of each valid edge within its row using int32
             valid_int = valid_mask.to(torch.int32)
-            valid_cs = torch.cumsum(valid_int, dim=1)
+            valid_cs = torch.cumsum(valid_int, dim=1, dtype=torch.int32)
             # We only extract the rank for the valid entries (1D array)
             valid_rank = valid_cs[valid_mask] - 1
             
@@ -346,6 +346,17 @@ class AgentLevelWrapper:
             dest_flat_valid = leg_write_start[valid_row_indices] + 1 + valid_rank
             
             paths_flat[dest_flat_valid] = selected_routes[valid_mask].int()
+
+        # Free all CSR intermediates before starting the long simulation loop
+        del valid_mask, route_lens, leg_total, leg_contrib_with_sep, leg_is_first, first_mask
+        del global_cs, agent_cs_start, intra_offset, leg_write_start, non_first
+        if 'valid_int' in locals():
+            del valid_int, valid_cs, valid_rank, valid_row_indices, dest_flat_valid
+            
+        # Also, selected_routes might be needed for semi_bandit_costs below
+        # but we only need a safe version of it. So let's delete it if we don't need it.
+        # Wait, selected_routes is used in semi_bandit_costs if self.feedback_type == "semi".
+        # We can't delete selected_routes yet if semi-bandit. 
 
         # ── Run the bandit simulation ────────────────────────────────
         paths_flat = paths_flat.detach().contiguous()
@@ -380,6 +391,10 @@ class AgentLevelWrapper:
             
             # Set costs for padding positions to 0
             semi_bandit_costs = torch.where(selected_routes >= 0, semi_bandit_costs, torch.zeros_like(semi_bandit_costs))
+            
+        # Now we can safely delete selected_routes
+        del selected_routes
+        import gc; gc.collect()
 
         # ── Package outputs ──────────────────────────────────────────
         terminated = np.ones(self.num_envs, dtype=bool)

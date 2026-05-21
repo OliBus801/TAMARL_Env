@@ -211,7 +211,7 @@ def get_memory_usage():
     mem_info = process.memory_info()
     return mem_info.rss / 1024 / 1024 # MB
 
-def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_factor=1.0, start_hour=0, end_hour=24, save_pickle=False, load_pickle=True, save_paths=False, save_legs=False, save_events=False, track_events=True, output_folder="output", seed=None):
+def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_factor=1.0, start_hour=0, end_hour=24, save_pickle=False, load_pickle=True, save_paths=False, save_legs=False, save_events=False, track_events=True, output_folder="output", seed=None, profile_memory=False):
     
     process = psutil.Process(os.getpid())
     def get_mem():
@@ -453,9 +453,20 @@ def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_facto
     
     print(f"Starting simulation loop... ({start_hour}h -> {end_hour}h)")
     t0 = time.time()
+    
+    if profile_memory:
+        from tamarl.core.memory_profiler import analyze_tensor_memory
+        analyze_tensor_memory("BEFORE EPISODE")
+    
     while active and step < max_steps:
         dnl.step()
         step += 1
+        
+        if profile_memory and step % 10000 == 0:
+            analyze_tensor_memory(f"STEP {step}")
+            
+    if profile_memory:
+        analyze_tensor_memory("AFTER EPISODE")
             
         if step % 3600 == 0:
             t1 = time.time()
@@ -622,11 +633,11 @@ if __name__ == "__main__":
     parser.add_argument("--timestep", help="Time step size of each simulation step, by default 1 second.", default=1)
     parser.add_argument("--output_folder", help="Output folder for results.", default="output")
     parser.add_argument("--seed", help="Seed for random number generator. Used in priority calculation", default=None)
-
+    parser.add_argument("--profile_memory", help="Enable tensor memory profiling during the benchmark.", action="store_true")
 
     args = parser.parse_args()
     
     if not os.path.exists(args.root_folder):
         print(f"Root folder not found: {args.root_folder}")
     else:
-        run_benchmark(args.root_folder, args.population, timestep=float(args.timestep), scale_factor=float(args.scale_factor), start_hour=args.hours[0], end_hour=args.hours[1], save_pickle=args.save_pickle, load_pickle=not args.no_load_pickle, save_paths=args.save_paths, save_legs=args.save_legs, save_events=args.save_events, track_events=args.track_events, output_folder=args.output_folder, seed=int(args.seed) if args.seed is not None else None)
+        run_benchmark(args.root_folder, args.population, timestep=float(args.timestep), scale_factor=float(args.scale_factor), start_hour=args.hours[0], end_hour=args.hours[1], save_pickle=args.save_pickle, load_pickle=not args.no_load_pickle, save_paths=args.save_paths, save_legs=args.save_legs, save_events=args.save_events, track_events=args.track_events, output_folder=args.output_folder, seed=int(args.seed) if args.seed is not None else None, profile_memory=args.profile_memory)

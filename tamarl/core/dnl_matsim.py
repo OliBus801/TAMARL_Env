@@ -95,7 +95,6 @@ class TorchDNLMATSim:
 
         # Event tracking -- uses a pre-allocated GPU tensor buffer instead of Python list
         self.track_events = track_events
-        self._init_event_buffer()
 
         # Test number of interactions
         self.interactions = 0
@@ -146,6 +145,9 @@ class TorchDNLMATSim:
             if departure_times is None:
                 raise ValueError("departure_times is mandatory in RL mode (paths=None).")
             self.num_agents = departure_times.shape[0]
+            
+        # Initialize event buffer now that self.num_agents is defined
+        self._init_event_buffer()
             
         # Multi-leg definitions
         if num_legs is not None:
@@ -260,8 +262,10 @@ class TorchDNLMATSim:
     def _init_event_buffer(self):
         """Initialize event buffer as a pre-allocated tensor (or None if not tracking)."""
         if self.track_events:
-            # Pre-allocate for ~5M events on GPU, periodically flush to CPU
-            self._event_chunk_size = 5_000_000
+            # Scale the GPU chunk size based on population: ~20 events per agent per chunk
+            # Bound between 500k and 5M to avoid massive initial allocations or tiny chunks
+            estimated = max(500_000, self.num_agents * 20)
+            self._event_chunk_size = min(estimated, 5_000_000)
             self._event_buffer = torch.empty((self._event_chunk_size, 4), device=self.device, dtype=torch.int32)
             self._event_count = 0
             self._cpu_events_blocks = []

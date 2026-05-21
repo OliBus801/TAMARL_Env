@@ -26,9 +26,10 @@ from tamarl.envs.scenario_loader import load_scenario
 from tamarl.rl.wandb_logger import WandbLogger
 from tamarl.rl.render_helper import render_episode
 from tamarl.rl.agents.random_agent import RandomAgent
+from tamarl.core.memory_profiler import analyze_tensor_memory
 
 
-def run_episode(env, agent, epsilon_ratio: float = 0.10):
+def run_episode(env, agent, epsilon_ratio: float = 0.10, profile_memory: bool = False):
     """Run a single episode using the bandit paradigm.
 
     Génère un tenseur ``aggregation_indices`` [N] qui est passé uniformément
@@ -41,6 +42,9 @@ def run_episode(env, agent, epsilon_ratio: float = 0.10):
     L'agent ne voit jamais la distinction : il projette toujours ses poids
     [B, K] via self.weights[aggregation_indices] et agrège via scatter_add_.
     """
+    if profile_memory:
+        analyze_tensor_memory("BEFORE EPISODE")
+    
     with torch.no_grad():
         obs, infos = env.reset()
     device = getattr(env, "_device", "cpu")
@@ -93,6 +97,9 @@ def run_episode(env, agent, epsilon_ratio: float = 0.10):
         rewards_t = torch.from_numpy(rewards).to(device)
         agent.update(actions_t, rewards_t, aggregation_indices=aggregation_indices)
 
+    if profile_memory:
+        analyze_tensor_memory("AFTER EPISODE")
+    
     return _compute_stats(env, rewards, infos, wall_time, len(actions), epsilon_ratio)
 
 
@@ -191,6 +198,8 @@ def train(
     # Exp3
     exp3_eta: float = 0.01,
     exp3_gamma: float = 0.05,
+    # Profiling
+    profile_memory: bool = False,
 ):
     """Run the training loop for the One-Shot Bandit environment.
 
@@ -276,6 +285,7 @@ def train(
         seed=seed,
         track_events=need_events,
         link_tt_interval=link_tt_interval,
+        profile_memory=profile_memory,
     )
     
     # 2. Wrap it in the appropriate wrapper (based on formulation)
@@ -497,7 +507,7 @@ def train(
             
 
 
-        stats = run_episode(env, agent, epsilon_ratio)
+        stats = run_episode(env, agent, epsilon_ratio, profile_memory=profile_memory)
         
         # Accumulate cumulative regret
         if 'max_regret' in stats:
@@ -794,6 +804,8 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="Start and end hours for rendering")
     parser.add_argument("--render_speed", type=int, default=None, help="Speed factor for rendering")
 
+    parser.add_argument("--profile_memory", action="store_true", help="Enable memory profiling")
+
     parser.add_argument("--epsilon_start", type=float, default=None)
     parser.add_argument("--epsilon_end", type=float, default=None)
     parser.add_argument("--epsilon_decay", type=float, default=None)
@@ -845,6 +857,7 @@ _CLI_TO_KWARGS = {
     "render_speed": "render_speed",
     "epsilon_ratio": "epsilon_ratio",
     "link_tt_interval": "link_tt_interval",
+    "profile_memory": "profile_memory",
 }
 
 
