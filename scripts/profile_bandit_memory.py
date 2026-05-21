@@ -60,23 +60,15 @@ def run_bandit_profiling(kwargs):
         torch.cuda.empty_cache()
         mem_before_step = torch.cuda.memory_allocated() / 1024**2
     
-    # We profile the run_episode function
-    activities = [torch.profiler.ProfilerActivity.CPU]
+    # Execute the full episode cycle manually tracking memory (Zero overhead)
     if device == 'cuda':
-        activities.append(torch.profiler.ProfilerActivity.CUDA)
-
-    with torch.profiler.profile(
-        activities=activities,
-        schedule=torch.profiler.schedule(wait=0, warmup=0, active=1, repeat=1),
-        on_trace_ready=torch.profiler.tensorboard_trace_handler('./profiler_logs_bandit'),
-        record_shapes=True,
-        profile_memory=True,
-        with_stack=False  # CRITICAL: with_stack=True over a full episode causes massive memory leaks & OOM
-    ) as prof:
+        torch.cuda.reset_peak_memory_stats()
         
-        # Execute the full episode cycle: reset -> select actions -> env.step -> reward/update
-        run_episode(env, agent)
-        prof.step()
+    t0 = time.time()
+    run_episode(env, agent)
+    elapsed = time.time() - t0
+    
+    print(f"\nEpisode finished in {elapsed:.2f} seconds.")
 
     if device == 'cuda':
         mem_after_step = torch.cuda.memory_allocated() / 1024**2
@@ -87,7 +79,6 @@ def run_bandit_profiling(kwargs):
         with open("memory_summary_bandit.txt", "w") as f:
             f.write(torch.cuda.memory_summary(device=device))
         print("\nSaved detailed memory summary to memory_summary_bandit.txt")
-        print("PyTorch profiler logs saved to ./profiler_logs_bandit")
 
     # Final breakdown of DNL inside bandit
     if bandit.dnl is not None:
