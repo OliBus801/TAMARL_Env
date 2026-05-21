@@ -92,7 +92,7 @@ def run_bandit_profiling(scenario_path, population_filter, top_k_paths=3, max_st
     if bandit.dnl is not None:
         print("\n--- Final Breakdown of inner TorchDNLMATSim ---")
         tensors = [
-            ('paths', bandit.dnl.paths),
+            ('paths_flat', getattr(bandit.dnl, 'paths_flat', None)),
             ('interval_tt_sum', getattr(bandit.dnl, 'interval_tt_sum', None)),
         ]
         for name, t in tensors:

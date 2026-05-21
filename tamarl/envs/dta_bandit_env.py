@@ -74,24 +74,29 @@ class DTABanditEnv:
     #  Public API
     # ──────────────────────────────────────────────────────────────────
 
-    def reset(self, paths: torch.Tensor) -> None:
+    def reset(self, paths: torch.Tensor = None, paths_flat: torch.Tensor = None, path_offsets: torch.Tensor = None) -> None:
         """Configure the DNL with the given paths and prepare for step().
 
         Args:
-            paths: [A, MaxPathLen] int tensor of edge indices, padded
-                   with -1.  Each row is a full route for one agent.
-                   Multi-leg routes use -2 as leg separator.
+            paths: DEPRECATED. [A, MaxPathLen] int tensor (dense format).
+            paths_flat: [TotalEdges] int32 tensor of compact edge indices (CSR format).
+            path_offsets: [A+1] long tensor of CSR offsets into paths_flat.
         """
-        assert paths.shape[0] == self.num_agents, (
-            f"paths has {paths.shape[0]} agents, expected {self.num_agents}"
+        if paths_flat is not None:
+            num_agents_check = path_offsets.shape[0] - 1
+        elif paths is not None:
+            num_agents_check = paths.shape[0]
+        else:
+            raise ValueError("Must provide either paths or paths_flat + path_offsets.")
+            
+        assert num_agents_check == self.num_agents, (
+            f"paths has {num_agents_check} agents, expected {self.num_agents}"
         )
-
-        paths_device = paths.to(self._device, dtype=torch.int32)
 
         # (Re-)create the DNL in paths mode (non-RL)
         self.dnl = TorchDNLMATSim(
             edge_static=self.scenario.edge_static,
-            paths=paths_device,
+            paths=paths,
             device=self._device,
             departure_times=self.scenario.departure_times,
             edge_endpoints=self.scenario.edge_endpoints,
@@ -106,6 +111,8 @@ class DTABanditEnv:
             track_events=self._track_events,
             collect_link_tt=self.collect_link_tt,
             link_tt_interval=self.link_tt_interval,
+            paths_flat=paths_flat,
+            path_offsets=path_offsets,
         )
 
         self.dnl.num_nodes = self.scenario.num_nodes

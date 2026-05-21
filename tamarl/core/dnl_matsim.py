@@ -50,13 +50,15 @@ class TorchDNLMATSim:
                  first_edges: torch.Tensor = None,
                  destinations: torch.Tensor = None,
                  collect_link_tt: bool = False,
-                 link_tt_interval: float = 300.0):
+                 link_tt_interval: float = 300.0,
+                 paths_flat: torch.Tensor = None,
+                 path_offsets: torch.Tensor = None):
         """
         Initialize the TorchDNLMATSim simulation engine.
         
         Args:
             edge_static: Tensor [E, 5] -> [length, free_flow_speed, capacity_storage (c_e), capacity_flow (D_e per hour), ff_travel_time]
-            paths: Tensor [A, MaxPathLen] -> Pre-calculated path indices for each agent. None for RL mode.
+            paths: DEPRECATED. Dense tensor [A, MaxPathLen]. Use paths_flat + path_offsets instead.
             device: Device to run on ('cuda' or 'cpu').
             departure_times: Tensor [A] -> Departure times for each agent.
             edge_endpoints: Tensor [E, 2] -> [from_node, to_node] for connectivity validation.
@@ -69,6 +71,8 @@ class TorchDNLMATSim:
             track_events: If True, records MATSim-style simulation events.
             first_edges: Tensor [A, MaxLegs] -> First edge for each leg (RL mode only).
             destinations: Tensor [A, MaxLegs] -> Destination node for each leg (RL mode only).
+            paths_flat: Tensor [TotalEdges] -> 1D compact edge indices for all agents concatenated.
+            path_offsets: Tensor [A+1] -> CSR-style offsets into paths_flat per agent.
         """
         self.device = device
         self.stuck_threshold = stuck_threshold
@@ -105,19 +109,43 @@ class TorchDNLMATSim:
         # Move constants to device
         self.edge_static = edge_static.to(device)
         
-        # RL mode: paths is None, routes are decided dynamically by the environment
-        self.rl_mode = (paths is None)
+        # RL mode: paths is None AND paths_flat is None
+        self.rl_mode = (paths is None and paths_flat is None)
         
         if not self.rl_mode:
-            self.paths = paths.to(device).long()
-            self.num_agents = self.paths.shape[0]
-            self.max_path_len = self.paths.shape[1]
+            # Sparse CSR format (preferred): paths_flat + path_offsets
+            if paths_flat is not None:
+                self.paths_flat = paths_flat.to(device, dtype=torch.int32)
+                self.path_offsets = path_offsets.to(device, dtype=torch.long)
+                self.num_agents = self.path_offsets.shape[0] - 1
+            else:
+                # Legacy dense format: convert to CSR on the fly
+                paths_dev = paths.to(device, dtype=torch.int32)
+                self.num_agents = paths_dev.shape[0]
+                flat_list = []
+                offsets = [0]
+                for i in range(self.num_agents):
+                    row = paths_dev[i]
+                    # Find last valid (non -1) element, keeping -2 separators
+                    valid_mask = row != -1
+                    if valid_mask.any():
+                        last_valid = valid_mask.nonzero(as_tuple=True)[0][-1].item()
+                        flat_list.append(row[:last_valid + 1])
+                        offsets.append(offsets[-1] + last_valid + 1)
+                    else:
+                        offsets.append(offsets[-1])
+                if flat_list:
+                    self.paths_flat = torch.cat(flat_list).to(device, dtype=torch.int32)
+                else:
+                    self.paths_flat = torch.empty(0, device=device, dtype=torch.int32)
+                self.path_offsets = torch.tensor(offsets, device=device, dtype=torch.long)
+                del paths_dev
         else:
-            self.paths = None
+            self.paths_flat = None
+            self.path_offsets = None
             if departure_times is None:
                 raise ValueError("departure_times is mandatory in RL mode (paths=None).")
             self.num_agents = departure_times.shape[0]
-            self.max_path_len = 0  # Not used in RL mode
             
         # Multi-leg definitions
         if num_legs is not None:
@@ -200,7 +228,7 @@ class TorchDNLMATSim:
 
         # Pre-set first edge as next_edge for waiting agents
         if not self.rl_mode:
-            self.next_edge[:] = self.paths[:, 0]
+            self.next_edge[:] = self.paths_flat[self.path_offsets[:-1]].long()
         else:
             # RL mode: first_edges must be provided
             if first_edges is None:
@@ -280,7 +308,7 @@ class TorchDNLMATSim:
         self.current_edge.fill_(-1)
         self.current_leg.fill_(0)
         if not self.rl_mode:
-            self.next_edge[:] = self.paths[:, 0]
+            self.next_edge[:] = self.paths_flat[self.path_offsets[:-1]].long()
         else:
             self._first_edges = self._all_first_edges[:, 0]
             self.next_edge[:] = self._first_edges
@@ -554,10 +582,12 @@ class TorchDNLMATSim:
 
         # Determine exiter vs mover
         if not self.rl_mode:
-            # Path-based: exiter if next path step is beyond path or padding/sentinel
-            is_exiter = (next_ptrs_sorted >= self.max_path_len)
+            # Path-based: exiter if next path step is beyond agent's path length or is a sentinel
+            agent_path_lens = self.path_offsets[arrived_sorted + 1] - self.path_offsets[arrived_sorted]
+            is_exiter = (next_ptrs_sorted >= agent_path_lens)
             valid = ~is_exiter
-            path_next = self.paths[arrived_sorted[valid], next_ptrs_sorted[valid]]
+            abs_ptrs = self.path_offsets[arrived_sorted[valid]] + next_ptrs_sorted[valid]
+            path_next = self.paths_flat[abs_ptrs].long()
             is_exiter[valid] = (path_next == -1) | (path_next == -2)
         else:
             # RL mode: exiter if current edge's to_node == agent's destination
@@ -664,10 +694,12 @@ class TorchDNLMATSim:
         self.next_edge[winners] = -1  # Default: needs decision (RL) or end-of-path
         if not self.rl_mode:
             w_next_ptrs = next_ptrs_sorted[proc_win_mask]
-            valid_ptr = w_next_ptrs < self.max_path_len
+            w_agent_path_lens = self.path_offsets[winners + 1] - self.path_offsets[winners]
+            valid_ptr = w_next_ptrs < w_agent_path_lens
             valid_winners = winners[valid_ptr]
             valid_w_next_ptrs = w_next_ptrs[valid_ptr]
-            self.next_edge[valid_winners] = self.paths[valid_winners, valid_w_next_ptrs]
+            abs_ptrs = self.path_offsets[valid_winners] + valid_w_next_ptrs
+            self.next_edge[valid_winners] = self.paths_flat[abs_ptrs].long()
         # In RL mode, next_edge stays -1 → environment will set it before next step()
 
     # =========================================================================
@@ -755,8 +787,9 @@ class TorchDNLMATSim:
                     # We just need to advance path_ptr by 2 (current is -2, next is start)
                     self.path_ptr[cont_agents] += 2
                     next_ptrs = self.path_ptr[cont_agents]
-                    # safe because next_ptrs < max_path_len by definition of having more legs
-                    self.next_edge[cont_agents] = self.paths[cont_agents, next_ptrs]
+                    # safe because next_ptrs < agent path len by definition of having more legs
+                    abs_ptrs = self.path_offsets[cont_agents] + next_ptrs
+                    self.next_edge[cont_agents] = self.paths_flat[abs_ptrs].long()
                 else:
                     self.next_edge[cont_agents] = self._all_first_edges[cont_agents, new_legs]
 
@@ -831,10 +864,12 @@ class TorchDNLMATSim:
         self.next_edge[winners] = -1  # Default: needs decision (RL) or end-of-path
         if not self.rl_mode:
             next_ptrs = self.path_ptr[winners] + 1
-            valid_ptr_mask = next_ptrs < self.max_path_len
+            w_agent_path_lens = self.path_offsets[winners + 1] - self.path_offsets[winners]
+            valid_ptr_mask = next_ptrs < w_agent_path_lens
             v_agents = winners[valid_ptr_mask]
             v_next_ptrs = next_ptrs[valid_ptr_mask]
-            self.next_edge[v_agents] = self.paths[v_agents, v_next_ptrs]
+            abs_ptrs = self.path_offsets[v_agents] + v_next_ptrs
+            self.next_edge[v_agents] = self.paths_flat[abs_ptrs].long()
         # In RL mode, next_edge stays -1 → environment will set it before next step()
 
     # =========================================================================
@@ -935,7 +970,10 @@ class TorchDNLMATSim:
         """
         en_route_mask = (self.status == 1) | (self.status == 2)
         pointers = self.path_ptr[en_route_mask]
-        hist = torch.histc(pointers.float(), bins=self.max_path_len, min=0, max=self.max_path_len-1)
+        if pointers.numel() == 0:
+            return torch.zeros(1, device=self.device)
+        max_ptr = int(pointers.max().item()) + 1
+        hist = torch.histc(pointers.float(), bins=max_ptr, min=0, max=max_ptr-1)
         return hist
 
     def get_events(self):

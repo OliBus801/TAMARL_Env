@@ -365,33 +365,33 @@ def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_facto
     num_agents = len(agents_data)
     
     # Calculate max lengths
-    max_path_len = 0
     max_acts = 0
     for a in agents_data:
-        # lengths of individual legs + sentinels (-2) between them
-        total_len = sum(len(leg) for leg in a['legs']) + len(a['legs']) - 1
-        max_path_len = max(max_path_len, total_len)
         max_acts = max(max_acts, len(a['act_end_times']))
 
-    print(f"Packing {num_agents} paths (max len {max_path_len}, max int_acts {max_acts})...")
-    paths_tensor = torch.full((num_agents, max_path_len), -1, dtype=torch.int32)
+    # Build sparse CSR paths (paths_flat + path_offsets)
+    print(f"Packing {num_agents} paths (CSR format, max int_acts {max_acts})...")
+    flat_list = []
+    offsets = [0]
+    for i, a in enumerate(agents_data):
+        legs = a['legs']
+        agent_edges = []
+        for leg_idx, leg in enumerate(legs):
+            agent_edges.extend(leg)
+            if leg_idx < len(legs) - 1:
+                agent_edges.append(-2)  # sentinel
+        flat_list.extend(agent_edges)
+        offsets.append(len(flat_list))
+    
+    paths_flat = torch.tensor(flat_list, dtype=torch.int32)
+    path_offsets = torch.tensor(offsets, dtype=torch.long)
+    
     act_end_times_tensor = torch.full((num_agents, max_acts), -1, dtype=torch.int32)
     act_durations_tensor = torch.full((num_agents, max_acts), -1, dtype=torch.int32)
     num_legs_tensor = torch.zeros(num_agents, dtype=torch.int32)
     
     for i, a in enumerate(agents_data):
-        legs = a['legs']
-        num_legs_tensor[i] = len(legs)
-        
-        # Build concatenated path with -2 sentinels
-        ptr = 0
-        for leg_idx, leg in enumerate(legs):
-            leg_len = len(leg)
-            paths_tensor[i, ptr:ptr+leg_len] = torch.tensor(leg, dtype=torch.int32)
-            ptr += leg_len
-            if leg_idx < len(legs) - 1:
-                paths_tensor[i, ptr] = -2  # sentinel
-                ptr += 1
+        num_legs_tensor[i] = len(a['legs'])
                 
         # Fill act times
         n_acts = len(a['act_end_times'])
@@ -405,7 +405,7 @@ def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_facto
 
     # Object Sizes
     edge_static_size = edge_static.element_size() * edge_static.nelement() / 1024 / 1024
-    paths_tensor_size = paths_tensor.element_size() * paths_tensor.nelement() / 1024 / 1024
+    paths_flat_size = paths_flat.element_size() * paths_flat.nelement() / 1024 / 1024
     
     # Estimate metadata size
     trips_size = sys.getsizeof(trip_metadata) / 1024 / 1024 
@@ -413,7 +413,7 @@ def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_facto
     print("\n--- 📦 Object Sizes ---")
     print(f"🛣️  Network (edge_static): {edge_static_size:.2f} MB")
     print(f"👥 Population (metadata): {trips_size:.2f} MB")
-    print(f"🔢 Population (paths_tensor): {paths_tensor_size:.2f} MB")
+    print(f"🔢 Population (paths_flat): {paths_flat_size:.2f} MB")
     print("-----------------------\n")
 
     
@@ -425,7 +425,6 @@ def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_facto
     
     dnl = TorchDNLMATSim(
         edge_static, 
-        paths_tensor, 
         device=device, 
         departure_times=departure_times, 
         edge_endpoints=edge_endpoints,
@@ -436,7 +435,9 @@ def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_facto
         seed=seed, 
         stuck_threshold=10,
         enable_profiling=True,
-        track_events=effective_track_events
+        track_events=effective_track_events,
+        paths_flat=paths_flat,
+        path_offsets=path_offsets,
     )
 
     

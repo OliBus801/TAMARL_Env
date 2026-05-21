@@ -151,7 +151,7 @@ class ODLevelWrapper:
                 masks_np[od_idx, k_idx] = (k_idx < len(paths_list))
 
         self.candidate_routes = torch.tensor(
-            cand_np, dtype=torch.long, device=self._device
+            cand_np, dtype=torch.int32, device=self._device
         )  # [Num_Unique_OD, K, MaxRouteLen]
 
         self.action_masks = torch.tensor(
@@ -171,17 +171,7 @@ class ODLevelWrapper:
                 else:
                     self.fftt_matrix[od_idx, k_idx] = np.inf
 
-        # ── Compute max total path length needed for [A, MaxTotal] ───
-        max_total = 0
-        for i in range(A):
-            n = num_legs_np[i]
-            # Each leg: 1 (first edge) + max_route_len (path)
-            # Separators: (n-1)
-            total = n * (1 + max_route_len) + (n - 1)
-            max_total = max(max_total, total)
-        self._max_path_len = int(max_total)
 
-        # ── Gymnasium VectorEnv setup ────────────────────────────────
         self.single_observation_space = spaces.Box(
             low=0, high=np.inf, shape=(top_k,), dtype=np.float32
         )
@@ -254,37 +244,60 @@ class ODLevelWrapper:
         # [TotalLegs, MaxRouteLen]
         selected_routes = self.candidate_routes[self.od_indices_all_legs, actions_t]
 
-        # ── Assemble full multi-leg paths tensor [A, MaxPathLen] ─────
-        paths = torch.full(
-            (A, self._max_path_len), -1,
-            dtype=torch.long, device=self._device
+        # ── Build sparse CSR paths (paths_flat + path_offsets) ────────
+        A = self.bandit.num_agents
+        num_legs_np = self.bandit.scenario.num_legs.cpu()
+        
+        # Compute per-leg valid route lengths (excluding -1 padding)
+        valid_mask = selected_routes >= 0  # [TotalLegs, MaxRouteLen]
+        route_lens = valid_mask.sum(dim=1)  # [TotalLegs]
+        
+        # Per-leg contribution: 1 (first_edge) + route_len
+        leg_total = 1 + route_lens  # [TotalLegs]
+        
+        # Build agent_per_leg mapping
+        agent_per_leg = torch.tensor(
+            [i for i, _ in self.leg_to_agent], dtype=torch.long, device=self._device
         )
-
+        
+        # Sum per-agent
+        agent_flat_len = torch.zeros(A, device=self._device, dtype=torch.long)
+        agent_flat_len.scatter_add_(0, agent_per_leg, leg_total.long())
+        agent_flat_len += (num_legs_np.to(self._device).long() - 1)  # separators
+        
+        # Build CSR offsets [A+1]
+        path_offsets = torch.zeros(A + 1, device=self._device, dtype=torch.long)
+        path_offsets[1:] = torch.cumsum(agent_flat_len, dim=0)
+        total_flat_len = int(path_offsets[-1].item())
+        
+        paths_flat = torch.empty(total_flat_len, device=self._device, dtype=torch.int32)
+        
+        # Fill paths_flat using Python loop (ODLevelWrapper already used a loop)
         leg_ptr = 0
         for i in range(A):
             n_legs = self.bandit.scenario.num_legs[i].item()
-            ptr = 0
+            write_ptr = int(path_offsets[i].item())
             for leg_j in range(n_legs):
                 if leg_j > 0:
-                    paths[i, ptr] = -2  # leg separator
-                    ptr += 1
-
-                paths[i, ptr] = self.first_edges_all_legs[leg_ptr]
-                ptr += 1
-
+                    paths_flat[write_ptr] = -2  # separator
+                    write_ptr += 1
+                
+                paths_flat[write_ptr] = int(self.first_edges_all_legs[leg_ptr].item())
+                write_ptr += 1
+                
                 route = selected_routes[leg_ptr]
-                # Filter out padding (-1)
                 valid_edges = route[route != -1]
                 L = valid_edges.size(0)
-                paths[i, ptr : ptr + L] = valid_edges
-                ptr += L
-
+                if L > 0:
+                    paths_flat[write_ptr:write_ptr + L] = valid_edges.int()
+                    write_ptr += L
+                
                 leg_ptr += 1
 
         # ── Run the bandit simulation ────────────────────────────────
-        # Blindage du tenseur paths avant passage au simulateur
-        paths = paths.detach().contiguous()
-        self.bandit.reset(paths)
+        paths_flat = paths_flat.detach().contiguous()
+        path_offsets = path_offsets.detach().contiguous()
+        self.bandit.reset(paths_flat=paths_flat, path_offsets=path_offsets)
         _ = self.bandit.step()  # Returns [A] per-vehicle rewards, we ignore it
 
         # ── Extract per-leg rewards and update history ───────────────
@@ -358,7 +371,6 @@ class ODLevelWrapper:
         return {
             "num_od_pairs": self.num_od_pairs,
             "K": self.K,
-            "max_path_len": self._max_path_len,
             "num_vehicles": self.num_envs,
             "candidate_routes_shape": list(self.candidate_routes.shape),
         }
