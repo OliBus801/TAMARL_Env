@@ -7,6 +7,8 @@ import inspect
 
 from tamarl.envs.dta_bandit_env import DTABanditEnv
 from tamarl.envs.agent_level_wrapper import AgentLevelWrapper
+from tamarl.envs.od_level_wrapper import ODLevelWrapper
+from tamarl.envs.centralized_level_wrapper import CentralizedLevelWrapper
 from tamarl.rl.agents.random_agent import RandomAgent
 from tamarl.rl.train_bandit import _build_parser, load_config, _CLI_TO_KWARGS, run_episode, train
 
@@ -34,16 +36,22 @@ def run_bandit_profiling(kwargs):
         print(f"VRAM after DTABanditEnv: {mem_bandit:.2f} MB")
 
     top_k_paths = kwargs.get("top_k", 3)
-    print(f"\n--- 2. Instantiating AgentLevelWrapper (top_k={top_k_paths}) ---")
-    env = AgentLevelWrapper(
-        bandit=bandit,
-        top_k=top_k_paths,
-        feedback_type="full"
-    )
+    formulation = kwargs.get("formulation", "agent")
+    feedback_type = kwargs.get("feedback_type", "full")
+    
+    print(f"\n--- 2. Instantiating Wrapper (formulation={formulation}, top_k={top_k_paths}) ---")
+    if formulation == "agent":
+        env = AgentLevelWrapper(bandit=bandit, top_k=top_k_paths, feedback_type=feedback_type)
+    elif formulation == "od":
+        env = ODLevelWrapper(bandit=bandit, top_k=top_k_paths, feedback_type=feedback_type)
+    elif formulation == "centralized":
+        env = CentralizedLevelWrapper(bandit=bandit, top_k=top_k_paths, feedback_type=feedback_type)
+    else:
+        raise ValueError(f"Unknown formulation: {formulation}")
     
     if device == 'cuda':
         mem_wrapper = torch.cuda.memory_allocated() / 1024**2
-        print(f"VRAM after AgentLevelWrapper: {mem_wrapper:.2f} MB")
+        print(f"VRAM after {env.__class__.__name__}: {mem_wrapper:.2f} MB")
         
         # Breakdown wrapper tensors
         if hasattr(env, 'candidate_routes'):

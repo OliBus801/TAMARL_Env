@@ -331,22 +331,21 @@ class AgentLevelWrapper:
         paths_flat[leg_write_start] = self.first_edges_all_legs.int()
         
         # Write valid route edges
-        # For each leg, we need to scatter the valid edges starting at leg_write_start + 1
-        # Build destination indices for valid route edges
-        max_rl = selected_routes.shape[1]
-        # Expand leg_write_start to per-route-slot: [TotalLegs, MaxRouteLen]
-        slot_positions = torch.arange(max_rl, device=self._device).unsqueeze(0).expand(self.num_envs, -1)
-        # For each valid slot, compute its rank within that leg's valid slots
-        valid_int = valid_mask.long()  # [TotalLegs, MaxRouteLen]
-        valid_cs = torch.cumsum(valid_int, dim=1)  # [TotalLegs, MaxRouteLen]
-        valid_rank = valid_cs - 1  # 0-indexed rank of valid edges
-        
-        # Destination in paths_flat = leg_write_start + 1 + valid_rank
-        dest_flat = (leg_write_start.unsqueeze(1) + 1 + valid_rank)  # [TotalLegs, MaxRouteLen]
-        
-        # Only write where valid
+        # Only write where valid to avoid massive dense tensor allocations
         if valid_mask.any():
-            paths_flat[dest_flat[valid_mask]] = selected_routes[valid_mask].int()
+            # Get row indices for each valid edge
+            valid_row_indices = torch.nonzero(valid_mask, as_tuple=True)[0]
+            
+            # Compute rank of each valid edge within its row using int32
+            valid_int = valid_mask.to(torch.int32)
+            valid_cs = torch.cumsum(valid_int, dim=1)
+            # We only extract the rank for the valid entries (1D array)
+            valid_rank = valid_cs[valid_mask] - 1
+            
+            # Destination in paths_flat for valid edges is a 1D array
+            dest_flat_valid = leg_write_start[valid_row_indices] + 1 + valid_rank
+            
+            paths_flat[dest_flat_valid] = selected_routes[valid_mask].int()
 
         # ── Run the bandit simulation ────────────────────────────────
         paths_flat = paths_flat.detach().contiguous()
