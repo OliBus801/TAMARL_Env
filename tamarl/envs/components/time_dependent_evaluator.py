@@ -180,57 +180,68 @@ class TimeDependentEvaluator:
             # Fallback to free flow travel time if simulation hasn't run
             dynamic_tt = dnl.edge_static[:, 4].unsqueeze(0)
 
-        # ── Reconstruct minimal-width route tensor from CSR ───────────
-        # Builds [Batch, K, max_actual_len] where max_actual_len is the
-        # longest route across the selected OD pairs (often << global MaxLen).
         Batch = od_idx.shape[0]
-        route_rows_2d   = od_idx.unsqueeze(1) * self.K + torch.arange(
-            self.K, device=self.device, dtype=torch.long).unsqueeze(0)
-        route_rows_flat = route_rows_2d.reshape(-1)           # [Batch * K]
-        starts = self.routes_offsets_csr[route_rows_flat]     # [Batch * K]
-        ends   = self.routes_offsets_csr[route_rows_flat + 1] # [Batch * K]
-        lens   = (ends - starts).long()                       # [Batch * K]
-        max_len = int(lens.max().item()) if lens.numel() > 0 and lens.max() > 0 else 0
-
-        routes = torch.full(
-            (Batch * self.K, max(max_len, 1)), -1, device=self.device, dtype=torch.int32
-        )
-        if max_len > 0:
-            total_e = int(lens.sum().item())
-            if total_e > 0:
-                bk_of_e = torch.repeat_interleave(
-                    torch.arange(Batch * self.K, device=self.device, dtype=torch.long), lens)
-                cs_bk = torch.zeros(Batch * self.K + 1, device=self.device, dtype=torch.long)
-                cs_bk[1:] = torch.cumsum(lens, dim=0)
-                rank = torch.arange(total_e, device=self.device, dtype=torch.long) - cs_bk[bk_of_e]
-                routes[bk_of_e, rank] = self.routes_flat_csr[starts[bk_of_e] + rank]
-        routes = routes.view(Batch, self.K, max(max_len, 1))  # [Batch, K, max_actual_len]
+        CHUNK_SIZE = 16384
+        all_path_costs = []
 
         # Map agent departure times (steps) to [TotalLegs].
-        dep_all_steps = departure_times.to(self.device)  # [A] steps — must be on device before indexing
-        if dep_all_steps.shape[0] == routes.shape[0]:
+        dep_all_steps = departure_times.to(self.device)
+        if dep_all_steps.shape[0] == Batch:
             dep_steps = dep_all_steps
         else:
-            dep_steps = dep_all_steps[self._leg_agent_map]  # [TotalLegs]
+            dep_steps = dep_all_steps[self._leg_agent_map]
+        dep_sec_all = dep_steps.float() * dnl.dt
+        fe_all = self.first_edges.to(self.device)
+
+        # ── Process in chunks to avoid OOM ────────────────────────────
+        for start_idx in range(0, Batch, CHUNK_SIZE):
+            end_idx = min(start_idx + CHUNK_SIZE, Batch)
+            chunk_size = end_idx - start_idx
             
-        dep_sec = dep_steps.float() * dnl.dt
+            od_chunk = od_idx[start_idx:end_idx]
+            dep_sec_chunk = dep_sec_all[start_idx:end_idx]
+            fe_chunk = fe_all[start_idx:end_idx]
 
-        fe = self.first_edges.to(self.device)     # [TotalLegs]
+            # ── Reconstruct minimal-width route tensor for this chunk ─────
+            route_rows_2d = od_chunk.unsqueeze(1) * self.K + torch.arange(
+                self.K, device=self.device, dtype=torch.long).unsqueeze(0)
+            route_rows_flat = route_rows_2d.reshape(-1)
+            starts = self.routes_offsets_csr[route_rows_flat]
+            ends   = self.routes_offsets_csr[route_rows_flat + 1]
+            lens   = (ends - starts).long()
+            max_len = int(lens.max().item()) if lens.numel() > 0 and lens.max() > 0 else 0
 
-        # ── Evaluate ──────────────────────────────────────────────────
-        path_costs = evaluate_paths_time_dependent(
-            dynamic_tt=dynamic_tt,
-            link_tt_interval=self.link_tt_interval,
-            routes=routes,
-            first_edges=fe,
-            departure_times_sec=dep_sec,
-            num_edges=dnl.num_edges,
-        )  # [TotalLegs, K]
+            routes_chunk = torch.full(
+                (chunk_size * self.K, max(max_len, 1)), -1, device=self.device, dtype=torch.int32
+            )
+            if max_len > 0:
+                total_e = int(lens.sum().item())
+                if total_e > 0:
+                    bk_of_e = torch.repeat_interleave(
+                        torch.arange(chunk_size * self.K, device=self.device, dtype=torch.long), lens)
+                    cs_bk = torch.zeros(chunk_size * self.K + 1, device=self.device, dtype=torch.long)
+                    cs_bk[1:] = torch.cumsum(lens, dim=0)
+                    rank = torch.arange(total_e, device=self.device, dtype=torch.long) - cs_bk[bk_of_e]
+                    routes_chunk[bk_of_e, rank] = self.routes_flat_csr[starts[bk_of_e] + rank]
+            routes_chunk = routes_chunk.view(chunk_size, self.K, max(max_len, 1))
 
-        # Mask invalid paths (will have cost = 0 from zero first-edge edge index)
-        # We do not have the action_masks here, so just return raw costs.
-        # The caller can apply masks if needed.
-        best_k = path_costs.argmin(dim=1)  # [TotalLegs]
+            # ── Evaluate chunk ────────────────────────────────────────────
+            chunk_costs = evaluate_paths_time_dependent(
+                dynamic_tt=dynamic_tt,
+                link_tt_interval=self.link_tt_interval,
+                routes=routes_chunk,
+                first_edges=fe_chunk,
+                departure_times_sec=dep_sec_chunk,
+                num_edges=dnl.num_edges,
+            )
+            all_path_costs.append(chunk_costs)
+
+            # Free intermediates
+            del route_rows_2d, route_rows_flat, starts, ends, lens, routes_chunk
+        
+        # ── Concatenate and compute best_k ────────────────────────────
+        path_costs = torch.cat(all_path_costs, dim=0)  # [TotalLegs, K]
+        best_k = path_costs.argmin(dim=1)              # [TotalLegs]
 
         return path_costs, best_k
 
