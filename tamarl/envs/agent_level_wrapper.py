@@ -263,28 +263,39 @@ class AgentLevelWrapper:
         # Write first edges
         paths_flat[leg_write_start] = self.first_edges_all_legs.int()
 
-        # Write route edges directly from CSR — no dense 2D intermediate!
+        # Write route edges directly from CSR — chunked to avoid OOM
         total_route_edges = int(route_lens.sum().item())
         if total_route_edges > 0:
-            leg_of_edge = torch.repeat_interleave(
-                torch.arange(self.num_envs, device=self._device, dtype=torch.long),
-                route_lens,
-            )  # [TotalRouteEdges]
-            cumsum_lens = torch.zeros(self.num_envs + 1, device=self._device, dtype=torch.long)
-            cumsum_lens[1:] = torch.cumsum(route_lens, dim=0)
-            edge_rank = (
-                torch.arange(total_route_edges, device=self._device, dtype=torch.long)
-                - cumsum_lens[leg_of_edge]
-            )
-            src_idx = route_starts[leg_of_edge] + edge_rank
-            dst_idx = leg_write_start[leg_of_edge] + 1 + edge_rank
-            paths_flat[dst_idx] = self.routes_flat_csr[src_idx]
+            CHUNK_SIZE = 65536
+            for start_idx in range(0, self.num_envs, CHUNK_SIZE):
+                end_idx = min(start_idx + CHUNK_SIZE, self.num_envs)
+                chunk_route_lens = route_lens[start_idx:end_idx]
+                chunk_total_edges = int(chunk_route_lens.sum().item())
+                if chunk_total_edges == 0:
+                    continue
+
+                chunk_leg_of_edge = torch.repeat_interleave(
+                    torch.arange(start_idx, end_idx, device=self._device, dtype=torch.long),
+                    chunk_route_lens,
+                )
+
+                chunk_cumsum_lens = torch.zeros(end_idx - start_idx + 1, device=self._device, dtype=torch.long)
+                chunk_cumsum_lens[1:] = torch.cumsum(chunk_route_lens, dim=0)
+
+                edge_rank = (
+                    torch.arange(chunk_total_edges, device=self._device, dtype=torch.long)
+                    - chunk_cumsum_lens[chunk_leg_of_edge - start_idx]
+                )
+                
+                src_idx = route_starts[chunk_leg_of_edge] + edge_rank
+                dst_idx = leg_write_start[chunk_leg_of_edge] + 1 + edge_rank
+                paths_flat[dst_idx] = self.routes_flat_csr[src_idx]
+
+                del chunk_leg_of_edge, chunk_cumsum_lens, edge_rank, src_idx, dst_idx
 
         # Free all build intermediates before the long simulation loop
         del leg_total, leg_contrib_with_sep, first_mask, global_cs
         del agent_cs_start, intra_offset, non_first, first_leg_pos, agent_per_leg
-        if total_route_edges > 0:
-            del leg_of_edge, cumsum_lens, edge_rank, src_idx, dst_idx
         import gc; gc.collect()
 
         # ── Run the bandit simulation ────────────────────────────────
