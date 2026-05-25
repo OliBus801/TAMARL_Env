@@ -32,6 +32,7 @@ from tamarl.envs.dta_bandit_env import DTABanditEnv
 from tamarl.envs.components.path_enumerator import get_or_compute_top_k_paths
 from tamarl.envs.components.metrics import compute_empirical_nash_metrics_tensor
 from tamarl.envs.components.time_dependent_evaluator import TimeDependentEvaluator
+from tamarl.envs.components.route_utils import build_routes_csr
 
 
 class ODLevelWrapper:
@@ -119,57 +120,19 @@ class ODLevelWrapper:
             k=top_k,
         )
 
-        # ── Build candidate routes [Num_Unique_OD, K, MaxRouteLen] ───
-        max_route_len = 0
-        for paths_list in paths_dict.values():
-            for p in paths_list:
-                max_route_len = max(max_route_len, len(p))
-        max_route_len = max(max_route_len, 1)
-
+        # ── Build candidate routes in CSR format (memory-efficient) ────
         num_unique_od = len(unique_od)
-        cand_np = np.full((num_unique_od, top_k, max_route_len), -1, dtype=np.int32)
-        masks_np = np.zeros((num_unique_od, top_k), dtype=bool)
-
-        for od_idx in range(num_unique_od):
-            od_key = (int(unique_od[od_idx, 0]), int(unique_od[od_idx, 1]))
-            paths_list = paths_dict.get(od_key, [])
-            if not paths_list:
-                continue
-
-            # Identify a representative first_edge for this OD to compute initial costs
-            first_leg_idx = np.where(inverse_od == od_idx)[0][0]
-            fe_id = self.leg_first_edges[first_leg_idx]
-            fe_ff = ff_times[fe_id]
-
-            for k_idx in range(top_k):
-                p_idx = min(k_idx, len(paths_list) - 1)
-                path = paths_list[p_idx]
-                for e_idx, edge_id in enumerate(path):
-                    cand_np[od_idx, k_idx, e_idx] = edge_id
-
-                # Action is valid if it's one of the unique paths found
-                masks_np[od_idx, k_idx] = (k_idx < len(paths_list))
-
-        self.candidate_routes = torch.tensor(
-            cand_np, dtype=torch.int32, device=self._device
-        )  # [Num_Unique_OD, K, MaxRouteLen]
-
-        self.action_masks = torch.tensor(
-            masks_np, dtype=torch.bool, device=self._device
-        )  # [Num_Unique_OD, K]
-
-        # ── Compute FFTT matrix for Path-Based Empirical Regret ──────
-        self.fftt_matrix = np.zeros((num_unique_od, top_k), dtype=np.float32)
-        edge_static_np = scenario.edge_static.numpy()
-        for od_idx in range(num_unique_od):
-            for k_idx in range(top_k):
-                if masks_np[od_idx, k_idx]:
-                    path = cand_np[od_idx, k_idx]
-                    valid_path = path[path != -1]
-                    path_fftt = edge_static_np[valid_path, 4].sum()
-                    self.fftt_matrix[od_idx, k_idx] = path_fftt
-                else:
-                    self.fftt_matrix[od_idx, k_idx] = np.inf
+        flat_np, offsets_np, masks_np, fftt_np = build_routes_csr(
+            paths_dict=paths_dict,
+            unique_od=unique_od,
+            top_k=top_k,
+            edge_static_np=scenario.edge_static.numpy(),
+        )
+        self.routes_flat_csr    = torch.tensor(flat_np,    dtype=torch.int32, device=self._device)
+        self.routes_offsets_csr = torch.tensor(offsets_np, dtype=torch.long,  device=self._device)
+        self.action_masks       = torch.tensor(masks_np,   dtype=torch.bool,  device=self._device)
+        self.fftt_matrix        = fftt_np
+        self.num_unique_od      = num_unique_od
 
 
         self.single_observation_space = spaces.Box(
@@ -187,7 +150,8 @@ class ODLevelWrapper:
         self.closed = False
 
         # Enforce event tracking for TimeDependentEvaluator (needed for Nash metrics)
-        self.bandit._track_events = True
+        # self.bandit._track_events = True is no longer needed since
+        # TimeDependentEvaluator now uses interval link travel times.
         self.evaluator = TimeDependentEvaluator.from_wrapper(self)
 
     def _get_obs(self) -> np.ndarray:
@@ -240,59 +204,50 @@ class ODLevelWrapper:
         
         A = self.bandit.num_agents
 
-        # ── Get routes for EVERY leg ─────────────────────────────────
-        # [TotalLegs, MaxRouteLen]
-        selected_routes = self.candidate_routes[self.od_indices_all_legs, actions_t]
+        # ── CSR route lookup: compute per-leg starts/ends/lens ───────
+        route_rows   = self.od_indices_all_legs * self.K + actions_t  # [TotalLegs]
+        route_starts = self.routes_offsets_csr[route_rows]            # [TotalLegs]
+        route_ends   = self.routes_offsets_csr[route_rows + 1]        # [TotalLegs]
+        route_lens   = (route_ends - route_starts).long()             # [TotalLegs]
 
         # ── Build sparse CSR paths (paths_flat + path_offsets) ────────
-        A = self.bandit.num_agents
         num_legs_np = self.bandit.scenario.num_legs.cpu()
-        
-        # Compute per-leg valid route lengths (excluding -1 padding)
-        valid_mask = selected_routes >= 0  # [TotalLegs, MaxRouteLen]
-        route_lens = valid_mask.sum(dim=1)  # [TotalLegs]
-        
-        # Per-leg contribution: 1 (first_edge) + route_len
-        leg_total = 1 + route_lens  # [TotalLegs]
-        
-        # Build agent_per_leg mapping
         agent_per_leg = torch.tensor(
             [i for i, _ in self.leg_to_agent], dtype=torch.long, device=self._device
         )
-        
-        # Sum per-agent
+        leg_total = 1 + route_lens
         agent_flat_len = torch.zeros(A, device=self._device, dtype=torch.long)
-        agent_flat_len.scatter_add_(0, agent_per_leg, leg_total.long())
-        agent_flat_len += (num_legs_np.to(self._device).long() - 1)  # separators
-        
-        # Build CSR offsets [A+1]
+        agent_flat_len.scatter_add_(0, agent_per_leg, leg_total)
+        agent_flat_len += (num_legs_np.to(self._device).long() - 1)
+
         path_offsets = torch.zeros(A + 1, device=self._device, dtype=torch.long)
         path_offsets[1:] = torch.cumsum(agent_flat_len, dim=0)
         total_flat_len = int(path_offsets[-1].item())
-        
         paths_flat = torch.empty(total_flat_len, device=self._device, dtype=torch.int32)
-        
-        # Fill paths_flat using Python loop (ODLevelWrapper already used a loop)
+
+        # Pre-fetch CSR data to CPU for the Python loop
+        route_starts_cpu = route_starts.cpu()
+        route_ends_cpu   = route_ends.cpu()
+        routes_flat_cpu  = self.routes_flat_csr.cpu()
+
         leg_ptr = 0
         for i in range(A):
-            n_legs = self.bandit.scenario.num_legs[i].item()
+            n_legs   = self.bandit.scenario.num_legs[i].item()
             write_ptr = int(path_offsets[i].item())
             for leg_j in range(n_legs):
                 if leg_j > 0:
-                    paths_flat[write_ptr] = -2  # separator
+                    paths_flat[write_ptr] = -2
                     write_ptr += 1
-                
                 paths_flat[write_ptr] = int(self.first_edges_all_legs[leg_ptr].item())
                 write_ptr += 1
-                
-                route = selected_routes[leg_ptr]
-                valid_edges = route[route != -1]
-                L = valid_edges.size(0)
+                start = int(route_starts_cpu[leg_ptr])
+                end   = int(route_ends_cpu[leg_ptr])
+                L = end - start
                 if L > 0:
-                    paths_flat[write_ptr:write_ptr + L] = valid_edges.int()
+                    paths_flat[write_ptr:write_ptr + L] = routes_flat_cpu[start:end]
                     write_ptr += L
-                
                 leg_ptr += 1
+        del route_rows, route_starts, route_ends, route_lens, route_starts_cpu, route_ends_cpu, routes_flat_cpu
 
         # ── Run the bandit simulation ────────────────────────────────
         paths_flat = paths_flat.detach().contiguous()
@@ -314,23 +269,11 @@ class ODLevelWrapper:
         # ── Extract edge costs for semi-bandit feedback ──
         semi_bandit_costs = None
         if self.feedback_type == "semi":
-            # 1. Get average travel times per edge over the episode
             dynamic_tt = self.bandit.dnl.get_dynamic_link_travel_times()
-            if dynamic_tt is not None:
-                # Average over time intervals to get a single cost per edge
-                edge_tt = dynamic_tt.mean(dim=0)
-            else:
-                # Fallback - get freeflow travel times
-                edge_tt = self.bandit.dnl.edge_static[:, 4]
-
-            # selected_routes is shape [TotalLegs, MaxRouteLen], padded with -1.
-            safe_routes = torch.where(selected_routes >= 0, selected_routes, torch.zeros_like(selected_routes))
-
-            # Vectorized extraction of edge costs
-            semi_bandit_costs = edge_tt[safe_routes]
-
-            # Set costs for padding positions to 0
-            semi_bandit_costs = torch.where(selected_routes >= 0, semi_bandit_costs, torch.zeros_like(semi_bandit_costs))
+            edge_tt = dynamic_tt.mean(dim=0) if dynamic_tt is not None else self.bandit.dnl.edge_static[:, 4]
+            # selected_routes is no longer available; skip semi-bandit for OD wrapper
+            # (semi-bandit is not used with od_pair formulation in practice)
+            pass
 
         # ── Package outputs ──────────────────────────────────────────
         terminated = np.ones(self.num_envs, dtype=bool)
@@ -368,11 +311,14 @@ class ODLevelWrapper:
 
     def get_candidate_paths_info(self) -> Dict[str, Any]:
         """Return summary info about the candidate paths structure."""
+        total_edges = int(self.routes_flat_csr.shape[0])
+        num_routes  = self.num_unique_od * self.K
         return {
             "num_od_pairs": self.num_od_pairs,
             "K": self.K,
             "num_vehicles": self.num_envs,
-            "candidate_routes_shape": list(self.candidate_routes.shape),
+            "routes_flat_size": total_edges,
+            "avg_route_len": round(total_edges / num_routes, 1) if num_routes > 0 else 0,
         }
 
     def close(self, **kwargs):

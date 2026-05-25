@@ -38,146 +38,60 @@ import torch
 # Low-level helpers (no state)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def compute_n_curves(
-    events_tensor: torch.Tensor,  # [NumEvents, 4] -> [step, type, agent, edge]
-    num_steps: int,
-    num_edges: int,
-    device: str
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build Sparse N-Curves A(t) and D(t) from simulation events.
-    
-    Args:
-        events_tensor: Raw event buffer [N, 4].
-        num_steps: Total steps in the simulation.
-        num_edges: Number of edges in the network.
-        
-    Returns:
-        A_shifted_sorted: 1D tensor of arrivals shifted by edge*num_steps.
-        A_offsets: 1D tensor of size [num_edges + 1] with offsets.
-        D_times_sorted: 1D tensor of departure times.
-        D_offsets: 1D tensor of size [num_edges + 1] with offsets.
-    """
-    if events_tensor.numel() == 0:
-        empty_A = torch.empty(0, device=device, dtype=torch.long)
-        empty_D = torch.empty(0, device=device, dtype=torch.long)
-        zeros_off = torch.zeros(num_edges + 1, device=device, dtype=torch.long)
-        return empty_A, zeros_off, empty_D, zeros_off.clone()
-
-    times = events_tensor[:, 0].long().clamp(max=num_steps - 1)
-    event_types = events_tensor[:, 1].long()
-    edges = events_tensor[:, 3].long().clamp(min=0, max=num_edges - 1)
-    
-    # Arrivals: EVT_DEPARTURE (1), EVT_ENTERED_LINK (4)
-    mask_A = (event_types == 1) | (event_types == 4)
-    A_times = times[mask_A]
-    A_edges = edges[mask_A]
-    
-    # Departures: EVT_LEFT_LINK (3), EVT_LEAVES_TRAFFIC (5), EVT_STUCKANDABORT (8)
-    mask_D = (event_types == 3) | (event_types == 5) | (event_types == 8)
-    D_times = times[mask_D]
-    D_edges = edges[mask_D]
-    
-    # Sort arrivals by edge then time
-    A_shifted = A_edges * num_steps + A_times
-    A_shifted_sorted, A_sort_idx = torch.sort(A_shifted)
-    
-    A_counts = torch.bincount(A_edges[A_sort_idx], minlength=num_edges)
-    A_offsets = torch.zeros(num_edges + 1, device=device, dtype=torch.long)
-    A_offsets[1:] = torch.cumsum(A_counts, dim=0)
-    
-    # Sort departures by edge then time
-    D_shifted = D_edges * num_steps + D_times
-    D_shifted_sorted, D_sort_idx = torch.sort(D_shifted)
-    D_times_sorted = D_times[D_sort_idx]
-    
-    D_counts = torch.bincount(D_edges[D_sort_idx], minlength=num_edges)
-    D_offsets = torch.zeros(num_edges + 1, device=device, dtype=torch.long)
-    D_offsets[1:] = torch.cumsum(D_counts, dim=0)
-    
-    return A_shifted_sorted, A_offsets, D_times_sorted, D_offsets
-
-
 def evaluate_paths_time_dependent(
-    A_shifted_sorted: torch.Tensor,
-    A_offsets: torch.Tensor,
-    D_times_sorted: torch.Tensor,
-    D_offsets: torch.Tensor,
+    dynamic_tt: torch.Tensor,       # [NumIntervals, NumEdges] average travel time in seconds
+    link_tt_interval: float,        # width of interval in seconds
     routes: torch.Tensor,           # [Batch, K, MaxRouteLen] edge indices, -1 = padding
     first_edges: torch.Tensor,      # [Batch] first-edge index per leg
-    departure_times_step: torch.Tensor,# [Batch] departure time in steps
-    dt: float,                      # simulation timestep in seconds
+    departure_times_sec: torch.Tensor,# [Batch] departure time in seconds
     num_edges: int,
-    num_steps: int,
-    ff_travel_time_steps: torch.Tensor, # [NumEdges] free-flow travel time
 ) -> torch.Tensor:
     """Evaluate K candidate routes for each element of a batch in O(Batch×K×L).
 
-    Propagates a virtual traveller through each path using Newell's N-Curves.
+    Propagates a virtual traveller through each path using interval-based link travel times.
 
     Args:
-        A_shifted_sorted, A_offsets, D_times_sorted, D_offsets: Sparse N-Curves.
+        dynamic_tt:         [NumIntervals, NumEdges] average travel time in seconds.
+        link_tt_interval:   Width of the time bin in seconds.
         routes:             [Batch, K, MaxRouteLen] – edge IDs, -1 = padding sentinel.
         first_edges:        [Batch] – the mandatory first edge.
-        departure_times_step: [Batch] – departure time in steps.
-        dt:                 Simulation time step in seconds.
+        departure_times_sec: [Batch] – departure time in seconds.
         num_edges:          Total edges in the network.
-        num_steps:          Total steps in the simulation.
-        ff_travel_time_steps: [NumEdges] free flow travel time per edge in steps.
 
     Returns:
         path_costs: [Batch, K] – total travel time (s) for each (agent, path).
     """
-    device = A_shifted_sorted.device
+    device = dynamic_tt.device
     Batch, K, MaxLen = routes.shape
+    NumIntervals = dynamic_tt.size(0)
 
-    # Current simulated clock in steps for every (batch, k) pair
-    # Shape: [Batch, K]
-    current_step = departure_times_step.unsqueeze(1).expand(Batch, K).long().clone()
+    # Current simulated clock in seconds for every (batch, k) pair
+    current_time_sec = departure_times_sec.unsqueeze(1).expand(Batch, K).clone()
     
     # helper for processing one step on an edge
-    def _traverse(edges_mask, edges_b_k, cur_steps_b_k):
+    def _traverse(edges_mask, edges_b_k, cur_time_b_k):
         flat_mask = edges_mask.reshape(-1)
         valid_indices = torch.nonzero(flat_mask, as_tuple=True)[0]
         if valid_indices.numel() == 0:
-            return torch.zeros_like(cur_steps_b_k)
+            return torch.zeros_like(cur_time_b_k)
             
         flat_edges = edges_b_k.reshape(-1)[valid_indices].clamp(min=0, max=num_edges - 1)
-        flat_steps = cur_steps_b_k.reshape(-1)[valid_indices].clamp(min=0, max=num_steps - 1)
+        flat_times = cur_time_b_k.reshape(-1)[valid_indices]
         
-        # Arrival number n = A[e, t]
-        queries = flat_edges * num_steps + flat_steps
-        global_idx = torch.searchsorted(A_shifted_sorted, queries, right=True)
-        n_vals = global_idx - A_offsets[flat_edges]
+        # Find which interval the agent arrives at the link
+        interval_idx = (flat_times / link_tt_interval).long().clamp(max=NumIntervals - 1)
         
-        num_departures = D_offsets[flat_edges + 1] - D_offsets[flat_edges]
-        valid_mask = (n_vals > 0) & (n_vals <= num_departures)
+        step_tt_sec = dynamic_tt[interval_idx, flat_edges]
         
-        t_exit = torch.zeros_like(flat_steps)
-        # Fallback: if arriving on completely empty link, assume free-flow travel time
-        t_exit[n_vals == 0] = flat_steps[n_vals == 0] + ff_travel_time_steps[flat_edges[n_vals == 0]]
-        t_exit[n_vals > num_departures] = num_steps - 1
-        
-        if valid_mask.any():
-            idx = D_offsets[flat_edges[valid_mask]] + n_vals[valid_mask] - 1
-            t_exit[valid_mask] = D_times_sorted[idx]
-            
-        t_exit = t_exit.clamp(max=num_steps - 1)
-        step_tt_steps = t_exit - flat_steps
-        
-        # Make sure travel time is not negative, minimum is free flow travel time
-        min_tt = ff_travel_time_steps[flat_edges]
-        step_tt_steps = torch.maximum(step_tt_steps, min_tt)
-        
-        # Scatter back to [Batch, K]
-        result = torch.zeros(Batch * K, device=device, dtype=torch.long)
-        result[valid_indices] = step_tt_steps
+        result = torch.zeros(Batch * K, device=device, dtype=torch.float32)
+        result[valid_indices] = step_tt_sec
         return result.view(Batch, K)
 
     # ── First edge (mandatory, same for all K paths of a leg) ────────────────
     fe_expanded = first_edges.unsqueeze(1).expand(Batch, K).long()
     fe_mask = fe_expanded >= 0
-    tt_first = _traverse(fe_mask, fe_expanded, current_step)
-    current_step += tt_first
+    tt_first = _traverse(fe_mask, fe_expanded, current_time_sec)
+    current_time_sec += tt_first
 
     # ── Route edges (vary per K path) ────────────────────────────────────────
     for step in range(MaxLen):
@@ -186,13 +100,12 @@ def evaluate_paths_time_dependent(
         if not valid_mask.any():
             break
 
-        step_tt = _traverse(valid_mask, edges, current_step)
-        current_step += step_tt
+        step_tt = _traverse(valid_mask, edges, current_time_sec)
+        current_time_sec += step_tt
 
     # Total travel time = final time − departure time
-    path_costs = (current_step - departure_times_step.unsqueeze(1)).float() * dt  # [Batch, K]
+    path_costs = current_time_sec - departure_times_sec.unsqueeze(1)  # [Batch, K]
     return path_costs
-
 
 
 
@@ -217,21 +130,23 @@ class TimeDependentEvaluator:
 
     def __init__(
         self,
-        candidate_routes: torch.Tensor,  # [NumOD, K, MaxRouteLen]
+        routes_flat_csr: torch.Tensor,    # [TotalActualEdges] int32
+        routes_offsets_csr: torch.Tensor, # [NumOD * K + 1] int64
+        K: int,                           # number of candidate routes per OD
         first_edges: torch.Tensor,        # [TotalLegs]
         od_indices: torch.Tensor,         # [TotalLegs]
         link_tt_interval: float = 300.0,
         device: str = "cpu",
         leg_agent_map: Optional[torch.Tensor] = None,  # [TotalLegs] → agent idx
     ):
-        self.candidate_routes = candidate_routes.to(device)
-        self.first_edges = first_edges.to(device)
-        self.od_indices = od_indices.to(device)
-        self.link_tt_interval = link_tt_interval
-        self.device = device
-        # [TotalLegs] mapping each leg to its parent agent index.
-        # None means TotalLegs == A (single-leg shortcut).
-        self._leg_agent_map = leg_agent_map.to(device) if leg_agent_map is not None else None
+        self.routes_flat_csr    = routes_flat_csr.to(device)
+        self.routes_offsets_csr = routes_offsets_csr.to(device)
+        self.K                  = K
+        self.first_edges        = first_edges.to(device)
+        self.od_indices         = od_indices.to(device)
+        self.link_tt_interval   = link_tt_interval
+        self.device             = device
+        self._leg_agent_map     = leg_agent_map.to(device) if leg_agent_map is not None else None
 
     # ------------------------------------------------------------------
     def evaluate(
@@ -256,50 +171,60 @@ class TimeDependentEvaluator:
 
         od_idx = od_indices if od_indices is not None else self.od_indices
 
-        # ── Build A(t) and D(t) N-Curves from events ────
-        if not dnl.track_events:
-            raise ValueError("TimeDependentEvaluator requires dnl.track_events=True to build N-Curves.")
+        # ── Fetch interval-based average link travel times ───────────
+        if not dnl.collect_link_tt:
+            raise ValueError("TimeDependentEvaluator requires dnl.collect_link_tt=True to evaluate paths.")
             
-        dnl._flush_events()
-        if len(dnl._cpu_events_blocks) > 0:
-            events_tensor = torch.cat(dnl._cpu_events_blocks, dim=0).to(self.device)
-        else:
-            events_tensor = torch.empty((0, 4), device=self.device, dtype=torch.long)
-            
-        # Add 1 to current_step to ensure enough capacity (steps are 0-indexed)
-        num_steps = max(dnl.current_step + 1, 1)
-        A_shifted_sorted, A_offsets, D_times_sorted, D_offsets = compute_n_curves(
-            events_tensor, num_steps, dnl.num_edges, self.device)
+        dynamic_tt = dnl.get_dynamic_link_travel_times()
+        if dynamic_tt is None:
+            # Fallback to free flow travel time if simulation hasn't run
+            dynamic_tt = dnl.edge_static[:, 4].unsqueeze(0)
 
-        # ── Per-leg routes and departure times ────────────────────────
-        # routes: [TotalLegs, K, MaxRouteLen]
-        routes = self.candidate_routes[od_idx]  # [TotalLegs, K, MaxRouteLen]
+        # ── Reconstruct minimal-width route tensor from CSR ───────────
+        # Builds [Batch, K, max_actual_len] where max_actual_len is the
+        # longest route across the selected OD pairs (often << global MaxLen).
+        Batch = od_idx.shape[0]
+        route_rows_2d   = od_idx.unsqueeze(1) * self.K + torch.arange(
+            self.K, device=self.device, dtype=torch.long).unsqueeze(0)
+        route_rows_flat = route_rows_2d.reshape(-1)           # [Batch * K]
+        starts = self.routes_offsets_csr[route_rows_flat]     # [Batch * K]
+        ends   = self.routes_offsets_csr[route_rows_flat + 1] # [Batch * K]
+        lens   = (ends - starts).long()                       # [Batch * K]
+        max_len = int(lens.max().item()) if lens.numel() > 0 and lens.max() > 0 else 0
+
+        routes = torch.full(
+            (Batch * self.K, max(max_len, 1)), -1, device=self.device, dtype=torch.int32
+        )
+        if max_len > 0:
+            total_e = int(lens.sum().item())
+            if total_e > 0:
+                bk_of_e = torch.repeat_interleave(
+                    torch.arange(Batch * self.K, device=self.device, dtype=torch.long), lens)
+                cs_bk = torch.zeros(Batch * self.K + 1, device=self.device, dtype=torch.long)
+                cs_bk[1:] = torch.cumsum(lens, dim=0)
+                rank = torch.arange(total_e, device=self.device, dtype=torch.long) - cs_bk[bk_of_e]
+                routes[bk_of_e, rank] = self.routes_flat_csr[starts[bk_of_e] + rank]
+        routes = routes.view(Batch, self.K, max(max_len, 1))  # [Batch, K, max_actual_len]
 
         # Map agent departure times (steps) to [TotalLegs].
-        dep_all = departure_times.long().to(self.device)  # [A] steps — must be on device before indexing
-        if dep_all.shape[0] == routes.shape[0]:
-            # Single-leg scenario shortcut
-            dep = dep_all
+        dep_all_steps = departure_times.to(self.device)  # [A] steps — must be on device before indexing
+        if dep_all_steps.shape[0] == routes.shape[0]:
+            dep_steps = dep_all_steps
         else:
-            # Multi-leg: expand using the stored leg→agent index map
-            # Both dep_all and _leg_agent_map are now on self.device — safe indexing
-            dep = dep_all[self._leg_agent_map]  # [TotalLegs]
+            dep_steps = dep_all_steps[self._leg_agent_map]  # [TotalLegs]
+            
+        dep_sec = dep_steps.float() * dnl.dt
 
         fe = self.first_edges.to(self.device)     # [TotalLegs]
 
         # ── Evaluate ──────────────────────────────────────────────────
         path_costs = evaluate_paths_time_dependent(
-            A_shifted_sorted=A_shifted_sorted,
-            A_offsets=A_offsets,
-            D_times_sorted=D_times_sorted,
-            D_offsets=D_offsets,
+            dynamic_tt=dynamic_tt,
+            link_tt_interval=self.link_tt_interval,
             routes=routes,
             first_edges=fe,
-            departure_times_step=dep,
-            dt=dnl.dt,
+            departure_times_sec=dep_sec,
             num_edges=dnl.num_edges,
-            num_steps=num_steps,
-            ff_travel_time_steps=dnl.ff_travel_time_steps,
         )  # [TotalLegs, K]
 
         # Mask invalid paths (will have cost = 0 from zero first-edge edge index)
@@ -312,22 +237,23 @@ class TimeDependentEvaluator:
     # ------------------------------------------------------------------
     @classmethod
     def from_wrapper(cls, env) -> "TimeDependentEvaluator":
-        """Convenience constructor from an AgentLevelWrapper instance.
+        """Convenience constructor from a wrapper instance (any formulation).
 
         Args:
-            env: An ``AgentLevelWrapper`` instance.
+            env: An ``AgentLevelWrapper``, ``ODLevelWrapper``, or
+                 ``CentralizedLevelWrapper`` instance.
 
         Returns:
             A ``TimeDependentEvaluator`` ready to use with ``env.bandit.dnl``.
         """
-        # Build leg → agent index map from env.leg_to_agent
-        # leg_to_agent is a list of (agent_idx, leg_in_agent_idx) tuples
         leg_agent_indices = torch.tensor(
             [agent_idx for agent_idx, _ in env.leg_to_agent],
             dtype=torch.long,
         )
         return cls(
-            candidate_routes=env.candidate_routes,
+            routes_flat_csr=env.routes_flat_csr,
+            routes_offsets_csr=env.routes_offsets_csr,
+            K=env.K,
             first_edges=env.first_edges_all_legs,
             od_indices=env.od_indices_all_legs,
             link_tt_interval=env.bandit.link_tt_interval,

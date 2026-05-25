@@ -52,7 +52,8 @@ class TorchDNLMATSim:
                  collect_link_tt: bool = False,
                  link_tt_interval: float = 300.0,
                  paths_flat: torch.Tensor = None,
-                 path_offsets: torch.Tensor = None):
+                 path_offsets: torch.Tensor = None,
+                 max_steps: int = None):
         """
         Initialize the TorchDNLMATSim simulation engine.
         
@@ -73,10 +74,13 @@ class TorchDNLMATSim:
             destinations: Tensor [A, MaxLegs] -> Destination node for each leg (RL mode only).
             paths_flat: Tensor [TotalEdges] -> 1D compact edge indices for all agents concatenated.
             path_offsets: Tensor [A+1] -> CSR-style offsets into paths_flat per agent.
+            max_steps: If provided, pre-allocates link TT buffers for exactly this many steps,
+                       avoiding repeated doubling during the simulation.
         """
         self.device = device
         self.stuck_threshold = stuck_threshold
         self.dt = dt
+        self._max_steps = max_steps  # stored for link TT buffer sizing
         
         # Random number generator for probabilistic upstream link selection
         # Using a CPU generator, but need to monitor performance impact. -OB 
@@ -196,9 +200,17 @@ class TorchDNLMATSim:
         self.collect_link_tt = collect_link_tt
         self.link_tt_interval = link_tt_interval
         if self.collect_link_tt:
-            self.max_intervals = 100
-            self.interval_tt_sum = torch.zeros((self.max_intervals, self.num_edges), device=self.device, dtype=torch.float32)
-            self.interval_tt_count = torch.zeros((self.max_intervals, self.num_edges), device=self.device, dtype=torch.float32)
+            # Pre-allocate the exact number of intervals needed to cover the simulation,
+            # avoiding the expensive doubling strategy during the run.
+            # Formula: ceil(max_steps * dt / link_tt_interval) + 1 (safety margin)
+            # Falls back to 288 (covers a full 24h simulation at 300s intervals) if unknown.
+            if max_steps is not None and link_tt_interval > 0:
+                import math
+                num_intervals = math.ceil(max_steps * dt / link_tt_interval) + 1
+            else:
+                num_intervals = 288  # default: 86400s / 300s
+            self.interval_tt_sum = torch.zeros((num_intervals, self.num_edges), device=self.device, dtype=torch.float32)
+            self.interval_tt_count = torch.zeros((num_intervals, self.num_edges), device=self.device, dtype=torch.float32)
 
         # Agent State - Structure of Arrays (SOA)
         # Status | 0: Waiting/Activity, 1: Traveling, 2: Buffer, 3: Done, 4: Exiter (waiting for dispatch)

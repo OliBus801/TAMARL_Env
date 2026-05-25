@@ -115,6 +115,7 @@ class DTABanditEnv:
             link_tt_interval=self.link_tt_interval,
             paths_flat=paths_flat,
             path_offsets=path_offsets,
+            max_steps=self._max_steps,
         )
 
         self.dnl.num_nodes = self.scenario.num_nodes

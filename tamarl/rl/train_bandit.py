@@ -270,7 +270,7 @@ def train(
     )
 
     # ── Environment ──
-    need_events = render == 'interval' or agent_type in ['msa', 'evo_swap']
+    need_events = render == 'interval'
     need_render = render is not None
     
     # 1. Init DTABanditEnv
