@@ -111,8 +111,6 @@ class EvoSwapAgent:
         dnl = self._env.bandit.dnl
         if not dnl.collect_link_tt:
             # L'évaluateur TD requiert les données par intervalle.
-            # On applique quand même le decay pour rester cohérent.
-            self._decay_epsilon()
             return
 
         # 1. Évaluation des meilleures alternatives (Best Response)
@@ -129,12 +127,9 @@ class EvoSwapAgent:
         # 3. Application de la mutation
         self.current_actions = torch.where(mutate_mask, best_k, self.current_actions)
 
-        # 4. Decay de l'epsilon
-        self._decay_epsilon()
-
-    def _decay_epsilon(self) -> None:
-        """Applique la décroissance exponentielle à epsilon."""
-        self.epsilon = self.epsilon_min + (self.epsilon_max - self.epsilon_min) * math.exp(-self.epsilon_decay * self.episode)
+    def decay_epsilon(self) -> None:
+        """Décroissance multiplicative de epsilon après chaque épisode."""
+        self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
 
     def end_episode(self) -> None:
         pass
