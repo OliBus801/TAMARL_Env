@@ -32,6 +32,7 @@ from tamarl.envs.dta_bandit_env import DTABanditEnv
 from tamarl.envs.components.path_enumerator import get_or_compute_top_k_paths
 from tamarl.envs.components.metrics import compute_empirical_nash_metrics_tensor
 from tamarl.envs.components.time_dependent_evaluator import TimeDependentEvaluator
+from tamarl.envs.components.route_utils import build_routes_csr
 
 
 class AgentLevelWrapper:
@@ -56,6 +57,7 @@ class AgentLevelWrapper:
         bandit: DTABanditEnv,
         top_k: int = 3,
         feedback_type: str = "full",
+        reload_paths: bool = False,
     ):
         self.bandit = bandit
         self.K = top_k
@@ -121,108 +123,27 @@ class AgentLevelWrapper:
             ff_times=ff_times,
             od_pairs=unique_od.astype(np.int32),
             k=top_k,
+            force_recompute=reload_paths,
         )
 
-        # ── Build candidate routes [Num_Unique_OD, K, MaxRouteLen] ───
-        max_route_len = 0
-        for paths_list in paths_dict.values():
-            for p in paths_list:
-                max_route_len = max(max_route_len, len(p))
-        max_route_len = max(max_route_len, 1)
-
+        # ── Build candidate routes in CSR format (memory-efficient) ────
+        # Replaces dense [NumOD, K, MaxRouteLen] padded tensor.
+        # CSR layout: route (od_idx, k) → routes_flat_csr[offsets[od*K+k] : offsets[od*K+k+1]]
         num_unique_od = len(unique_od)
-        cand_np = np.full((num_unique_od, top_k, max_route_len), -1, dtype=np.int32)
-        masks_np = np.zeros((num_unique_od, top_k), dtype=bool)
+        flat_np, offsets_np, masks_np, fftt_np = build_routes_csr(
+            paths_dict=paths_dict,
+            unique_od=unique_od,
+            top_k=top_k,
+            edge_static_np=scenario.edge_static.numpy(),
+        )
+        self.routes_flat_csr    = torch.tensor(flat_np,    dtype=torch.int32, device=self._device)
+        self.routes_offsets_csr = torch.tensor(offsets_np, dtype=torch.long,  device=self._device)
+        self.action_masks       = torch.tensor(masks_np,   dtype=torch.bool,  device=self._device)
+        self.fftt_matrix        = fftt_np   # [NumUniqueOD, K] float32
+        self.num_unique_od      = num_unique_od
 
-        for od_idx in range(num_unique_od):
-            od_key = (int(unique_od[od_idx, 0]), int(unique_od[od_idx, 1]))
-            paths_list = paths_dict.get(od_key, [])
-            if not paths_list:
-                continue
-            
-            # Identify a representative first_edge for this OD to compute initial costs
-            # (We find the first leg in our list that matches this OD index)
-            first_leg_idx = np.where(inverse_od == od_idx)[0][0]
-            fe_id = self.leg_first_edges[first_leg_idx]
-            fe_ff = ff_times[fe_id]
 
-            for k_idx in range(top_k):
-                p_idx = min(k_idx, len(paths_list) - 1)
-                path = paths_list[p_idx]
-                for e_idx, edge_id in enumerate(path):
-                    cand_np[od_idx, k_idx, e_idx] = edge_id
-                
-                # Action is valid if it's one of the unique paths found
-                masks_np[od_idx, k_idx] = (k_idx < len(paths_list))
 
-        self.candidate_routes = torch.tensor(
-            cand_np, dtype=torch.long, device=self._device
-        )  # [Num_Unique_OD, K, MaxRouteLen]
-        
-        self.action_masks = torch.tensor(
-            masks_np, dtype=torch.bool, device=self._device
-        )  # [Num_Unique_OD, K]
-
-        # ── Compute FFTT matrix for Path-Based Empirical Regret ──────
-        self.fftt_matrix = np.zeros((num_unique_od, top_k), dtype=np.float32)
-        edge_static_np = scenario.edge_static.numpy()
-        for od_idx in range(num_unique_od):
-            for k_idx in range(top_k):
-                if masks_np[od_idx, k_idx]:
-                    path = cand_np[od_idx, k_idx]
-                    valid_path = path[path != -1]
-                    path_fftt = edge_static_np[valid_path, 4].sum()
-                    self.fftt_matrix[od_idx, k_idx] = path_fftt
-                else:
-                    self.fftt_matrix[od_idx, k_idx] = np.inf
-
-        # ── Compute max total path length needed for [A, MaxTotal] ───
-        # For each agent: sum of (1 + max_route_len) for each leg + (n_legs-1) separators
-        max_total = 0
-        for i in range(A):
-            n = num_legs_np[i]
-            # Each leg: 1 (first edge) + max_route_len (path)
-            # Separators: (n-1)
-            total = n * (1 + max_route_len) + (n - 1)
-            max_total = max(max_total, total)
-        self._max_path_len = int(max_total)
-
-        # -- Pre-compute per-leg info for vectorized path assembly (Opt-2) --
-        # Routes in paths[] MUST be compact (no -1 gaps before -2 separators).
-        # We store "assumed" fe base columns (assuming max_rl per prior leg).
-        # At step()-time we correct using actual route lengths via cumsum.
-        self._max_rl = max_route_len
-        _max_rl = self._max_rl  # local alias for the loop below
-        leg_agent_list  = []
-        leg_fe_base     = []   # fe col assuming max_rl per all prior legs of same agent
-        leg_is_first    = []   # True if leg_j == 0 (no separator before fe)
-        re_leg_list     = []
-        re_route_list   = []
-
-        leg_ptr = 0
-        for i in range(A):
-            n = num_legs_np[i]
-            ptr = 0
-            for leg_j in range(n):
-                if leg_j > 0:
-                    ptr += 1   # separator
-                fe_col = ptr
-                ptr += 1       # first edge
-                for e in range(_max_rl):
-                    re_leg_list.append(leg_ptr)
-                    re_route_list.append(e)
-                ptr += _max_rl  # assumed max_rl route slots (corrected at step-time)
-
-                leg_agent_list.append(i)
-                leg_fe_base.append(fe_col)
-                leg_is_first.append(leg_j == 0)
-                leg_ptr += 1
-
-        self._leg_agent2    = torch.tensor(leg_agent_list, dtype=torch.long)
-        self._leg_fe_base   = torch.tensor(leg_fe_base,   dtype=torch.long)  # [TotalLegs]
-        self._leg_is_first  = torch.tensor(leg_is_first,  dtype=torch.bool)  # [TotalLegs]
-        self._re_leg_ptr2   = torch.tensor(re_leg_list,   dtype=torch.long)  # [TotalLegs*MaxRouteLen]
-        self._re_route_pos2 = torch.tensor(re_route_list, dtype=torch.long)  # [TotalLegs*MaxRouteLen]
 
         # -- Gymnasium VectorEnv setup ----------------------------------------
         self.single_observation_space = spaces.Box(
@@ -243,14 +164,10 @@ class AgentLevelWrapper:
         dev = self._device
         self._leg_agent_idx  = self._leg_agent_idx.to(dev)
         self._leg_leg_idx    = self._leg_leg_idx.to(dev)
-        self._leg_agent2     = self._leg_agent2.to(dev)
-        self._leg_fe_base    = self._leg_fe_base.to(dev)
-        self._leg_is_first   = self._leg_is_first.to(dev)
-        self._re_leg_ptr2    = self._re_leg_ptr2.to(dev)
-        self._re_route_pos2  = self._re_route_pos2.to(dev)
 
         # Enforce event tracking for TimeDependentEvaluator (needed for Nash metrics)
-        self.bandit._track_events = True
+        # self.bandit._track_events = True is no longer needed since
+        # TimeDependentEvaluator now uses interval link travel times.
         self.evaluator = TimeDependentEvaluator.from_wrapper(self)
 
     def _get_obs(self) -> np.ndarray:
@@ -301,152 +218,118 @@ class AgentLevelWrapper:
         
         A = self.bandit.num_agents
         
-        # ── Get routes for EVERY leg ─────────────────────────────────
-        # [TotalLegs, MaxRouteLen]
-        selected_routes = self.candidate_routes[self.od_indices_all_legs, actions_t]
+        # ── CSR route lookup: compute per-leg route start/end from offsets ─
+        A = self.bandit.num_agents
+        num_legs_np = self.bandit.scenario.num_legs.cpu()
+        agent_per_leg = self._leg_agent_idx  # [TotalLegs]
 
-        # ── Assemble full multi-leg paths tensor [A, MaxPathLen] — GPU Opt-2 ──
-        # The simulator reads paths compactly: valid edges only, terminated by -1 or -2.
-        # We CANNOT leave -1 gaps mid-route before a -2 separator.
-        # Strategy: pre-compute fe/separator positions (fixed per scenario),
-        # compute compact route column offsets episode-by-episode via cumsum.
-        paths = torch.full(
-            (A, self._max_path_len), -1,
-            dtype=torch.long, device=self._device
+        route_rows   = self.od_indices_all_legs * self.K + actions_t  # [TotalLegs]
+        route_starts = self.routes_offsets_csr[route_rows]            # [TotalLegs]
+        route_ends   = self.routes_offsets_csr[route_rows + 1]        # [TotalLegs]
+        route_lens   = (route_ends - route_starts).long()             # [TotalLegs]
+
+        # ── Build sparse CSR paths (paths_flat + path_offsets) ────────
+        leg_total      = 1 + route_lens  # per-leg contribution (first_edge + route edges)
+        agent_flat_len = torch.zeros(A, device=self._device, dtype=torch.long)
+        agent_flat_len.scatter_add_(0, agent_per_leg, leg_total)
+        agent_flat_len += (num_legs_np.to(self._device).long() - 1)  # separators
+
+        path_offsets = torch.zeros(A + 1, device=self._device, dtype=torch.long)
+        path_offsets[1:] = torch.cumsum(agent_flat_len, dim=0)
+        total_flat_len = int(path_offsets[-1].item())
+        paths_flat = torch.empty(total_flat_len, device=self._device, dtype=torch.int32)
+
+        # Compute per-leg write start positions inside paths_flat
+        leg_contrib_with_sep = leg_total.clone()
+        first_mask = torch.zeros(self.num_envs, device=self._device, dtype=torch.bool)
+        first_mask[0] = True
+        if self.num_envs > 1:
+            first_mask[1:] = agent_per_leg[1:] != agent_per_leg[:-1]
+        leg_contrib_with_sep[~first_mask] += 1  # +1 separator before non-first legs
+
+        global_cs = torch.cumsum(leg_contrib_with_sep, dim=0)
+        agent_cs_start = torch.zeros(A, device=self._device, dtype=torch.long)
+        first_leg_pos = torch.nonzero(first_mask, as_tuple=True)[0]
+        agent_cs_start[agent_per_leg[first_leg_pos]] = (
+            global_cs[first_leg_pos] - leg_contrib_with_sep[first_leg_pos]
         )
+        intra_offset   = global_cs - leg_contrib_with_sep - agent_cs_start[agent_per_leg]
+        leg_write_start = path_offsets[agent_per_leg] + intra_offset
 
-        # All route edges for this episode: [TotalLegs * MaxRouteLen]
-        re_all = selected_routes[self._re_leg_ptr2, self._re_route_pos2]  # raw (may be -1)
-        valid_re = re_all >= 0  # [TotalLegs * MaxRouteLen]
+        # Write separators for non-first legs
+        non_first = ~first_mask
+        if non_first.any():
+            paths_flat[leg_write_start[non_first]] = -2
+            leg_write_start[non_first] += 1
 
-        # Group ID per route slot: which leg does each slot belong to?  [TotalLegs * MaxRouteLen]
-        # _re_leg_ptr2 already stores this (0..TotalLegs-1).
-        # Compact column within each leg = position among valid edges before this slot.
-        # cumsum within group: reset at each leg boundary.
-        # local_rank[k] = number of valid edges in leg _re_leg_ptr2[k] before slot k
-        valid_int = valid_re.long()
-        global_cs = torch.cumsum(valid_int, dim=0)  # [TotalLegs*MaxRouteLen]
-        # Offset: value of cumsum just before the first slot of each leg
-        # = global_cs at the last slot of the previous leg
-        leg_ids = self._re_leg_ptr2  # [TotalLegs * MaxRouteLen]
-        # First slot of each leg: where leg_ids changes (or position 0)
-        first_slot_mask = torch.zeros(leg_ids.shape[0], dtype=torch.bool, device=self._device)
-        first_slot_mask[0] = True
-        if leg_ids.shape[0] > 1:
-            first_slot_mask[1:] = (leg_ids[1:] != leg_ids[:-1])
-        # Scatter the cumsum value at each leg boundary start (subtract 1 since cumsum is inclusive)
-        leg_cs_offset = torch.zeros(self.num_envs, dtype=torch.long, device=self._device)
-        # global_cs[first_slot] gives the cumsum value AT the first slot.
-        # The offset for a leg is the cumsum value JUST BEFORE first slot.
-        # = global_cs[first_slot] - valid_int[first_slot]
-        first_slot_indices = torch.nonzero(first_slot_mask, as_tuple=True)[0]
-        leg_cs_offset[leg_ids[first_slot_indices]] = (
-            global_cs[first_slot_indices] - valid_int[first_slot_indices]
-        )
-        # local_rank = global_cs - leg_cs_offset[leg_id]
-        leg_offset_per_slot = leg_cs_offset[leg_ids]  # [TotalLegs*MaxRouteLen]
-        local_rank = global_cs - leg_offset_per_slot  # 1-indexed count of valid edges up to here
+        # Write first edges
+        paths_flat[leg_write_start] = self.first_edges_all_legs.int()
 
-        # Destination column for each valid route edge:
-        #   paths[agent, fe_base_of_leg + 1 + (local_rank - 1)]
-        #   = paths[agent, fe_base_of_leg + local_rank]
-        # fe_base per slot (looked up from leg_id)
-        fe_base_per_slot = self._leg_fe_base[leg_ids]  # [TotalLegs*MaxRouteLen]
-        re_dst_col = fe_base_per_slot + local_rank      # [TotalLegs*MaxRouteLen], only valid where valid_re
-        re_dst_agent = self._leg_agent2[leg_ids]        # [TotalLegs*MaxRouteLen]
+        # Write route edges directly from CSR — chunked to avoid OOM
+        total_route_edges = int(route_lens.sum().item())
+        if total_route_edges > 0:
+            CHUNK_SIZE = 65536
+            for start_idx in range(0, self.num_envs, CHUNK_SIZE):
+                end_idx = min(start_idx + CHUNK_SIZE, self.num_envs)
+                chunk_route_lens = route_lens[start_idx:end_idx]
+                chunk_total_edges = int(chunk_route_lens.sum().item())
+                if chunk_total_edges == 0:
+                    continue
 
-        # But fe_base_per_slot assumes max_rl per prior leg (from __init__).
-        # We need to correct fe_base for legs > 0: each prior leg contributes
-        # its actual route length (not max_rl) to the column offset.
-        # This correction is the delta between actual and assumed column.
-        # Compute: for each leg, actual route length = number of valid edges
-        actual_len = torch.zeros(self.num_envs, dtype=torch.long, device=self._device)
-        # Total valid edges per leg = global_cs at last slot of each leg
-        # last slot of leg l = first_slot_indices[l+1] - 1 (or end of array for last leg)
-        last_slot_indices = torch.zeros_like(first_slot_indices)
-        last_slot_indices[:-1] = first_slot_indices[1:] - 1
-        last_slot_indices[-1]  = leg_ids.shape[0] - 1
-        actual_len_vals = global_cs[last_slot_indices] - leg_cs_offset  # [TotalLegs]
+                chunk_leg_of_edge = torch.repeat_interleave(
+                    torch.arange(start_idx, end_idx, device=self._device, dtype=torch.long),
+                    chunk_route_lens,
+                )
 
-        # Column correction per leg: sum of (max_rl - actual_len) for all PRIOR legs of same agent.
-        # This accounts for the difference between assumed (max_rl) and actual column positions.
-        _max_rl = self._max_rl  # max route length (set in __init__)
-        savings = (_max_rl - actual_len_vals).long()  # [TotalLegs]
+                chunk_cumsum_lens = torch.zeros(end_idx - start_idx + 1, device=self._device, dtype=torch.long)
+                chunk_cumsum_lens[1:] = torch.cumsum(chunk_route_lens, dim=0)
 
-        # For each leg, correction = exclusive cumsum of savings within the same agent group.
-        # Legs of the same agent are contiguous in our ordering.
-        # NOTE: first_slot_indices are positions in the FLAT re array (size TotalLegs*MaxRouteLen).
-        #       We must go through leg_ids to get actual leg IDs before indexing [TotalLegs]-sized tensors.
-        agent_per_leg = self._leg_agent2[leg_ids[first_slot_indices]]  # [TotalLegs] agent ID per leg
-        savings_cumsum = torch.cumsum(savings, dim=0)          # global cumsum
+                edge_rank = (
+                    torch.arange(chunk_total_edges, device=self._device, dtype=torch.long)
+                    - chunk_cumsum_lens[chunk_leg_of_edge - start_idx]
+                )
+                
+                src_idx = route_starts[chunk_leg_of_edge] + edge_rank
+                dst_idx = leg_write_start[chunk_leg_of_edge] + 1 + edge_rank
+                paths_flat[dst_idx] = self.routes_flat_csr[src_idx]
 
-        # Offset at first leg of each agent = savings_cumsum value JUST BEFORE that leg
-        first_leg_mask2 = torch.zeros(first_slot_indices.shape[0], dtype=torch.bool, device=self._device)
-        first_leg_mask2[0] = True
-        if first_slot_indices.shape[0] > 1:
-            first_leg_mask2[1:] = (agent_per_leg[1:] != agent_per_leg[:-1])
-        agent_cs_offset = torch.zeros(A, dtype=torch.long, device=self._device)
-        first_leg_global_indices = torch.nonzero(first_leg_mask2, as_tuple=True)[0]
-        agent_cs_offset[agent_per_leg[first_leg_global_indices]] = (
-            savings_cumsum[first_leg_global_indices] - savings[first_leg_global_indices]
-        )
-        # correction[leg] = exclusive cumsum of savings for legs of the same agent
-        correction_per_leg = (
-            savings_cumsum - savings - agent_cs_offset[agent_per_leg]
-        )  # [TotalLegs]
+                del chunk_leg_of_edge, chunk_cumsum_lens, edge_rank, src_idx, dst_idx
 
-        # Apply correction to fe_base_per_slot
-        correction_per_slot = correction_per_leg[leg_ids]   # [TotalLegs*MaxRouteLen]
-        re_dst_col_corrected = re_dst_col - correction_per_slot
-
-        # Write valid route edges
-        if valid_re.any():
-            paths[re_dst_agent[valid_re], re_dst_col_corrected[valid_re]] = re_all[valid_re]
-
-        # Write first edges (corrected base columns)
-        # fe_base correction per leg
-        fe_base_corrected = self._leg_fe_base - correction_per_leg  # [TotalLegs]
-        paths[self._leg_agent2, fe_base_corrected] = self.first_edges_all_legs
-
-        # Write separators (-2): column = fe_base_corrected[leg] - 1 for leg_j > 0
-        multi_leg_mask = ~self._leg_is_first
-        if multi_leg_mask.any():
-            sep_agents = self._leg_agent2[multi_leg_mask]
-            sep_cols   = fe_base_corrected[multi_leg_mask] - 1
-            paths[sep_agents, sep_cols] = -2
+        # Free all build intermediates before the long simulation loop
+        del leg_total, leg_contrib_with_sep, first_mask, global_cs
+        del agent_cs_start, intra_offset, non_first, first_leg_pos, agent_per_leg
+        import gc; gc.collect()
 
         # ── Run the bandit simulation ────────────────────────────────
-        paths = paths.detach().contiguous()
-        self.bandit.reset(paths)
-        _ = self.bandit.step()  # Returns [A] per-vehicle rewards, we ignore it
+        paths_flat   = paths_flat.detach().contiguous()
+        path_offsets = path_offsets.detach().contiguous()
+        self.bandit.reset(paths_flat=paths_flat, path_offsets=path_offsets)
+        _ = self.bandit.step()
 
-        # ── Extract per-leg rewards — GPU Opt-1 ─────────────────────
-        # leg_metrics shape: [A, MaxLegs, 2] → [:, :, 1] is final travel time
+        # ── Extract per-leg rewards ──────────────────────────────────
         tt_matrix = self.bandit.dnl.leg_metrics[:, :, 1]
-        # Vectorized gather: zero Python loop, single GPU index op
-        tt_obs = tt_matrix[self._leg_agent_idx, self._leg_leg_idx]  # [TotalLegs] on device
-        rewards = (-tt_obs).cpu().numpy().astype(np.float32)         # one device→host copy
+        tt_obs    = tt_matrix[self._leg_agent_idx, self._leg_leg_idx]  # [TotalLegs]
+        rewards   = (-tt_obs).cpu().numpy().astype(np.float32)
 
-        # ── Extract edge costs for semi-bandit feedback ──
+        # ── Semi-bandit feedback (reconstructs dense tensor lazily) ──
         semi_bandit_costs = None
         if self.feedback_type == "semi":
-            # 1. Get average travel times per edge over the episode
             dynamic_tt = self.bandit.dnl.get_dynamic_link_travel_times()
-            if dynamic_tt is not None:
-                # Average over time intervals to get a single cost per edge
-                edge_tt = dynamic_tt.mean(dim=0)
-            else:
-                # Fallback - get freeflow travel times
-                edge_tt = self.bandit.dnl.edge_static[:, 4]
-                
-            # selected_routes is shape [TotalLegs, MaxRouteLen], padded with -1.
-            safe_routes = torch.where(selected_routes >= 0, selected_routes, torch.zeros_like(selected_routes))
-            
-            # Vectorized extraction of edge costs
-            semi_bandit_costs = edge_tt[safe_routes]
-            
-            # Set costs for padding positions to 0
-            semi_bandit_costs = torch.where(selected_routes >= 0, semi_bandit_costs, torch.zeros_like(semi_bandit_costs))
+            edge_tt    = dynamic_tt.mean(dim=0) if dynamic_tt is not None else self.bandit.dnl.edge_static[:, 4]
+            max_len_s  = int(route_lens.max().item()) if route_lens.numel() > 0 else 0
+            if max_len_s > 0:
+                sel = torch.full((self.num_envs, max_len_s), -1, device=self._device, dtype=torch.int32)
+                total_s = int(route_lens.sum().item())
+                if total_s > 0:
+                    loe = torch.repeat_interleave(
+                        torch.arange(self.num_envs, device=self._device), route_lens)
+                    cs_s = torch.zeros(self.num_envs + 1, device=self._device, dtype=torch.long)
+                    cs_s[1:] = torch.cumsum(route_lens, dim=0)
+                    rk_s = torch.arange(total_s, device=self._device) - cs_s[loe]
+                    sel[loe, rk_s] = self.routes_flat_csr[route_starts[loe] + rk_s]
+                safe = torch.where(sel >= 0, sel, torch.zeros_like(sel))
+                semi_bandit_costs = torch.where(sel >= 0, edge_tt[safe], torch.zeros_like(edge_tt[safe]))
+        del route_rows, route_starts, route_ends, route_lens, leg_write_start
 
         # ── Package outputs ──────────────────────────────────────────
         terminated = np.ones(self.num_envs, dtype=bool)
@@ -484,12 +367,15 @@ class AgentLevelWrapper:
 
     def get_candidate_paths_info(self) -> Dict[str, Any]:
         """Return summary info about the candidate paths structure."""
+        total_edges = int(self.routes_flat_csr.shape[0])
+        num_routes  = self.num_unique_od * self.K
+        avg_len     = total_edges / num_routes if num_routes > 0 else 0
         return {
-            "num_ods_leg0": self.candidate_routes_leg0.shape[0],
+            "num_unique_od": self.num_unique_od,
             "K": self.K,
-            "max_path_len": self._max_path_len,
             "num_agents": self.num_envs,
-            "candidate_routes_leg0_shape": list(self.candidate_routes_leg0.shape),
+            "routes_flat_size": total_edges,
+            "avg_route_len": round(avg_len, 1),
         }
 
     def close(self, **kwargs):

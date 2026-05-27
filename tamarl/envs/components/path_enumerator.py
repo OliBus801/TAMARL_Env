@@ -399,6 +399,7 @@ def get_or_compute_top_k_paths(
     k: int,
     method: str = "yen",
     penalty_factor: float = 1.5,
+    force_recompute: bool = False,
 ) -> Dict[Tuple[int, int], List[List[int]]]:
     """Get top-k paths from cache, or compute and cache them.
 
@@ -432,12 +433,12 @@ def get_or_compute_top_k_paths(
     paths_dict: Dict[Tuple[int, int], List[List[int]]] = {}
 
     # Try primary cache
-    if os.path.exists(cache_path):
+    if not force_recompute and os.path.exists(cache_path):
         print(f"Loading cached top-{k} paths ({method}) from {cache_path}")
         with open(cache_path, "rb") as f:
             paths_dict = pickle.load(f)
     # Fallback to legacy cache for yen
-    elif legacy_path and os.path.exists(legacy_path):
+    elif not force_recompute and legacy_path and os.path.exists(legacy_path):
         print(f"Loading legacy cached top-{k} paths from {legacy_path}")
         with open(legacy_path, "rb") as f:
             paths_dict = pickle.load(f)

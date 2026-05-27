@@ -211,7 +211,7 @@ def get_memory_usage():
     mem_info = process.memory_info()
     return mem_info.rss / 1024 / 1024 # MB
 
-def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_factor=1.0, start_hour=0, end_hour=24, save_pickle=False, load_pickle=True, save_paths=False, save_legs=False, save_events=False, track_events=True, output_folder="output", seed=None):
+def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_factor=1.0, start_hour=0, end_hour=24, save_pickle=False, load_pickle=True, save_paths=False, save_legs=False, save_events=False, track_events=True, output_folder="output", seed=None, profile_memory=False):
     
     process = psutil.Process(os.getpid())
     def get_mem():
@@ -365,33 +365,33 @@ def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_facto
     num_agents = len(agents_data)
     
     # Calculate max lengths
-    max_path_len = 0
     max_acts = 0
     for a in agents_data:
-        # lengths of individual legs + sentinels (-2) between them
-        total_len = sum(len(leg) for leg in a['legs']) + len(a['legs']) - 1
-        max_path_len = max(max_path_len, total_len)
         max_acts = max(max_acts, len(a['act_end_times']))
 
-    print(f"Packing {num_agents} paths (max len {max_path_len}, max int_acts {max_acts})...")
-    paths_tensor = torch.full((num_agents, max_path_len), -1, dtype=torch.int32)
+    # Build sparse CSR paths (paths_flat + path_offsets)
+    print(f"Packing {num_agents} paths (CSR format, max int_acts {max_acts})...")
+    flat_list = []
+    offsets = [0]
+    for i, a in enumerate(agents_data):
+        legs = a['legs']
+        agent_edges = []
+        for leg_idx, leg in enumerate(legs):
+            agent_edges.extend(leg)
+            if leg_idx < len(legs) - 1:
+                agent_edges.append(-2)  # sentinel
+        flat_list.extend(agent_edges)
+        offsets.append(len(flat_list))
+    
+    paths_flat = torch.tensor(flat_list, dtype=torch.int32)
+    path_offsets = torch.tensor(offsets, dtype=torch.long)
+    
     act_end_times_tensor = torch.full((num_agents, max_acts), -1, dtype=torch.int32)
     act_durations_tensor = torch.full((num_agents, max_acts), -1, dtype=torch.int32)
     num_legs_tensor = torch.zeros(num_agents, dtype=torch.int32)
     
     for i, a in enumerate(agents_data):
-        legs = a['legs']
-        num_legs_tensor[i] = len(legs)
-        
-        # Build concatenated path with -2 sentinels
-        ptr = 0
-        for leg_idx, leg in enumerate(legs):
-            leg_len = len(leg)
-            paths_tensor[i, ptr:ptr+leg_len] = torch.tensor(leg, dtype=torch.int32)
-            ptr += leg_len
-            if leg_idx < len(legs) - 1:
-                paths_tensor[i, ptr] = -2  # sentinel
-                ptr += 1
+        num_legs_tensor[i] = len(a['legs'])
                 
         # Fill act times
         n_acts = len(a['act_end_times'])
@@ -405,7 +405,7 @@ def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_facto
 
     # Object Sizes
     edge_static_size = edge_static.element_size() * edge_static.nelement() / 1024 / 1024
-    paths_tensor_size = paths_tensor.element_size() * paths_tensor.nelement() / 1024 / 1024
+    paths_flat_size = paths_flat.element_size() * paths_flat.nelement() / 1024 / 1024
     
     # Estimate metadata size
     trips_size = sys.getsizeof(trip_metadata) / 1024 / 1024 
@@ -413,7 +413,7 @@ def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_facto
     print("\n--- 📦 Object Sizes ---")
     print(f"🛣️  Network (edge_static): {edge_static_size:.2f} MB")
     print(f"👥 Population (metadata): {trips_size:.2f} MB")
-    print(f"🔢 Population (paths_tensor): {paths_tensor_size:.2f} MB")
+    print(f"🔢 Population (paths_flat): {paths_flat_size:.2f} MB")
     print("-----------------------\n")
 
     
@@ -425,7 +425,6 @@ def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_facto
     
     dnl = TorchDNLMATSim(
         edge_static, 
-        paths_tensor, 
         device=device, 
         departure_times=departure_times, 
         edge_endpoints=edge_endpoints,
@@ -436,7 +435,9 @@ def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_facto
         seed=seed, 
         stuck_threshold=10,
         enable_profiling=True,
-        track_events=effective_track_events
+        track_events=effective_track_events,
+        paths_flat=paths_flat,
+        path_offsets=path_offsets,
     )
 
     
@@ -452,9 +453,20 @@ def run_benchmark(root_folder, population_filter=None, timestep=1.0, scale_facto
     
     print(f"Starting simulation loop... ({start_hour}h -> {end_hour}h)")
     t0 = time.time()
+    
+    if profile_memory:
+        from tamarl.core.memory_profiler import analyze_tensor_memory
+        analyze_tensor_memory("BEFORE EPISODE")
+    
     while active and step < max_steps:
         dnl.step()
         step += 1
+        
+        if profile_memory and step % 10000 == 0:
+            analyze_tensor_memory(f"STEP {step}")
+            
+    if profile_memory:
+        analyze_tensor_memory("AFTER EPISODE")
             
         if step % 3600 == 0:
             t1 = time.time()
@@ -621,11 +633,11 @@ if __name__ == "__main__":
     parser.add_argument("--timestep", help="Time step size of each simulation step, by default 1 second.", default=1)
     parser.add_argument("--output_folder", help="Output folder for results.", default="output")
     parser.add_argument("--seed", help="Seed for random number generator. Used in priority calculation", default=None)
-
+    parser.add_argument("--profile_memory", help="Enable tensor memory profiling during the benchmark.", action="store_true")
 
     args = parser.parse_args()
     
     if not os.path.exists(args.root_folder):
         print(f"Root folder not found: {args.root_folder}")
     else:
-        run_benchmark(args.root_folder, args.population, timestep=float(args.timestep), scale_factor=float(args.scale_factor), start_hour=args.hours[0], end_hour=args.hours[1], save_pickle=args.save_pickle, load_pickle=not args.no_load_pickle, save_paths=args.save_paths, save_legs=args.save_legs, save_events=args.save_events, track_events=args.track_events, output_folder=args.output_folder, seed=int(args.seed) if args.seed is not None else None)
+        run_benchmark(args.root_folder, args.population, timestep=float(args.timestep), scale_factor=float(args.scale_factor), start_hour=args.hours[0], end_hour=args.hours[1], save_pickle=args.save_pickle, load_pickle=not args.no_load_pickle, save_paths=args.save_paths, save_legs=args.save_legs, save_events=args.save_events, track_events=args.track_events, output_folder=args.output_folder, seed=int(args.seed) if args.seed is not None else None, profile_memory=args.profile_memory)

@@ -40,25 +40,29 @@ def run_profiling(root_folder, population_filter=None, timestep=1.0, scale_facto
     departure_times = torch.tensor([a['dep_time'] for a in trips], dtype=torch.int32)
     
     num_agents = len(trips)
-    max_path_len = max(sum(len(leg) for leg in a['legs']) + len(a['legs']) - 1 for a in trips)
-    max_acts = max(len(a['act_end_times']) for a in trips)
-
-    paths_tensor = torch.full((num_agents, max_path_len), -1, dtype=torch.int32)
+    max_acts = max(len(a['act_end_times']) for a in trips) if trips else 0
+    # Build sparse CSR paths (paths_flat + path_offsets)
+    flat_list = []
+    offsets = [0]
+    for i, a in enumerate(trips):
+        legs = a['legs']
+        agent_edges = []
+        for leg_idx, leg in enumerate(legs):
+            agent_edges.extend(leg)
+            if leg_idx < len(legs) - 1:
+                agent_edges.append(-2)
+        flat_list.extend(agent_edges)
+        offsets.append(len(flat_list))
+        
+    paths_flat = torch.tensor(flat_list, dtype=torch.int32)
+    path_offsets = torch.tensor(offsets, dtype=torch.long)
+    
     act_end_times_tensor = torch.full((num_agents, max_acts), -1, dtype=torch.int32)
     act_durations_tensor = torch.full((num_agents, max_acts), -1, dtype=torch.int32)
     num_legs_tensor = torch.zeros(num_agents, dtype=torch.int32)
     
     for i, a in enumerate(trips):
-        legs = a['legs']
-        num_legs_tensor[i] = len(legs)
-        ptr = 0
-        for leg_idx, leg in enumerate(legs):
-            paths_tensor[i, ptr:ptr+len(leg)] = torch.tensor(leg, dtype=torch.int32)
-            ptr += len(leg)
-            if leg_idx < len(legs) - 1:
-                paths_tensor[i, ptr] = -2
-                ptr += 1
-        
+        num_legs_tensor[i] = len(a['legs'])
         n_acts = len(a['act_end_times'])
         if n_acts > 0:
             act_end_times_tensor[i, :n_acts] = torch.tensor(a['act_end_times'], dtype=torch.int32)
@@ -83,7 +87,6 @@ def run_profiling(root_folder, population_filter=None, timestep=1.0, scale_facto
     
     dnl = TorchDNLMATSim(
         edge_static, 
-        paths_tensor, 
         device=device, 
         departure_times=departure_times, 
         edge_endpoints=edge_endpoints,
@@ -92,7 +95,9 @@ def run_profiling(root_folder, population_filter=None, timestep=1.0, scale_facto
         num_legs=num_legs_tensor,
         dt=timestep,
         collect_link_tt=True, # Critical to reproduce the interval_tt_count memory allocation
-        link_tt_interval=300.0
+        link_tt_interval=300.0,
+        paths_flat=paths_flat,
+        path_offsets=path_offsets
     )
 
     if use_float16:
@@ -136,7 +141,7 @@ def run_profiling(root_folder, population_filter=None, timestep=1.0, scale_facto
     print("\n--- Data Structures Footprint ---")
     tensors = [
         ('edge_static', dnl.edge_static),
-        ('paths', dnl.paths),
+        ('paths_flat', getattr(dnl, 'paths_flat', None)),
         ('interval_tt_sum', getattr(dnl, 'interval_tt_sum', None)),
         ('interval_tt_count', getattr(dnl, 'interval_tt_count', None)),
         ('status', dnl.status),

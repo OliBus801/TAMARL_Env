@@ -231,7 +231,7 @@ def load_scenario(
     agents = parse_population(population_file, link_id_to_idx, node_id_to_idx)
 
     if len(agents) == 0:
-        raise ValueError("No valid trips found in population file.")
+        raise ValueError(f"No valid trips found in population file {population_file}.")
 
     # Build edge info
     # edges_data[i]['v'] is the to_node index

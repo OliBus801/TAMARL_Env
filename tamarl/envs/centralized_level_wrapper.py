@@ -35,6 +35,7 @@ from tamarl.envs.dta_bandit_env import DTABanditEnv
 from tamarl.envs.components.path_enumerator import get_or_compute_top_k_paths
 from tamarl.envs.components.metrics import compute_empirical_nash_metrics_tensor
 from tamarl.envs.components.time_dependent_evaluator import TimeDependentEvaluator
+from tamarl.envs.components.route_utils import build_routes_csr
 
 
 class CentralizedLevelWrapper:
@@ -65,6 +66,7 @@ class CentralizedLevelWrapper:
         bandit: DTABanditEnv,
         top_k: int = 3,
         feedback_type: str = "full",
+        reload_paths: bool = False,
     ):
         self.bandit = bandit
         self.K = top_k
@@ -139,60 +141,22 @@ class CentralizedLevelWrapper:
             ff_times=ff_times,
             od_pairs=unique_od.astype(np.int32),
             k=top_k,
+            force_recompute=reload_paths,
         )
 
-        # ── Construction de candidate_routes [Num_Unique_OD, K, MaxLen] ─
-        max_route_len = 0
-        for paths_list in paths_dict.values():
-            for p in paths_list:
-                max_route_len = max(max_route_len, len(p))
-        max_route_len = max(max_route_len, 1)
-
+        # ── Build candidate routes in CSR format (memory-efficient) ────
         num_unique_od = len(unique_od)
-        cand_np = np.full((num_unique_od, top_k, max_route_len), -1, dtype=np.int32)
-        masks_np = np.zeros((num_unique_od, top_k), dtype=bool)
-
-        for od_idx in range(num_unique_od):
-            od_key = (int(unique_od[od_idx, 0]), int(unique_od[od_idx, 1]))
-            paths_list = paths_dict.get(od_key, [])
-            if not paths_list:
-                continue
-
-            for k_idx in range(top_k):
-                p_idx = min(k_idx, len(paths_list) - 1)
-                path = paths_list[p_idx]
-                for e_idx, edge_id in enumerate(path):
-                    cand_np[od_idx, k_idx, e_idx] = edge_id
-                masks_np[od_idx, k_idx] = (k_idx < len(paths_list))
-
-        self.candidate_routes = torch.tensor(
-            cand_np, dtype=torch.long, device=self._device
-        )  # [Num_Unique_OD, K, MaxRouteLen]
-
-        self.action_masks = torch.tensor(
-            masks_np, dtype=torch.bool, device=self._device
-        )  # [Num_Unique_OD, K]
-
-        # ── Matrice FFTT pour le calcul du regret Nash ─────────────────
-        self.fftt_matrix = np.zeros((num_unique_od, top_k), dtype=np.float32)
-        edge_static_np = scenario.edge_static.numpy()
-        for od_idx in range(num_unique_od):
-            for k_idx in range(top_k):
-                if masks_np[od_idx, k_idx]:
-                    path = cand_np[od_idx, k_idx]
-                    valid_path = path[path != -1]
-                    path_fftt = edge_static_np[valid_path, 4].sum()
-                    self.fftt_matrix[od_idx, k_idx] = path_fftt
-                else:
-                    self.fftt_matrix[od_idx, k_idx] = np.inf
-
-        # ── Longueur max des chemins multi-leg ─────────────────────────
-        max_total = 0
-        for i in range(A):
-            n = num_legs_np[i]
-            total = n * (1 + max_route_len) + (n - 1)
-            max_total = max(max_total, total)
-        self._max_path_len = int(max_total)
+        flat_np, offsets_np, masks_np, fftt_np = build_routes_csr(
+            paths_dict=paths_dict,
+            unique_od=unique_od,
+            top_k=top_k,
+            edge_static_np=scenario.edge_static.numpy(),
+        )
+        self.routes_flat_csr    = torch.tensor(flat_np,    dtype=torch.int32, device=self._device)
+        self.routes_offsets_csr = torch.tensor(offsets_np, dtype=torch.long,  device=self._device)
+        self.action_masks       = torch.tensor(masks_np,   dtype=torch.bool,  device=self._device)
+        self.fftt_matrix        = fftt_np
+        self.num_unique_od      = num_unique_od
 
         # ── Gymnasium VectorEnv setup ─────────────────────────────────
         self.single_observation_space = spaces.Box(
@@ -210,7 +174,8 @@ class CentralizedLevelWrapper:
         self.closed = False
 
         # Enforce event tracking for TimeDependentEvaluator (needed for Nash metrics)
-        self.bandit._track_events = True
+        # self.bandit._track_events = True is no longer needed since
+        # TimeDependentEvaluator now uses interval link travel times.
         self.evaluator = TimeDependentEvaluator.from_wrapper(self)
 
     def _get_obs(self) -> np.ndarray:
@@ -267,39 +232,89 @@ class CentralizedLevelWrapper:
         
         A = self.bandit.num_agents
 
-        # ── Routes pour chaque leg [TotalLegs, MaxRouteLen] ──────────
-        selected_routes = self.candidate_routes[self.od_indices_all_legs, actions_t]
+        # ── CSR route lookup ────────────────────────────────────────────
+        route_rows   = self.od_indices_all_legs * self.K + actions_t
+        route_starts = self.routes_offsets_csr[route_rows]
+        route_ends   = self.routes_offsets_csr[route_rows + 1]
+        route_lens   = (route_ends - route_starts).long()
 
-        # ── Assemblage du tenseur multi-leg [A, MaxPathLen] ───────────
-        paths = torch.full(
-            (A, self._max_path_len), -1,
-            dtype=torch.long, device=self._device
+        num_legs_np = self.bandit.scenario.num_legs.cpu()
+        agent_per_leg = torch.tensor(
+            [i for i, _ in self.leg_to_agent], dtype=torch.long, device=self._device
         )
+        leg_total = 1 + route_lens
+        agent_flat_len = torch.zeros(A, device=self._device, dtype=torch.long)
+        agent_flat_len.scatter_add_(0, agent_per_leg, leg_total)
+        agent_flat_len += (num_legs_np.to(self._device).long() - 1)
 
-        leg_ptr = 0
-        for i in range(A):
-            n_legs = self.bandit.scenario.num_legs[i].item()
-            ptr = 0
-            for leg_j in range(n_legs):
-                if leg_j > 0:
-                    paths[i, ptr] = -2  # séparateur de leg
-                    ptr += 1
+        path_offsets = torch.zeros(A + 1, device=self._device, dtype=torch.long)
+        path_offsets[1:] = torch.cumsum(agent_flat_len, dim=0)
+        total_flat_len = int(path_offsets[-1].item())
+        paths_flat = torch.empty(total_flat_len, device=self._device, dtype=torch.int32)
 
-                paths[i, ptr] = self.first_edges_all_legs[leg_ptr]
-                ptr += 1
+        # ── Write components using chunked vectorization ──────────────
+        leg_contrib_with_sep = leg_total.clone()
+        first_mask = torch.zeros(self.num_envs, device=self._device, dtype=torch.bool)
+        first_mask[0] = True
+        if self.num_envs > 1:
+            first_mask[1:] = agent_per_leg[1:] != agent_per_leg[:-1]
+        leg_contrib_with_sep[~first_mask] += 1
 
-                route = selected_routes[leg_ptr]
-                valid_edges = route[route != -1]
-                L = valid_edges.size(0)
-                paths[i, ptr: ptr + L] = valid_edges
-                ptr += L
+        global_cs = torch.cumsum(leg_contrib_with_sep, dim=0)
+        agent_cs_start = torch.zeros(A, device=self._device, dtype=torch.long)
+        first_leg_pos = torch.nonzero(first_mask, as_tuple=True)[0]
+        agent_cs_start[agent_per_leg[first_leg_pos]] = (
+            global_cs[first_leg_pos] - leg_contrib_with_sep[first_leg_pos]
+        )
+        intra_offset   = global_cs - leg_contrib_with_sep - agent_cs_start[agent_per_leg]
+        leg_write_start = path_offsets[agent_per_leg] + intra_offset
 
-                leg_ptr += 1
+        non_first = ~first_mask
+        if non_first.any():
+            paths_flat[leg_write_start[non_first]] = -2
+            leg_write_start[non_first] += 1
+
+        paths_flat[leg_write_start] = self.first_edges_all_legs.int()
+
+        total_route_edges = int(route_lens.sum().item())
+        if total_route_edges > 0:
+            CHUNK_SIZE = 65536
+            for start_idx in range(0, self.num_envs, CHUNK_SIZE):
+                end_idx = min(start_idx + CHUNK_SIZE, self.num_envs)
+                chunk_route_lens = route_lens[start_idx:end_idx]
+                chunk_total_edges = int(chunk_route_lens.sum().item())
+                if chunk_total_edges == 0:
+                    continue
+
+                chunk_leg_of_edge = torch.repeat_interleave(
+                    torch.arange(start_idx, end_idx, device=self._device, dtype=torch.long),
+                    chunk_route_lens,
+                )
+
+                chunk_cumsum_lens = torch.zeros(end_idx - start_idx + 1, device=self._device, dtype=torch.long)
+                chunk_cumsum_lens[1:] = torch.cumsum(chunk_route_lens, dim=0)
+
+                edge_rank = (
+                    torch.arange(chunk_total_edges, device=self._device, dtype=torch.long)
+                    - chunk_cumsum_lens[chunk_leg_of_edge - start_idx]
+                )
+                
+                src_idx = route_starts[chunk_leg_of_edge] + edge_rank
+                dst_idx = leg_write_start[chunk_leg_of_edge] + 1 + edge_rank
+                paths_flat[dst_idx] = self.routes_flat_csr[src_idx]
+
+                del chunk_leg_of_edge, chunk_cumsum_lens, edge_rank, src_idx, dst_idx
+
+        del leg_total, leg_contrib_with_sep, first_mask, global_cs, agent_cs_start
+        del intra_offset, non_first, first_leg_pos, agent_per_leg
+        del route_rows, route_starts, route_ends, route_lens
+        import gc; gc.collect()
+
 
         # ── Simulation bandit ─────────────────────────────────────────
-        # Blindage du tenseur paths avant passage au simulateur
-        paths = paths.detach().contiguous()
-        self.bandit.reset(paths)
+        paths_flat = paths_flat.detach().contiguous()
+        path_offsets = path_offsets.detach().contiguous()
+        self.bandit.reset(paths_flat=paths_flat, path_offsets=path_offsets)
         _ = self.bandit.step()
 
         # ── Extraction des récompenses par leg ────────────────────────
@@ -316,18 +331,8 @@ class CentralizedLevelWrapper:
         semi_bandit_costs = None
         if self.feedback_type == "semi":
             dynamic_tt = self.bandit.dnl.get_dynamic_link_travel_times()
-            if dynamic_tt is not None:
-                edge_tt = dynamic_tt.mean(dim=0)
-            else:
-                edge_tt = self.bandit.dnl.edge_static[:, 4]
-
-            safe_routes = torch.where(
-                selected_routes >= 0, selected_routes, torch.zeros_like(selected_routes)
-            )
-            semi_bandit_costs = edge_tt[safe_routes]
-            semi_bandit_costs = torch.where(
-                selected_routes >= 0, semi_bandit_costs, torch.zeros_like(semi_bandit_costs)
-            )
+            edge_tt = dynamic_tt.mean(dim=0) if dynamic_tt is not None else self.bandit.dnl.edge_static[:, 4]
+            pass  # selected_routes no longer exists; semi-bandit not used with centralized
 
         # ── Packaging des sorties ─────────────────────────────────────
         terminated = np.ones(self.num_envs, dtype=bool)
@@ -367,13 +372,15 @@ class CentralizedLevelWrapper:
 
     def get_candidate_paths_info(self) -> Dict[str, Any]:
         """Résumé de la structure des chemins candidates."""
+        total_edges = int(self.routes_flat_csr.shape[0])
+        num_routes  = self.num_unique_od * self.K
         return {
             "num_models": self.num_models,
             "num_od_pairs": self.num_od_pairs,
             "K": self.K,
-            "max_path_len": self._max_path_len,
             "num_vehicles": self.num_envs,
-            "candidate_routes_shape": list(self.candidate_routes.shape),
+            "routes_flat_size": total_edges,
+            "avg_route_len": round(total_edges / num_routes, 1) if num_routes > 0 else 0,
         }
 
     def close(self, **kwargs):

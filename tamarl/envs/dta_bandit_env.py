@@ -44,11 +44,13 @@ class DTABanditEnv:
         stuck_threshold: int = 10,
         track_events: bool = False,
         link_tt_interval: float = 300.0,
+        profile_memory: bool = False,
     ):
         self._scenario_path = scenario_path
         self._max_steps = max_steps
         self._device = device
         self._seed = seed
+        self._profile_memory = profile_memory
 
         # Load scenario (network + population)
         self.scenario = load_scenario(
@@ -74,24 +76,29 @@ class DTABanditEnv:
     #  Public API
     # ──────────────────────────────────────────────────────────────────
 
-    def reset(self, paths: torch.Tensor) -> None:
+    def reset(self, paths: torch.Tensor = None, paths_flat: torch.Tensor = None, path_offsets: torch.Tensor = None) -> None:
         """Configure the DNL with the given paths and prepare for step().
 
         Args:
-            paths: [A, MaxPathLen] int tensor of edge indices, padded
-                   with -1.  Each row is a full route for one agent.
-                   Multi-leg routes use -2 as leg separator.
+            paths: DEPRECATED. [A, MaxPathLen] int tensor (dense format).
+            paths_flat: [TotalEdges] int32 tensor of compact edge indices (CSR format).
+            path_offsets: [A+1] long tensor of CSR offsets into paths_flat.
         """
-        assert paths.shape[0] == self.num_agents, (
-            f"paths has {paths.shape[0]} agents, expected {self.num_agents}"
+        if paths_flat is not None:
+            num_agents_check = path_offsets.shape[0] - 1
+        elif paths is not None:
+            num_agents_check = paths.shape[0]
+        else:
+            raise ValueError("Must provide either paths or paths_flat + path_offsets.")
+            
+        assert num_agents_check == self.num_agents, (
+            f"paths has {num_agents_check} agents, expected {self.num_agents}"
         )
-
-        paths_device = paths.to(self._device, dtype=torch.int32)
 
         # (Re-)create the DNL in paths mode (non-RL)
         self.dnl = TorchDNLMATSim(
             edge_static=self.scenario.edge_static,
-            paths=paths_device,
+            paths=paths,
             device=self._device,
             departure_times=self.scenario.departure_times,
             edge_endpoints=self.scenario.edge_endpoints,
@@ -106,6 +113,9 @@ class DTABanditEnv:
             track_events=self._track_events,
             collect_link_tt=self.collect_link_tt,
             link_tt_interval=self.link_tt_interval,
+            paths_flat=paths_flat,
+            path_offsets=path_offsets,
+            max_steps=self._max_steps,
         )
 
         self.dnl.num_nodes = self.scenario.num_nodes
@@ -125,6 +135,11 @@ class DTABanditEnv:
             # Early exit when every agent is done
             if self.dnl.active_agents_count == 0:
                 break
+                
+            if self._profile_memory and self.dnl.current_step % 10000 == 0 and self.dnl.current_step > 0:
+                from tamarl.core.memory_profiler import analyze_tensor_memory
+                analyze_tensor_memory(f"STEP {self.dnl.current_step}")
+                
             self.dnl.step()
 
         # Extract per-agent travel time from leg_metrics

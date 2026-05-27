@@ -3,13 +3,16 @@ import os
 import torch
 import numpy as np
 import time
+import inspect
 
 from tamarl.envs.dta_bandit_env import DTABanditEnv
 from tamarl.envs.agent_level_wrapper import AgentLevelWrapper
+from tamarl.envs.od_level_wrapper import ODLevelWrapper
+from tamarl.envs.centralized_level_wrapper import CentralizedLevelWrapper
 from tamarl.rl.agents.random_agent import RandomAgent
+from tamarl.rl.train_bandit import _build_parser, load_config, _CLI_TO_KWARGS, run_episode, train
 
-def run_bandit_profiling(scenario_path, population_filter, top_k_paths=3, max_steps=1000):
-    
+def run_bandit_profiling(kwargs):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
     if device == 'cuda':
@@ -19,10 +22,11 @@ def run_bandit_profiling(scenario_path, population_filter, top_k_paths=3, max_st
     
     print("\n--- 1. Instantiating DTABanditEnv ---")
     bandit = DTABanditEnv(
-        scenario_path=scenario_path,
-        population_filter=population_filter,
-        timestep=1.0,
-        max_steps=max_steps,
+        scenario_path=kwargs["scenario_path"],
+        population_filter=kwargs.get("population_filter"),
+        timestep=kwargs.get("timestep", 1.0),
+        scale_factor=kwargs.get("scale_factor", 1.0),
+        max_steps=kwargs.get("max_steps", 36000),
         device=device,
         track_events=False
     )
@@ -31,16 +35,23 @@ def run_bandit_profiling(scenario_path, population_filter, top_k_paths=3, max_st
         mem_bandit = torch.cuda.memory_allocated() / 1024**2
         print(f"VRAM after DTABanditEnv: {mem_bandit:.2f} MB")
 
-    print(f"\n--- 2. Instantiating AgentLevelWrapper (top_k={top_k_paths}) ---")
-    env = AgentLevelWrapper(
-        bandit=bandit,
-        top_k=top_k_paths,
-        feedback_type="full"
-    )
+    top_k_paths = kwargs.get("top_k", 3)
+    formulation = kwargs.get("formulation", "agent")
+    feedback_type = kwargs.get("feedback_type", "full")
+    
+    print(f"\n--- 2. Instantiating Wrapper (formulation={formulation}, top_k={top_k_paths}) ---")
+    if formulation == "agent":
+        env = AgentLevelWrapper(bandit=bandit, top_k=top_k_paths, feedback_type=feedback_type)
+    elif formulation == "od":
+        env = ODLevelWrapper(bandit=bandit, top_k=top_k_paths, feedback_type=feedback_type)
+    elif formulation == "centralized":
+        env = CentralizedLevelWrapper(bandit=bandit, top_k=top_k_paths, feedback_type=feedback_type)
+    else:
+        raise ValueError(f"Unknown formulation: {formulation}")
     
     if device == 'cuda':
         mem_wrapper = torch.cuda.memory_allocated() / 1024**2
-        print(f"VRAM after AgentLevelWrapper: {mem_wrapper:.2f} MB")
+        print(f"VRAM after {env.__class__.__name__}: {mem_wrapper:.2f} MB")
         
         # Breakdown wrapper tensors
         if hasattr(env, 'candidate_routes'):
@@ -50,32 +61,22 @@ def run_bandit_profiling(scenario_path, population_filter, top_k_paths=3, max_st
             
     print("\n--- 3. Running 1 Episode (like train_bandit.py) ---")
     agent = RandomAgent(num_agents=env.num_envs, k=top_k_paths)
-    obs, infos = env.reset()
     
-    # Generate mock actions
-    actions = agent.act()
-    
-    print("Running env.step(actions)... (This triggers path building & TorchDNLMATSim instantiation)")
+    print("Running run_episode(env, agent)... (This triggers reset, action generation, step & update)")
     
     if device == 'cuda':
         torch.cuda.empty_cache()
         mem_before_step = torch.cuda.memory_allocated() / 1024**2
     
-    # We profile the step function
-    with torch.profiler.profile(
-        activities=[
-            torch.profiler.ProfilerActivity.CPU,
-            torch.profiler.ProfilerActivity.CUDA,
-        ],
-        schedule=torch.profiler.schedule(wait=0, warmup=0, active=1, repeat=1),
-        on_trace_ready=torch.profiler.tensorboard_trace_handler('./profiler_logs_bandit'),
-        record_shapes=True,
-        profile_memory=True,
-        with_stack=True
-    ) as prof:
+    # Execute the full episode cycle manually tracking memory (Zero overhead)
+    if device == 'cuda':
+        torch.cuda.reset_peak_memory_stats()
         
-        obs, rewards, terminated, truncated, infos = env.step(actions)
-        prof.step()
+    t0 = time.time()
+    run_episode(env, agent)
+    elapsed = time.time() - t0
+    
+    print(f"\nEpisode finished in {elapsed:.2f} seconds.")
 
     if device == 'cuda':
         mem_after_step = torch.cuda.memory_allocated() / 1024**2
@@ -86,13 +87,12 @@ def run_bandit_profiling(scenario_path, population_filter, top_k_paths=3, max_st
         with open("memory_summary_bandit.txt", "w") as f:
             f.write(torch.cuda.memory_summary(device=device))
         print("\nSaved detailed memory summary to memory_summary_bandit.txt")
-        print("PyTorch profiler logs saved to ./profiler_logs_bandit")
 
     # Final breakdown of DNL inside bandit
     if bandit.dnl is not None:
         print("\n--- Final Breakdown of inner TorchDNLMATSim ---")
         tensors = [
-            ('paths', bandit.dnl.paths),
+            ('paths_flat', getattr(bandit.dnl, 'paths_flat', None)),
             ('interval_tt_sum', getattr(bandit.dnl, 'interval_tt_sum', None)),
         ]
         for name, t in tensors:
@@ -101,12 +101,41 @@ def run_bandit_profiling(scenario_path, population_filter, top_k_paths=3, max_st
                 print(f"{name:20s}: {size_mb:8.2f} MB (dtype: {t.dtype}, shape: {list(t.shape)})")
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("scenario_path", help="Path to scenario folder")
-    parser.add_argument("--population", help="Population filter", default=None)
-    parser.add_argument("--top_k", type=int, default=3, help="Top K paths")
-    parser.add_argument("--steps", type=int, default=1000, help="Max steps for DNL")
+def main():
+    parser = _build_parser()
+    parser.description = "Profile the One-Shot Bandit DTA memory footprint"
     
-    args = parser.parse_args()
-    run_bandit_profiling(args.scenario_path, args.population, args.top_k, args.steps)
+    args, unknown = parser.parse_known_args()
+
+    # 1. Start with train() defaults
+    sig = inspect.signature(train)
+    kwargs = {
+        k: v.default
+        for k, v in sig.parameters.items()
+        if v.default is not inspect.Parameter.empty
+    }
+
+    # 2. Override with JSON config if provided
+    if args.config:
+        config_path = args.config
+        if not os.path.isfile(config_path):
+            parser.error(f"Config file not found: {config_path}")
+        json_kwargs = load_config(config_path)
+        kwargs.update(json_kwargs)
+        print(f"  [Config] Loaded from: {config_path}")
+
+    # 3. Override with CLI arguments (only those explicitly set)
+    args_dict = vars(args)
+    for cli_name, kwarg_name in _CLI_TO_KWARGS.items():
+        cli_val = args_dict.get(cli_name)
+        if cli_val is not None:
+            kwargs[kwarg_name] = cli_val
+
+    # 4. Ensure scenario_path is set
+    if "scenario_path" not in kwargs or kwargs["scenario_path"] is None:
+        parser.error("--scenario is required (via CLI or config file)")
+        
+    run_bandit_profiling(kwargs)
+
+if __name__ == "__main__":
+    main()
