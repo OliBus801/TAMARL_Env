@@ -198,6 +198,8 @@ def train(
     # Exp3
     exp3_eta: float = 0.01,
     exp3_gamma: float = 0.05,
+    # Reload paths
+    reload_paths: bool = False,
     # Profiling
     profile_memory: bool = False,
 ):
@@ -242,6 +244,7 @@ def train(
         'ts_env_std': ts_env_std,
         'exp3_eta': exp3_eta,
         'exp3_gamma': exp3_gamma,
+        'reload_paths': reload_paths,
     }
 
 
@@ -294,18 +297,21 @@ def train(
             bandit=bandit,
             top_k=top_k_paths,
             feedback_type=bandit_feedback,
+            reload_paths=reload_paths,
         )
     elif formulation == "od_pair":
         env = ODLevelWrapper(
             bandit=bandit,
             top_k=top_k_paths,
             feedback_type=bandit_feedback,
+            reload_paths=reload_paths,
         )
     elif formulation == "centralized":
         env = CentralizedLevelWrapper(
             bandit=bandit,
             top_k=top_k_paths,
             feedback_type=bandit_feedback,
+            reload_paths=reload_paths,
         )
     else:
         raise ValueError(f"Unknown formulation: {formulation}")
@@ -681,6 +687,7 @@ def load_config(config_path: str) -> dict:
         "ts_env_std": "ts_env_std",
         "exp3_eta": "exp3_eta",
         "exp3_gamma": "exp3_gamma",
+        "reload_paths": "reload_paths",
     }
     for json_key, kwarg_key in _map.items():
         if json_key in tr:
@@ -752,6 +759,26 @@ def load_config(config_path: str) -> dict:
     return kwargs
 
 
+def _parse_wandb_tags(tags_str: str) -> List[str]:
+    """Parse wandb_tags string from CLI.
+    
+    Handles JSON-like list strings (e.g. '["tag1", "tag2"]') or comma-separated lists.
+    """
+    if not tags_str:
+        return []
+    tags_str = tags_str.strip()
+    if (tags_str.startswith('[') and tags_str.endswith(']')) or (tags_str.startswith('(') and tags_str.endswith(')')):
+        try:
+            normalized = tags_str.replace("'", '"')
+            parsed = json.loads(normalized)
+            if isinstance(parsed, list):
+                return [str(t).strip() for t in parsed]
+        except Exception:
+            tags_str = tags_str[1:-1]
+            
+    return [t.strip().strip('"').strip("'").strip() for t in tags_str.split(',') if t.strip()]
+
+
 def _build_parser() -> argparse.ArgumentParser:
     """Build the argparse parser for CLI arguments."""
     parser = argparse.ArgumentParser(description="One-Shot Bandit DTA — Training Runner")
@@ -793,6 +820,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--wandb", action="store_true", default=None,
                         help="Enable Weights & Biases logging")
     parser.add_argument("--wandb_project", default=None, help="W&B project name")
+    parser.add_argument("--wandb_tags", default=None,
+                        help="W&B run tags (comma-separated or JSON list string)")
 
     # Render
     parser.add_argument("--render", default=None, choices=["interval", "end"],
@@ -805,6 +834,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--render_speed", type=int, default=None, help="Speed factor for rendering")
 
     parser.add_argument("--profile_memory", action="store_true", help="Enable memory profiling")
+    parser.add_argument("--reload_paths", action="store_true", default=None,
+                        help="Force recalculation and overwrite of the cached shortest paths .pkl file")
 
     parser.add_argument("--epsilon_start", type=float, default=None)
     parser.add_argument("--epsilon_end", type=float, default=None)
@@ -817,7 +848,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--exp3_gamma", type=float, default=None, help="Exploration parameter for Exp3 agent")
 
     # Metrics Config
-    parser.add_argument("--epsilon_ratio", type=float, default=None, help="Threshold ratio for Epsilon-compliance (e.g., 0.10 for 10%)")
+    parser.add_argument("--epsilon_ratio", type=float, default=None, help="Threshold ratio for Epsilon-compliance (e.g., 0.10 for 10%%)")
     parser.add_argument("--link_tt_interval", type=float, default=None, help="Aggregation interval for Nash metrics (seconds)")
 
     return parser
@@ -850,6 +881,7 @@ _CLI_TO_KWARGS = {
     "exp3_gamma": "exp3_gamma",
     "wandb": "wandb_enabled",
     "wandb_project": "wandb_project",
+    "wandb_tags": "wandb_tags",
     "render": "render",
     "render_format": "render_format",
     "render_fps": "render_fps",
@@ -858,6 +890,7 @@ _CLI_TO_KWARGS = {
     "epsilon_ratio": "epsilon_ratio",
     "link_tt_interval": "link_tt_interval",
     "profile_memory": "profile_memory",
+    "reload_paths": "reload_paths",
 }
 
 
@@ -888,6 +921,8 @@ if __name__ == "__main__":
     for cli_name, kwarg_name in _CLI_TO_KWARGS.items():
         cli_val = args_dict.get(cli_name)
         if cli_val is not None:
+            if cli_name == "wandb_tags" and isinstance(cli_val, str):
+                cli_val = _parse_wandb_tags(cli_val)
             kwargs[kwarg_name] = cli_val
 
     # 4. Ensure scenario_path is set

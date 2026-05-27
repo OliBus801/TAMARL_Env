@@ -57,6 +57,7 @@ class AgentLevelWrapper:
         bandit: DTABanditEnv,
         top_k: int = 3,
         feedback_type: str = "full",
+        reload_paths: bool = False,
     ):
         self.bandit = bandit
         self.K = top_k
@@ -122,6 +123,7 @@ class AgentLevelWrapper:
             ff_times=ff_times,
             od_pairs=unique_od.astype(np.int32),
             k=top_k,
+            force_recompute=reload_paths,
         )
 
         # ── Build candidate routes in CSR format (memory-efficient) ────

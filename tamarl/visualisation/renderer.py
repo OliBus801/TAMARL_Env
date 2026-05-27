@@ -392,6 +392,12 @@ def _compute_agent_positions(agent_ids, link_ids, states_col, links_col, enters_
             overflow = n - N_MAX_STACK if n > N_MAX_STACK else 0
             nv = len(visible)
 
+            # Calculate spacing dynamically based on the Euclidean length of the link
+            dx_geom = x1 - x0
+            dy_geom = y1 - y0
+            geom_len = math.sqrt(dx_geom * dx_geom + dy_geom * dy_geom)
+            link_spacing = geom_len * 0.06 if geom_len > 1e-9 else 1.0
+
             is_longitudinal = group[0].get('is_longitudinal_queue', False)
 
             if is_longitudinal:
@@ -405,12 +411,12 @@ def _compute_agent_positions(agent_ids, link_ids, states_col, links_col, enters_
                     ux, uy = 0.0, 0.0
                 
                 for i, p in enumerate(visible):
-                    p['x'] += ux * i * spacing
-                    p['y'] += uy * i * spacing
+                    p['x'] += ux * i * link_spacing
+                    p['y'] += uy * i * link_spacing
                     result.append(p)
             else:
                 for i, p in enumerate(visible):
-                    offset = (i - (nv - 1) / 2.0) * spacing
+                    offset = (i - (nv - 1) / 2.0) * link_spacing
                     ox, oy = _perpendicular_offset(x0, y0, x1, y1, offset)
                     p['x'] += ox
                     p['y'] += oy
@@ -755,7 +761,7 @@ def render_animation(scenario_folder: str, output_folder: str,
     pbar = tqdm(total=num_frames, desc='🎞️  Rendering', unit='frame',
                 bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]')
 
-    disable_fanning = len(agent_ids) > 2000 or len(links) > 2000
+    disable_fanning = False
 
     last_dynamic_artists = []
 
@@ -868,7 +874,7 @@ def render_live(scenario_folder: str, output_folder: str,
 
     # State
     state = {'playing': False, 'current_frame': 0, 'speed': initial_speed, 'timer': None, 'artists': []}
-    disable_fanning = len(agent_ids) > 2000 or len(links) > 2000
+    disable_fanning = False
 
     def draw_current():
         for art in state['artists']:
