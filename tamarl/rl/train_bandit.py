@@ -182,6 +182,7 @@ def train(
     wandb_enabled: bool = False,
     wandb_project: str = "tamarl",
     wandb_tags: Optional[list] = None,
+    wandb_agent: Optional[str] = None,
     # Metrics
     epsilon_ratio: float = 0.10,
     link_tt_interval: float = 60.0,
@@ -245,6 +246,7 @@ def train(
         'exp3_eta': exp3_eta,
         'exp3_gamma': exp3_gamma,
         'reload_paths': reload_paths,
+        'wandb_agent': wandb_agent,
     }
 
 
@@ -266,7 +268,7 @@ def train(
         project=wandb_project,
         run_name=f"{agent_type}-bandit-seed{seed}",
         scenario_id=scenario_id,
-        agent_type=agent_type,
+        agent_type=wandb_agent if wandb_agent is not None else agent_type,
         config=config,
         enabled=wandb_enabled,
         tags=wandb_tags,
@@ -328,11 +330,45 @@ def train(
         num_agent_models = env.num_envs
 
     # ── Agent ──
+    # Dynamic Priors Logic (used by Thompson Sampling and Epsilon Greedy)
+    prior_means = None
+    ts_env_stds = None
+    
+    if hasattr(env, "fftt_matrix") and hasattr(env, "od_indices_all_legs"):
+        if formulation == "od_pair":
+            # OD-pair formulation: priors are per OD pair [num_od_pairs, K]
+            fftt_per_model = env.fftt_matrix  # [num_od_pairs, K]
+        elif formulation == "centralized":
+            # Centralized: prior = moyenne globale sur toutes les OD [1, K]
+            masked_fftt_all = env.fftt_matrix.copy()
+            masked_fftt_all[masked_fftt_all == np.inf] = np.nan
+            # nanmean sur l'axe 0 (sur toutes les OD) → [K]
+            grand_mean = np.nanmean(masked_fftt_all, axis=0)
+            grand_mean = np.nan_to_num(grand_mean, nan=0.0)
+            fftt_per_model = grand_mean[np.newaxis, :]  # [1, K]
+        else:
+            # Agent formulation: map to per-vehicle [TotalLegs, K]
+            fftt_per_model = env.fftt_matrix[env.od_indices_all_legs.cpu().numpy()]
+
+        # Rewards are negative travel times
+        prior_means = torch.from_numpy(-fftt_per_model).to(device)
+
+        # Env Std is the std of FFTTs among paths, with a floor of 10.0s
+        if ts_env_std is None:
+            masked_fftt = fftt_per_model.copy()
+            masked_fftt[masked_fftt == np.inf] = np.nan
+            std_vals = np.nanstd(masked_fftt, axis=1)
+            std_vals = np.nan_to_num(std_vals, nan=0.0)
+            ts_env_stds = torch.from_numpy(np.maximum(std_vals, 10.0)).to(device)
+        else:
+            ts_env_stds = torch.full((num_agent_models,), ts_env_std, device=device)
+
     if agent_type == "epsilon_greedy":
         from tamarl.rl.agents.epsilon_greedy_agent import EpsilonGreedyAgent
         agent = EpsilonGreedyAgent(
             num_agents=num_agent_models,
             k_paths=top_k_paths,
+            prior_mean=prior_means,
             epsilon_start=epsilon_start,
             epsilon_end=epsilon_end,
             epsilon_decay=epsilon_decay,
@@ -351,45 +387,12 @@ def train(
     elif agent_type == "ts":
         from tamarl.rl.agents.thompson_sampling_agent import ThompsonSamplingAgent
         
-        # Dynamic Priors Logic
-        prior_means = None
-        env_stds = None
-        
-        if hasattr(env, "fftt_matrix") and hasattr(env, "od_indices_all_legs"):
-            if formulation == "od_pair":
-                # OD-pair formulation: priors are per OD pair [num_od_pairs, K]
-                fftt_per_model = env.fftt_matrix  # [num_od_pairs, K]
-            elif formulation == "centralized":
-                # Centralized: prior = moyenne globale sur toutes les OD [1, K]
-                masked_fftt_all = env.fftt_matrix.copy()
-                masked_fftt_all[masked_fftt_all == np.inf] = np.nan
-                # nanmean sur l'axe 0 (sur toutes les OD) → [K]
-                grand_mean = np.nanmean(masked_fftt_all, axis=0)
-                grand_mean = np.nan_to_num(grand_mean, nan=0.0)
-                fftt_per_model = grand_mean[np.newaxis, :]  # [1, K]
-            else:
-                # Agent formulation: map to per-vehicle [TotalLegs, K]
-                fftt_per_model = env.fftt_matrix[env.od_indices_all_legs.cpu().numpy()]
-
-            # Rewards are negative travel times
-            prior_means = torch.from_numpy(-fftt_per_model).to(device)
-
-            # Env Std is the std of FFTTs among paths, with a floor of 10.0s
-            if ts_env_std is None:
-                masked_fftt = fftt_per_model.copy()
-                masked_fftt[masked_fftt == np.inf] = np.nan
-                std_vals = np.nanstd(masked_fftt, axis=1)
-                std_vals = np.nan_to_num(std_vals, nan=0.0)
-                env_stds = torch.from_numpy(np.maximum(std_vals, 10.0)).to(device)
-            else:
-                env_stds = torch.full((num_agent_models,), ts_env_std, device=device)
-
         agent = ThompsonSamplingAgent(
             num_agents=num_agent_models,
             k_paths=top_k_paths,
             prior_mean=prior_means,
             prior_std=ts_prior_std,
-            env_std=env_stds,
+            env_std=ts_env_stds,
             device=device,
             seed=seed
         )
@@ -735,6 +738,8 @@ def load_config(config_path: str) -> dict:
         kwargs["wandb_project"] = log["wandb_project"]
     if "wandb_tags" in log:
         kwargs["wandb_tags"] = log["wandb_tags"]
+    if "wandb_agent" in log:
+        kwargs["wandb_agent"] = log["wandb_agent"]
 
     # ── Rendering ──
     rnd = cfg.get("rendering", {})
@@ -822,6 +827,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--wandb_project", default=None, help="W&B project name")
     parser.add_argument("--wandb_tags", default=None,
                         help="W&B run tags (comma-separated or JSON list string)")
+    parser.add_argument("--wandb_agent", default=None, help="Specific agent type name for W&B logging")
 
     # Render
     parser.add_argument("--render", default=None, choices=["interval", "end"],
@@ -882,6 +888,7 @@ _CLI_TO_KWARGS = {
     "wandb": "wandb_enabled",
     "wandb_project": "wandb_project",
     "wandb_tags": "wandb_tags",
+    "wandb_agent": "wandb_agent",
     "render": "render",
     "render_format": "render_format",
     "render_fps": "render_fps",

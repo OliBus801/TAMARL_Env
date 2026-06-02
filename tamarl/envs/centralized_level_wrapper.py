@@ -351,18 +351,19 @@ class CentralizedLevelWrapper:
         # ── Métriques Nash empiriques ─────────────────────────────────
         # Les métriques Nash sont calculées par paire OD réelle (num_od_pairs),
         # pas par bloc de paramètres (num_models = 1).
-        estimated_times, _ = self.evaluator.evaluate(
-            dnl=self.bandit.dnl,
-            departure_times=self.bandit.scenario.departure_times,
-            od_indices=self.od_indices_all_legs,
-        )
-        
-        path_metrics = compute_empirical_nash_metrics_tensor(
-            actual_travel_times=torch.tensor(travel_times, device=self._device),
-            actions=actions_t,
-            estimated_times=estimated_times
-        )
-        info.update(path_metrics)
+        if self.bandit.collect_link_tt:
+            estimated_times, _ = self.evaluator.evaluate(
+                dnl=self.bandit.dnl,
+                departure_times=self.bandit.scenario.departure_times,
+                od_indices=self.od_indices_all_legs,
+            )
+            
+            path_metrics = compute_empirical_nash_metrics_tensor(
+                actual_travel_times=torch.tensor(travel_times, device=self._device),
+                actions=actions_t,
+                estimated_times=estimated_times
+            )
+            info.update(path_metrics)
 
         return self._get_obs(), rewards, terminated, truncated, info
 
