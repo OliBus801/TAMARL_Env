@@ -209,8 +209,14 @@ class TorchDNLMATSim:
                 num_intervals = math.ceil(max_steps * dt / link_tt_interval) + 1
             else:
                 num_intervals = 288  # default: 86400s / 300s
-            self.interval_tt_sum = torch.zeros((num_intervals, self.num_edges), device=self.device, dtype=torch.float32)
-            self.interval_tt_count = torch.zeros((num_intervals, self.num_edges), device=self.device, dtype=torch.float32)
+            # Store full history on CPU using pinned memory for fast asynchronous transfers if CUDA is available
+            pin_memory = torch.cuda.is_available()
+            self.interval_tt_sum = torch.zeros((num_intervals, self.num_edges), device='cpu', dtype=torch.float32, pin_memory=pin_memory)
+            self.interval_tt_count = torch.zeros((num_intervals, self.num_edges), device='cpu', dtype=torch.float32, pin_memory=pin_memory)
+            # Double buffer current active interval on simulator device (e.g. GPU)
+            self.current_interval_idx = 0
+            self.current_interval_tt_sum = torch.zeros(self.num_edges, device=self.device, dtype=torch.float32)
+            self.current_interval_tt_count = torch.zeros(self.num_edges, device=self.device, dtype=torch.float32)
 
         # Agent State - Structure of Arrays (SOA)
         # Status | 0: Waiting/Activity, 1: Traveling, 2: Buffer, 3: Done, 4: Exiter (waiting for dispatch)
@@ -348,6 +354,9 @@ class TorchDNLMATSim:
         if self.collect_link_tt:
             self.interval_tt_sum.fill_(0)
             self.interval_tt_count.fill_(0)
+            self.current_interval_idx = 0
+            self.current_interval_tt_sum.zero_()
+            self.current_interval_tt_count.zero_()
 
         if self.profiler:
             self.profiler.clear()
@@ -528,21 +537,11 @@ class TorchDNLMATSim:
                 self._record_events(EVT_ENTERED_LINK, winners, w_next)
 
             if self.collect_link_tt:
-                interval_idx = int((self.current_step * self.dt) // self.link_tt_interval)
-                while interval_idx >= self.interval_tt_sum.size(0):
-                    new_size = max(interval_idx + 10, self.interval_tt_sum.size(0) * 2)
-                    new_sum = torch.zeros((new_size, self.num_edges), device=self.device, dtype=torch.float32)
-                    new_count = torch.zeros((new_size, self.num_edges), device=self.device, dtype=torch.float32)
-                    new_sum[:self.interval_tt_sum.size(0)] = self.interval_tt_sum
-                    new_count[:self.interval_tt_count.size(0)] = self.interval_tt_count
-                    self.interval_tt_sum = new_sum
-                    self.interval_tt_count = new_count
-                
                 ff_curr = self.ff_travel_time_steps[w_curr]
                 delay = self.current_step - stuck_s[storage_pass]
                 tt = (ff_curr + delay).float() * self.dt
-                self.interval_tt_sum[interval_idx].scatter_add_(0, w_curr, tt)
-                self.interval_tt_count[interval_idx].scatter_add_(0, w_curr, torch.ones_like(tt))
+                self.current_interval_tt_sum.scatter_add_(0, w_curr, tt)
+                self.current_interval_tt_count.scatter_add_(0, w_curr, torch.ones_like(tt))
 
             # OPT: Update buffer_counts (agents leaving buffer)
             self.buffer_counts.scatter_add_(0, w_curr,
@@ -665,21 +664,11 @@ class TorchDNLMATSim:
 
         if self.collect_link_tt and exiters.numel() > 0:
             exit_edges = edges_sorted[proc_exit_mask]
-            interval_idx = int((self.current_step * self.dt) // self.link_tt_interval)
-            while interval_idx >= self.interval_tt_sum.size(0):
-                new_size = max(interval_idx + 10, self.interval_tt_sum.size(0) * 2)
-                new_sum = torch.zeros((new_size, self.num_edges), device=self.device, dtype=torch.float32)
-                new_count = torch.zeros((new_size, self.num_edges), device=self.device, dtype=torch.float32)
-                new_sum[:self.interval_tt_sum.size(0)] = self.interval_tt_sum
-                new_count[:self.interval_tt_count.size(0)] = self.interval_tt_count
-                self.interval_tt_sum = new_sum
-                self.interval_tt_count = new_count
-                
             ff_curr = self.ff_travel_time_steps[exit_edges]
             delay = self.current_step - self.stuck_since[exiters]
             tt = (ff_curr + delay).float() * self.dt
-            self.interval_tt_sum[interval_idx].scatter_add_(0, exit_edges, tt)
-            self.interval_tt_count[interval_idx].scatter_add_(0, exit_edges, torch.ones_like(tt))
+            self.current_interval_tt_sum.scatter_add_(0, exit_edges, tt)
+            self.current_interval_tt_count.scatter_add_(0, exit_edges, torch.ones_like(tt))
 
         self.status[exiters] = 4
 
@@ -904,6 +893,31 @@ class TorchDNLMATSim:
         # C. Schedule Demand (New agents enter network)
         self._schedule_demand_C()
 
+        # Check if the time interval changed
+        if self.collect_link_tt:
+            next_interval_idx = int(((self.current_step + 1) * self.dt) // self.link_tt_interval)
+            if next_interval_idx > self.current_interval_idx:
+                # Grow CPU tensors if necessary, keeping them in pinned memory if CUDA is available
+                if next_interval_idx >= self.interval_tt_sum.size(0):
+                    new_size = max(next_interval_idx + 10, self.interval_tt_sum.size(0) * 2)
+                    pin_memory = torch.cuda.is_available()
+                    new_sum = torch.zeros((new_size, self.num_edges), device='cpu', dtype=torch.float32, pin_memory=pin_memory)
+                    new_count = torch.zeros((new_size, self.num_edges), device='cpu', dtype=torch.float32, pin_memory=pin_memory)
+                    new_sum[:self.interval_tt_sum.size(0)] = self.interval_tt_sum
+                    new_count[:self.interval_tt_count.size(0)] = self.interval_tt_count
+                    self.interval_tt_sum = new_sum
+                    self.interval_tt_count = new_count
+                
+                # Flush current GPU buffer to the CPU tensor asynchronously (non-blocking)
+                self.interval_tt_sum[self.current_interval_idx].copy_(self.current_interval_tt_sum, non_blocking=True)
+                self.interval_tt_count[self.current_interval_idx].copy_(self.current_interval_tt_count, non_blocking=True)
+                
+                # Zero out GPU buffers for the next interval
+                self.current_interval_tt_sum.zero_()
+                self.current_interval_tt_count.zero_()
+                
+                self.current_interval_idx = next_interval_idx
+
         self.current_step += 1
 
     def stop_profiling(self):
@@ -1021,17 +1035,23 @@ class TorchDNLMATSim:
         """Returns [num_intervals_active, num_edges] with average travel times."""
         if not self.collect_link_tt:
             return None
-        max_active_interval = int((self.current_step * self.dt) // self.link_tt_interval)
+        
+        # Flush the final (possibly incomplete) interval to CPU (blocking here to ensure data availability)
+        self.interval_tt_sum[self.current_interval_idx].copy_(self.current_interval_tt_sum)
+        self.interval_tt_count[self.current_interval_idx].copy_(self.current_interval_tt_count)
+        
+        max_active_interval = self.current_interval_idx
         if max_active_interval >= self.interval_tt_sum.size(0):
              max_active_interval = self.interval_tt_sum.size(0) - 1
              
         sum_tt = self.interval_tt_sum[:max_active_interval + 1]
         count_tt = self.interval_tt_count[:max_active_interval + 1]
         
+        # Perform computation on CPU to conserve GPU VRAM
         avg_tt = sum_tt / count_tt.clamp(min=1.0)
         
         # Where count is 0, fallback to ff_travel_time
-        ff_seconds = self.edge_static[:, 4].unsqueeze(0).expand_as(avg_tt)
+        ff_seconds = self.edge_static[:, 4].cpu().unsqueeze(0).expand_as(avg_tt)
         avg_tt = torch.where(count_tt > 0, avg_tt, ff_seconds)
         
-        return avg_tt
+        return avg_tt.to(self.device)
