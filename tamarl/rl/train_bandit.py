@@ -29,7 +29,7 @@ from tamarl.rl.agents.random_agent import RandomAgent
 from tamarl.core.memory_profiler import analyze_tensor_memory
 
 
-def run_episode(env, agent, epsilon_ratio: float = 0.10, profile_memory: bool = False):
+def run_episode(env, agent, epsilon_ratio: float = 0.10, profile_memory: bool = False, return_raw_infos: bool = False):
     """Run a single episode using the bandit paradigm.
 
     Génère un tenseur ``aggregation_indices`` [N] qui est passé uniformément
@@ -41,6 +41,11 @@ def run_episode(env, agent, epsilon_ratio: float = 0.10, profile_memory: bool = 
 
     L'agent ne voit jamais la distinction : il projette toujours ses poids
     [B, K] via self.weights[aggregation_indices] et agrège via scatter_add_.
+
+    Args:
+        return_raw_infos: If True, returns (stats, infos) instead of just stats.
+            Used by sanity checks to extract raw tensors without keeping them
+            permanently in memory.
     """
     if profile_memory:
         analyze_tensor_memory("BEFORE EPISODE")
@@ -100,7 +105,10 @@ def run_episode(env, agent, epsilon_ratio: float = 0.10, profile_memory: bool = 
     if profile_memory:
         analyze_tensor_memory("AFTER EPISODE")
     
-    return _compute_stats(env, rewards, infos, wall_time, len(actions), epsilon_ratio)
+    stats = _compute_stats(env, rewards, infos, wall_time, len(actions), epsilon_ratio)
+    if return_raw_infos:
+        return stats, infos
+    return stats
 
 
 def _compute_stats(env: AgentLevelWrapper, rewards: np.ndarray, infos: dict, wall_time: float, n_decisions: int, epsilon_ratio: float = 0.10) -> dict:
@@ -133,7 +141,7 @@ def _compute_stats(env: AgentLevelWrapper, rewards: np.ndarray, infos: dict, wal
     }
     
     # Pull empirical Nash metrics from infos (computed in AgentLevelWrapper.step)
-    for k in ['mean_regret', 'max_regret', 'epsilon_compliance_rate']:
+    for k in ['mean_regret', 'max_regret', 'std_regret', 'epsilon_compliance_rate']:
         if k in infos:
             stats[k] = infos[k]
 
@@ -144,7 +152,7 @@ def _aggregate_stats(window: List[Dict]) -> Dict[str, float]:
     """Aggregate stats over a window of episodes."""
     keys = ['tstt', 'mean_travel_time', 'arrival_rate', 'mean_reward',
             'episode_length', 'n_decisions', 'tt_p90', 'tt_p95',
-            'wall_time', 'mean_regret', 'max_regret',
+            'wall_time', 'mean_regret', 'max_regret', 'std_regret',
             'epsilon_compliance_rate']
     agg = {}
     for k in keys:
@@ -203,6 +211,8 @@ def train(
     reload_paths: bool = False,
     # Profiling
     profile_memory: bool = False,
+    # Sanity Checks
+    sanity_checks: bool = False,
 ):
     """Run the training loop for the One-Shot Bandit environment.
 
@@ -488,9 +498,10 @@ def train(
     window_stats = []
     cumulative_max_regret = 0.0
     
-    # If using SB3, and we want to do proper RL training, we could call agent.learn().
-    # But for parity with the manual loop of train.py, we run it manually for now.
-    # Note: proper SB3 integration should use agent.model.learn(total_timesteps)
+    # ── Sanity Check tracking ──
+    best_mean_tt = float('inf')
+    best_sanity_data = None          # Will hold CPU tensors for the best episode
+    best_sanity_data = None          # Will hold CPU tensors for the best episode
 
     pbar = tqdm(range(n_episodes), desc="Training", unit="ep", dynamic_ncols=True)
 
@@ -503,6 +514,9 @@ def train(
         # MSA and EvoSwap agents always need collect_link_tt (TD evaluator requirement)
         if agent_type in ["msa", "evo_swap"]:
             needs_tt = True
+        # Sanity checks require link TT for V/C computation
+        if sanity_checks:
+            needs_tt = True
         env.bandit.collect_link_tt = needs_tt
 
         # Enable event tracking for rendering if it's the last episode and render == 'end'
@@ -513,10 +527,15 @@ def train(
         # Decay epsilon if supported
         if hasattr(agent, "decay_epsilon"):
             agent.decay_epsilon()
-            
 
-
-        stats = run_episode(env, agent, epsilon_ratio, profile_memory=profile_memory)
+        # Run the episode, optionally returning raw infos for sanity checks
+        result = run_episode(env, agent, epsilon_ratio, profile_memory=profile_memory,
+                             return_raw_infos=sanity_checks)
+        if sanity_checks:
+            stats, raw_infos = result
+        else:
+            stats = result
+            raw_infos = None
         
         # Accumulate cumulative regret
         if 'max_regret' in stats:
@@ -527,6 +546,28 @@ def train(
         if hasattr(agent, "end_episode"):
             agent.end_episode()
 
+
+        # ── Sanity Check: track best episode & histogram regrets ──────
+        if sanity_checks and raw_infos is not None:
+            current_mean_tt = stats['mean_travel_time']
+            if current_mean_tt < best_mean_tt:
+                best_mean_tt = current_mean_tt
+                # Clone only the data needed for plots 1 & 2 to CPU
+                best_sanity_data = {
+                    'episode': ep,
+                    'mean_tt': current_mean_tt,
+                    'realized_tt': torch.from_numpy(raw_infos['_episode']['t']).cpu(),
+                    'fftt_chosen': torch.from_numpy(raw_infos['fftt_chosen']).cpu(),
+                }
+                # V/C data: clone interval counts from DNL
+                if hasattr(env.bandit.dnl, 'interval_tt_count') and env.bandit.collect_link_tt:
+                    best_sanity_data['link_counts'] = env.bandit.dnl.interval_tt_count.clone().cpu()
+                    best_sanity_data['flow_capacity_per_step'] = env.bandit.dnl.flow_capacity_per_step.clone().cpu()
+                    best_sanity_data['link_tt_interval'] = env.bandit.dnl.link_tt_interval
+                    best_sanity_data['dt'] = env.bandit.dnl.dt
+
+                # (Histogram logic was here but is now removed for memory efficiency and visualization change)
+                pass
 
         all_stats.append(stats)
         window_stats.append(stats)
@@ -606,7 +647,9 @@ def train(
     print(f"{'='*65}")
 
     def _fmt(key):
-        vals = [s[key] for s in all_stats]
+        vals = [s[key] for s in all_stats if key in s]
+        if not vals:
+            return "N/A"
         return f"{np.mean(vals):.1f} ± {np.std(vals):.1f}"
 
     print(f"  TSTT:             {_fmt('tstt')}")
@@ -651,6 +694,26 @@ def train(
             render_speed=render_speed,
             filename=f"{agent_type}-{scenario_id}-final",
         )
+
+    # ── Sanity Check Plots ──
+    if sanity_checks and best_sanity_data is not None:
+        from tamarl.visualisation.sanity_checks import generate_sanity_checks
+        run_name = f"{agent_type}-seed{seed}"
+        output_dir = os.path.join(scenario_path, run_name, "graphs")
+        os.makedirs(output_dir, exist_ok=True)
+
+        tqdm.write(f"\n📊 Generating sanity check plots in {output_dir}...")
+        generate_sanity_checks(
+            best_sanity_data=best_sanity_data,
+            regret_history=[
+                (s.get('mean_regret'), s.get('max_regret'), s.get('std_regret'), s.get('epsilon_compliance_rate'))
+                for s in all_stats
+            ],
+            output_dir=output_dir,
+            scenario_id=scenario_id,
+            agent_type=agent_type,
+        )
+        tqdm.write(f"  ✅ Sanity check plots saved to {output_dir}")
 
     env.close()
     return all_stats
@@ -760,6 +823,8 @@ def load_config(config_path: str) -> dict:
         kwargs["epsilon_ratio"] = met["epsilon_ratio"]
     if "link_tt_interval" in met:
         kwargs["link_tt_interval"] = met["link_tt_interval"]
+    if "sanity_checks" in met:
+        kwargs["sanity_checks"] = met["sanity_checks"]
 
     return kwargs
 
@@ -842,6 +907,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--profile_memory", action="store_true", help="Enable memory profiling")
     parser.add_argument("--reload_paths", action="store_true", default=None,
                         help="Force recalculation and overwrite of the cached shortest paths .pkl file")
+    parser.add_argument("--sanity_checks", action="store_true",
+                        help="Generate sanity check plots (FFTT scatter, V/C histogram, regret violin) at end of training")
 
     parser.add_argument("--epsilon_start", type=float, default=None)
     parser.add_argument("--epsilon_end", type=float, default=None)
@@ -898,6 +965,7 @@ _CLI_TO_KWARGS = {
     "link_tt_interval": "link_tt_interval",
     "profile_memory": "profile_memory",
     "reload_paths": "reload_paths",
+    "sanity_checks": "sanity_checks",
 }
 
 

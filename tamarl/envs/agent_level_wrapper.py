@@ -311,6 +311,12 @@ class AgentLevelWrapper:
         tt_obs    = tt_matrix[self._leg_agent_idx, self._leg_leg_idx]  # [TotalLegs]
         rewards   = (-tt_obs).cpu().numpy().astype(np.float32)
 
+        # ── Free-flow travel times for the chosen actions ────────────
+        # fftt_matrix is [NumUniqueOD, K] numpy float32
+        od_np = self.od_indices_all_legs.cpu().numpy()
+        act_np = actions_t.cpu().numpy()
+        fftt_chosen = self.fftt_matrix[od_np, act_np]  # [TotalLegs] numpy
+
         # ── Semi-bandit feedback (reconstructs dense tensor lazily) ──
         semi_bandit_costs = None
         if self.feedback_type == "semi":
@@ -344,6 +350,7 @@ class AgentLevelWrapper:
             "l": np.ones(self.num_envs, dtype=np.int32),
             "t": travel_times,
         }
+        info["fftt_chosen"] = fftt_chosen
 
         # ── Compute Path-Based Empirical Regret Metrics ──────────────
         if self.bandit.collect_link_tt:

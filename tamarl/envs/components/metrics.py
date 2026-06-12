@@ -185,5 +185,6 @@ def compute_empirical_nash_metrics_tensor(
     return {
         'mean_regret': regrets.mean().item(),
         'max_regret': regrets.max().item(),
-        'epsilon_compliance_rate': epsilon_compliance
+        'std_regret': regrets.std().item() if regrets.numel() > 1 else 0.0,
+        'epsilon_compliance_rate': epsilon_compliance,
     }
