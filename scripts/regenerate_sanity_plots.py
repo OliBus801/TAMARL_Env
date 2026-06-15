@@ -133,6 +133,7 @@ def main():
     parser.add_argument("dir", type=str, help="Directory containing the graph CSV files (e.g. graphs/)")
     parser.add_argument("--plots", type=str, default="1,2,3", help="Comma separated list of plots to regenerate (e.g., '1,3' or '2')")
     parser.add_argument("--recompute_ff", action="store_true", help="Recompute Free-Flow Travel Time (ignore first edge) and overwrite CSV")
+    parser.add_argument("--population_filter", type=str, default=None, help="Substring to match the correct population file (e.g. '25pct')")
     args = parser.parse_args()
 
     target_dir = args.dir
@@ -160,8 +161,8 @@ def main():
                     scenario_path = None
                     
                 if scenario_path and os.path.exists(scenario_path):
-                    print(f"  [Recompute] Loading scenario from {scenario_path}...")
-                    scenario_data = load_scenario(scenario_path)
+                    print(f"  [Recompute] Loading scenario from {scenario_path} (Filter: {args.population_filter})...")
+                    scenario_data = load_scenario(scenario_path, population_filter=args.population_filter)
                     
                     leg_first_edges = []
                     fe_np = scenario_data.first_edges.numpy()
