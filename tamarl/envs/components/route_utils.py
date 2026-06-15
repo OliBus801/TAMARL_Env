@@ -87,7 +87,8 @@ def build_routes_csr(
                 end   = int(routes_offsets_np[row + 1])
                 if masks_np[od_idx, k_idx] and end > start:
                     path_edges = routes_flat_np[start:end]
-                    fftt_matrix_np[od_idx, k_idx] = edge_static_np[path_edges, 4].sum()
+                    # The first link is ignored because the agent is placed directly in its capacity buffer
+                    fftt_matrix_np[od_idx, k_idx] = edge_static_np[path_edges[1:], 4].sum() if len(path_edges) > 1 else 0.0
                 else:
                     fftt_matrix_np[od_idx, k_idx] = np.inf
 

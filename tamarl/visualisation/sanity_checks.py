@@ -71,8 +71,11 @@ def plot_tt_vs_fftt(
     tt_min = tt_np / 60.0
     ff_min = ff_np / 60.0
 
+    # Filter out non-finite values for both validation and plotting
+    finite_mask = np.isfinite(tt_np) & np.isfinite(ff_np)
+
     # ── Validation ──
-    violations = tt_np < (ff_np - 1e-3)  # 1ms tolerance for float precision
+    violations = (tt_np < (ff_np - 1e-3)) & finite_mask  # 1ms tolerance for float precision
     n_violations = int(violations.sum())
     is_valid = n_violations == 0
 
@@ -91,22 +94,37 @@ def plot_tt_vs_fftt(
     fig, ax = plt.subplots(figsize=(8, 7))
     _apply_dark_theme(ax, fig)
 
-    # Hexbin
-    max_val = max(tt_min.max(), ff_min.max()) * 1.05
+    plot_tt = tt_min[finite_mask]
+    plot_ff = ff_min[finite_mask]
+    
+    n_dropped = len(tt_min) - len(plot_tt)
+    if n_dropped > 0:
+        print(f"  ⚠ Ignored {n_dropped} agents with Inf/NaN travel times in Plot 1.")
+
+    # Hexbin limits
+    if len(plot_tt) > 0:
+        max_val = max(plot_tt.max(), plot_ff.max()) * 1.05
+    else:
+        max_val = 1.0
+        
+    if max_val <= 0 or np.isnan(max_val) or np.isinf(max_val):
+        max_val = 1.0
+
     min_val = 0
 
     cmap = LinearSegmentedColormap.from_list(
         'dark_heat', ['#0d1117', '#1a3a5c', '#2d7d9a', '#58a6ff', '#79c0ff', '#ffffff']
     )
 
-    hb = ax.hexbin(
-        ff_min, tt_min,
-        gridsize=60, cmap=cmap, mincnt=1,
-        extent=[min_val, max_val, min_val, max_val],
-    )
-    cb = fig.colorbar(hb, ax=ax, pad=0.02)
-    cb.set_label('Agent Count', color=_TEXT_COLOR, fontsize=10)
-    cb.ax.tick_params(colors=_TEXT_COLOR, labelsize=8)
+    if len(plot_tt) > 0:
+        hb = ax.hexbin(
+            plot_ff, plot_tt,
+            gridsize=60, cmap=cmap, mincnt=1,
+            extent=[min_val, max_val, min_val, max_val],
+        )
+        cb = fig.colorbar(hb, ax=ax, pad=0.02)
+        cb.set_label('Agent Count', color=_TEXT_COLOR, fontsize=10)
+        cb.ax.tick_params(colors=_TEXT_COLOR, labelsize=8)
 
     # Y=X line (physical lower bound: green if valid, red if violation)
     line_range = np.linspace(min_val, max_val, 100)
@@ -116,9 +134,10 @@ def plot_tt_vs_fftt(
 
     # Mark violations if any
     if n_violations > 0:
-        viol_idx = np.where(violations)[0]
-        ax.scatter(ff_min[viol_idx], tt_min[viol_idx], color=_ACCENT_RED,
-                   s=15, zorder=5, alpha=0.8, label=f'⚠ {n_violations} violations')
+        viol_idx = np.where(violations & finite_mask)[0]
+        if len(viol_idx) > 0:
+            ax.scatter(ff_min[viol_idx], tt_min[viol_idx], color=_ACCENT_RED,
+                       s=15, zorder=5, alpha=0.8, label=f'⚠ {n_violations} violations')
 
     ax.set_xlabel('Free-Flow Travel Time (minutes)', fontsize=11)
     ax.set_ylabel('Realized Travel Time (minutes)', fontsize=11)
