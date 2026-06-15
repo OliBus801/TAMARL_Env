@@ -8,6 +8,7 @@ import sys
 def main():
     parser = argparse.ArgumentParser(description="Investigate Free-Flow violations in sanity check CSV.")
     parser.add_argument("csv_path", type=str, help="Path to the sanity_01_tt_vs_fftt.csv file")
+    parser.add_argument("--population_filter", type=str, default=None, help="Substring to match the correct population file (e.g. '100pct')")
     args = parser.parse_args()
 
     if not os.path.exists(args.csv_path):
@@ -61,6 +62,12 @@ def main():
 
     files = [f for f in os.listdir(scenario_path) if f.endswith('.xml')]
     pop_candidates = [f for f in files if 'population' in f.lower() or 'plans' in f.lower()]
+    
+    if args.population_filter:
+        filtered = [p for p in pop_candidates if args.population_filter in p]
+        if filtered:
+            pop_candidates = filtered
+
     population_file = None
     if pop_candidates:
         routed_candidates = [p for p in pop_candidates if 'routed' in p.lower()]
