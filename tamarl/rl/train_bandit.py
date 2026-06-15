@@ -100,6 +100,16 @@ def run_episode(env, agent, epsilon_ratio: float = 0.10, profile_memory: bool = 
     if hasattr(agent, 'update'):
         actions_t = torch.from_numpy(actions).to(device)
         rewards_t = torch.from_numpy(rewards).to(device)
+
+        # Strategic Ignorance: mask out unstarted legs so the RL agent
+        # does not learn from their false 0.0 reward.
+        valid_mask = infos.get("valid_leg_mask")
+        if valid_mask is not None:
+            mask_t = torch.from_numpy(valid_mask).to(device)
+            actions_t = actions_t[mask_t]
+            rewards_t = rewards_t[mask_t]
+            aggregation_indices = aggregation_indices[mask_t]
+
         agent.update(actions_t, rewards_t, aggregation_indices=aggregation_indices)
 
     if profile_memory:
@@ -113,7 +123,8 @@ def run_episode(env, agent, epsilon_ratio: float = 0.10, profile_memory: bool = 
 
 def _compute_stats(env: AgentLevelWrapper, rewards: np.ndarray, infos: dict, wall_time: float, n_decisions: int, epsilon_ratio: float = 0.10) -> dict:
     """Compute metrics from a completed episode."""
-    tt = infos["_episode"]["t"]
+    # Use only valid (departed) legs for all metrics
+    tt = infos["_episode"]["t"]  # already filtered by valid_leg_mask in wrapper
     mean_tt = infos["mean_travel_time"]
     tstt = tt.sum()
     
@@ -121,24 +132,32 @@ def _compute_stats(env: AgentLevelWrapper, rewards: np.ndarray, infos: dict, wal
     # We can check arrival rate using the DNL's status
     arrival_rate = float((env.bandit.dnl.status >= 3).float().mean().cpu())
 
+    # Use valid rewards for reward stats (filtered array from _episode)
+    valid_rewards = infos["_episode"]["r"]
+
     stats = {
         'tstt': float(tstt),
         'mean_travel_time': mean_tt,
         'arrival_rate': arrival_rate,
-        'mean_reward': float(rewards.mean()),
+        'mean_reward': float(valid_rewards.mean()) if valid_rewards.size > 0 else 0.0,
         'episode_length': int(env.bandit.dnl.current_step),  # Number of simulation steps taken
         'n_decisions': n_decisions,
-        'tt_std': float(np.std(tt)),
-        'tt_min': float(np.min(tt)),
-        'tt_max': float(np.max(tt)),
-        'tt_median': float(np.median(tt)),
-        'tt_p90': float(np.percentile(tt, 90)),
-        'tt_p95': float(np.percentile(tt, 95)),
-        'reward_std': float(np.std(rewards)),
-        'reward_min': float(np.min(rewards)),
-        'reward_max': float(np.max(rewards)),
+        'tt_std': float(np.std(tt)) if tt.size > 0 else 0.0,
+        'tt_min': float(np.min(tt)) if tt.size > 0 else 0.0,
+        'tt_max': float(np.max(tt)) if tt.size > 0 else 0.0,
+        'tt_median': float(np.median(tt)) if tt.size > 0 else 0.0,
+        'tt_p90': float(np.percentile(tt, 90)) if tt.size > 0 else 0.0,
+        'tt_p95': float(np.percentile(tt, 95)) if tt.size > 0 else 0.0,
+        'reward_std': float(np.std(valid_rewards)) if valid_rewards.size > 0 else 0.0,
+        'reward_min': float(np.min(valid_rewards)) if valid_rewards.size > 0 else 0.0,
+        'reward_max': float(np.max(valid_rewards)) if valid_rewards.size > 0 else 0.0,
         'wall_time': wall_time
     }
+    
+    # Report masked legs count
+    n_masked = infos.get("n_masked_legs", 0)
+    if n_masked > 0:
+        stats['n_masked_legs'] = n_masked
     
     # Pull empirical Nash metrics from infos (computed in AgentLevelWrapper.step)
     for k in ['mean_regret', 'max_regret', 'std_regret', 'epsilon_compliance_rate']:

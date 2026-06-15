@@ -142,6 +142,9 @@ class DTABanditEnv:
                 
             self.dnl.step()
 
+        # Finalize metrics for agents still stuck in the network at timeout
+        self.dnl.finalize_stuck_agents()
+
         # Extract per-agent travel time from leg_metrics
         # leg_metrics shape: [A, MaxLegs, 2] → [:, :, 1] is travel time
         # For the one-shot bandit, we sum travel times across all legs

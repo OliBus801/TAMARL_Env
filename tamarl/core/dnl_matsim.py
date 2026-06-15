@@ -261,7 +261,7 @@ class TorchDNLMATSim:
         # Leg Metrics [A, MaxLegs, 2] -> [accumulated_distance, final_travel_time]
         self.leg_metrics = torch.zeros((self.num_agents, self.max_legs_count, 2), device=self.device, dtype=torch.float32)
         # Leg departure times [A, MaxLegs] -> Actual step when agent departed for that leg
-        self.leg_departure_times = torch.zeros((self.num_agents, self.max_legs_count), device=self.device, dtype=torch.int32)
+        self.leg_departure_times = torch.full((self.num_agents, self.max_legs_count), -1, device=self.device, dtype=torch.int32)
 
         # Optimization: Wakeup Time [A]
         # Unified scheduler: agents are only processed if current_step >= wakeup_time
@@ -341,7 +341,7 @@ class TorchDNLMATSim:
         self.start_time.copy_(self.departure_times)
         
         self.leg_metrics.fill_(0)
-        self.leg_departure_times.fill_(0)
+        self.leg_departure_times.fill_(-1)
         self.wakeup_time.copy_(self.departure_times)
         self._departure_emitted.fill_(False)
         self.current_step = 0
@@ -876,6 +876,43 @@ class TorchDNLMATSim:
             abs_ptrs = self.path_offsets[v_agents] + v_next_ptrs
             self.next_edge[v_agents] = self.paths_flat[abs_ptrs].long()
         # In RL mode, next_edge stays -1 → environment will set it before next step()
+
+    # =========================================================================
+    # Finalize agents that are still in-network when simulation ends
+    # =========================================================================
+    def finalize_stuck_agents(self):
+        """Finalize metrics for agents still in-network at the end of simulation.
+
+        Called after the simulation loop completes. For each agent:
+        - If the agent has started a leg but not finished (status 0/1/2/4),
+          record travel_time = current_step - departure_time for their current leg.
+        - Legs that never started (leg_departure_times == -1) are left with
+          leg_metrics[:, :, 1] == 0. The caller uses leg_departure_times == -1
+          as the canonical "unstarted leg" mask.
+        """
+        # Agents that are still active (not done, not never-started)
+        not_done = (self.status != 3)
+        # Among those, only finalize legs that actually departed
+        active_agents = torch.nonzero(not_done, as_tuple=True)[0]
+
+        if active_agents.numel() == 0:
+            return
+
+        c_legs = self.current_leg[active_agents]
+        dep_times = self.leg_departure_times[active_agents, c_legs]
+
+        # Only finalize agents whose current leg actually started (dep_time >= 0)
+        started_mask = dep_times >= 0
+        if not started_mask.any():
+            return
+
+        started_agents = active_agents[started_mask]
+        started_c_legs = c_legs[started_mask]
+        started_dep = dep_times[started_mask]
+
+        self.leg_metrics[started_agents, started_c_legs, 1] = (
+            self.current_step - started_dep
+        ).float()
 
     # =========================================================================
     # Step

@@ -309,6 +309,12 @@ class AgentLevelWrapper:
         # ── Extract per-leg rewards ──────────────────────────────────
         tt_matrix = self.bandit.dnl.leg_metrics[:, :, 1]
         tt_obs    = tt_matrix[self._leg_agent_idx, self._leg_leg_idx]  # [TotalLegs]
+
+        # ── Build valid_leg_mask: True for legs that actually departed ─
+        dep_matrix = self.bandit.dnl.leg_departure_times  # [A, MaxLegs]
+        dep_per_leg = dep_matrix[self._leg_agent_idx, self._leg_leg_idx]  # [TotalLegs]
+        valid_leg_mask = (dep_per_leg >= 0)  # legs with departure_time == -1 never started
+
         rewards   = (-tt_obs).cpu().numpy().astype(np.float32)
 
         # ── Free-flow travel times for the chosen actions ────────────
@@ -337,20 +343,29 @@ class AgentLevelWrapper:
                 semi_bandit_costs = torch.where(sel >= 0, edge_tt[safe], torch.zeros_like(edge_tt[safe]))
         del route_rows, route_starts, route_ends, route_lens, leg_write_start
 
-        # ── Package outputs ──────────────────────────────────────────
+        # ── Package outputs (filtered by valid_leg_mask) ─────────────
         terminated = np.ones(self.num_envs, dtype=bool)
         truncated = np.zeros(self.num_envs, dtype=bool)
 
+        # Only count legs that actually departed for travel time metrics
+        valid_mask_np = valid_leg_mask.cpu().numpy()
         travel_times = (-rewards).astype(np.float32)
-        info = self._get_info(travel_times)
+        valid_travel_times = travel_times[valid_mask_np]
+
+        info = self._get_info(valid_travel_times if valid_travel_times.size > 0 else travel_times)
         if semi_bandit_costs is not None:
             info["semi_bandit_feedback"] = semi_bandit_costs.cpu().numpy()
         info["_episode"] = {
-            "r": rewards,
-            "l": np.ones(self.num_envs, dtype=np.int32),
-            "t": travel_times,
+            "r": rewards[valid_mask_np],
+            "l": np.ones(int(valid_mask_np.sum()), dtype=np.int32),
+            "t": valid_travel_times,
         }
-        info["fftt_chosen"] = fftt_chosen
+        info["fftt_chosen"] = fftt_chosen[valid_mask_np]
+        info["valid_leg_mask"] = valid_mask_np
+
+        n_masked = int((~valid_leg_mask).sum().item())
+        if n_masked > 0:
+            info["n_masked_legs"] = n_masked
 
         # ── Compute Path-Based Empirical Regret Metrics ──────────────
         if self.bandit.collect_link_tt:
@@ -363,7 +378,8 @@ class AgentLevelWrapper:
             path_metrics = compute_empirical_nash_metrics_tensor(
                 actual_travel_times=tt_obs,  # already on device, no numpy round-trip
                 actions=actions_t,
-                estimated_times=estimated_times
+                estimated_times=estimated_times,
+                valid_mask=valid_leg_mask,
             )
             info.update(path_metrics)
 

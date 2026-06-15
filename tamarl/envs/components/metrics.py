@@ -156,11 +156,21 @@ def compute_empirical_nash_metrics_tensor(
     actual_travel_times: torch.Tensor, # [N] Temps réels vécus
     actions: torch.Tensor,             # [N] Index du chemin pris (0 à K-1)
     estimated_times: torch.Tensor,     # [N, K] Temps estimés par les N-Curves via l'évaluateur
-    epsilon_threshold: float = 60.0
+    epsilon_threshold: float = 60.0,
+    valid_mask: torch.Tensor = None,   # [N] bool — True for legs that actually departed
 ) -> dict:
     """
     Calcule le Nash Regret et le Relative Gap de façon 100% tensorisée.
+    
+    If valid_mask is provided, only legs where valid_mask==True are considered.
+    This prevents unstarted legs (travel_time=0) from corrupting the metrics.
     """
+    # Apply valid_mask to filter out unstarted legs
+    if valid_mask is not None:
+        actual_travel_times = actual_travel_times[valid_mask]
+        actions = actions[valid_mask]
+        estimated_times = estimated_times[valid_mask]
+
     N = actual_travel_times.shape[0]
     if N == 0:
         return {'mean_regret': 0.0, 'max_regret': 0.0, 'epsilon_compliance_rate': 0.0}
@@ -188,3 +198,4 @@ def compute_empirical_nash_metrics_tensor(
         'std_regret': regrets.std().item() if regrets.numel() > 1 else 0.0,
         'epsilon_compliance_rate': epsilon_compliance,
     }
+
