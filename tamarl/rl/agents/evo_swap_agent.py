@@ -120,9 +120,16 @@ class EvoSwapAgent:
             departure_times=self._env.bandit.scenario.departure_times,
         )
 
+        # Strategic Ignorance: only mutate legs that actually departed
+        valid_mask = kwargs.get('valid_mask')
+
         # 2. Création du masque de mutation
         # On tire aléatoirement qui va changer de chemin (Mutation)
         mutate_mask = torch.rand(self.num_envs, device=self.device) < self.epsilon
+
+        # Exclude unstarted legs from mutation
+        if valid_mask is not None:
+            mutate_mask = mutate_mask & valid_mask
 
         # 3. Application de la mutation
         self.current_actions = torch.where(mutate_mask, best_k, self.current_actions)

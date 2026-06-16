@@ -176,6 +176,15 @@ class MSAAgent:
             departure_times=self._env.bandit.scenario.departure_times,
         )
 
+        # Strategic Ignorance: mask out unstarted legs from the oracle output
+        valid_mask = kwargs.get('valid_mask')
+        if valid_mask is not None:
+            best_k = best_k[valid_mask]
+            aggregation_indices = aggregation_indices[valid_mask]
+            N = best_k.shape[0]
+            if N == 0:
+                return
+
         # ── Calcul de la Cible (Proportion Target) ───────────────────
         # On calcule la proportion de véhicules dans chaque bloc qui a
         # chaque chemin k comme meilleur.

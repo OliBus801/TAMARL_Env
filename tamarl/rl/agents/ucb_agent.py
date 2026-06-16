@@ -139,6 +139,17 @@ class UCBAgent:
         if N == 0:
             return
 
+        # Strategic Ignorance: filter out unstarted legs
+        valid_mask = kwargs.get('valid_mask')
+        if valid_mask is not None:
+            actions = actions[valid_mask]
+            rewards = rewards[valid_mask]
+            if aggregation_indices is not None:
+                aggregation_indices = aggregation_indices[valid_mask]
+            N = actions.shape[0]
+            if N == 0:
+                return
+
         if aggregation_indices is None:
             aggregation_indices = torch.arange(N, device=self.device)
 

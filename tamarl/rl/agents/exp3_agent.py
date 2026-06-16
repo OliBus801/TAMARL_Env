@@ -161,6 +161,22 @@ class Exp3Agent:
         if N == 0:
             return
 
+        # Strategic Ignorance: filter out unstarted legs
+        valid_mask = kwargs.get('valid_mask')
+        if valid_mask is not None:
+            # _last_probs is [N_full, K], so we must filter it BEFORE filtering actions
+            if self._last_probs is not None:
+                self._last_probs = self._last_probs[valid_mask]
+            actions = actions[valid_mask]
+            rewards = rewards[valid_mask]
+            if aggregation_indices is not None:
+                aggregation_indices = aggregation_indices[valid_mask]
+            elif self._last_agg_idx is not None:
+                self._last_agg_idx = self._last_agg_idx[valid_mask]
+            N = actions.shape[0]
+            if N == 0:
+                return
+
         if aggregation_indices is None:
             if self._last_agg_idx is not None:
                 aggregation_indices = self._last_agg_idx

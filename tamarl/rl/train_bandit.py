@@ -101,16 +101,17 @@ def run_episode(env, agent, epsilon_ratio: float = 0.10, profile_memory: bool = 
         actions_t = torch.from_numpy(actions).to(device)
         rewards_t = torch.from_numpy(rewards).to(device)
 
-        # Strategic Ignorance: mask out unstarted legs so the RL agent
-        # does not learn from their false 0.0 reward.
+        # Strategic Ignorance: pass valid_mask to agent.update() so each agent
+        # can mask out unstarted legs at the appropriate point in its own logic.
+        # Some agents (e.g. MSA) compute best_k internally from the full population,
+        # so pre-filtering the inputs would break dimension alignment.
         valid_mask = infos.get("valid_leg_mask")
+        valid_mask_t = None
         if valid_mask is not None:
-            mask_t = torch.from_numpy(valid_mask).to(device)
-            actions_t = actions_t[mask_t]
-            rewards_t = rewards_t[mask_t]
-            aggregation_indices = aggregation_indices[mask_t]
+            valid_mask_t = torch.from_numpy(valid_mask).to(device)
 
-        agent.update(actions_t, rewards_t, aggregation_indices=aggregation_indices)
+        agent.update(actions_t, rewards_t, aggregation_indices=aggregation_indices,
+                     valid_mask=valid_mask_t)
 
     if profile_memory:
         analyze_tensor_memory("AFTER EPISODE")
