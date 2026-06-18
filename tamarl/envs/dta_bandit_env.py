@@ -102,8 +102,6 @@ class DTABanditEnv:
             device=self._device,
             departure_times=self.scenario.departure_times,
             edge_endpoints=self.scenario.edge_endpoints,
-            first_edges=self.scenario.first_edges,
-            destinations=self.scenario.destinations,
             act_end_times=self.scenario.act_end_times,
             act_durations=self.scenario.act_durations,
             num_legs=self.scenario.num_legs,

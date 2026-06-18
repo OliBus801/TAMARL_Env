@@ -135,7 +135,15 @@ class MSAAgent:
 
         # 2. Masquage et renormalisation
         p = p * masks.float()
-        row_sums = p.sum(dim=1, keepdim=True).clamp(min=1e-10)
+        row_sums = p.sum(dim=1, keepdim=True)
+
+        # Fallback uniforme sur les routes valides si toutes les probs d'une ligne sont nulles (ex: underflow)
+        zero_rows = (row_sums == 0).squeeze(1)
+        if zero_rows.any():
+            p[zero_rows] = masks[zero_rows].float()
+            row_sums = p.sum(dim=1, keepdim=True)
+
+        row_sums = row_sums.clamp(min=1e-10)
         p = p / row_sums
 
         # 3. Tirage multinomial
@@ -195,13 +203,17 @@ class MSAAgent:
         vote_counts.scatter_add_(0, flat_idx, torch.ones(N, device=self.device))
 
         target = vote_counts.reshape(self.num_models, self.k_paths)  # [B, K]
-        
+
+        # Déterminer quels blocs ont effectivement eu des véhicules actifs
+        active_blocks = target.sum(dim=1) > 0  # [B]
+
         # Normalisation pour obtenir les proportions
         bloc_sizes = target.sum(dim=1, keepdim=True).clamp(min=1e-10)
         target = target / bloc_sizes
 
         # ── MSA blend: p ← (1 - α) * p + α * target ──────────────────
-        self.probs = (1.0 - alpha) * self.probs + alpha * target
+        # On ne met à jour que les blocs actifs pour éviter l'underflow vers zéro des inactifs
+        self.probs[active_blocks] = (1.0 - alpha) * self.probs[active_blocks] + alpha * target[active_blocks]
 
     # ──────────────────────────────────────────────────────────────────
     #  Housekeeping

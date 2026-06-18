@@ -53,6 +53,11 @@ def plot_tt_vs_fftt(
     realized_tt: torch.Tensor,
     fftt_chosen: torch.Tensor,
     output_path: str,
+    original_idx: Optional[np.ndarray] = None,
+    planned_dep: Optional[np.ndarray] = None,
+    actual_dep: Optional[np.ndarray] = None,
+    arrival: Optional[np.ndarray] = None,
+    chosen_path_idx: Optional[np.ndarray] = None,
 ):
     """Hexbin scatter plot of realized travel time vs free-flow travel time.
 
@@ -63,6 +68,7 @@ def plot_tt_vs_fftt(
         realized_tt: [N] tensor of actual travel times (seconds).
         fftt_chosen: [N] tensor of free-flow travel times (seconds).
         output_path: Where to save the plot.
+        original_idx: Optional [N] array of the original, unfiltered leg indices.
     """
     tt_np = realized_tt.numpy().astype(np.float64)
     ff_np = fftt_chosen.astype(np.float64) if isinstance(fftt_chosen, np.ndarray) else fftt_chosen.numpy().astype(np.float64)
@@ -84,9 +90,14 @@ def plot_tt_vs_fftt(
     try:
         with open(csv_path, 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(['agent_idx', 'fftt_sec', 'realized_tt_sec', 'fftt_min', 'realized_tt_min'])
-            for idx in range(len(tt_np)):
-                writer.writerow([idx, ff_np[idx], tt_np[idx], ff_min[idx], tt_min[idx]])
+            writer.writerow(['leg_idx', 'fftt_sec', 'realized_tt_sec', 'fftt_min', 'realized_tt_min', 'planned_departure', 'actual_departure', 'arrival', 'chosen_path_idx'])
+            for i in range(len(tt_np)):
+                idx = int(original_idx[i]) if original_idx is not None else i
+                pd_val = int(planned_dep[i]) if planned_dep is not None else -1
+                ad_val = int(actual_dep[i]) if actual_dep is not None else -1
+                ar_val = int(arrival[i]) if arrival is not None else -1
+                cp_val = int(chosen_path_idx[i]) if chosen_path_idx is not None else -1
+                writer.writerow([idx, ff_np[i], tt_np[i], ff_min[i], tt_min[i], pd_val, ad_val, ar_val, cp_val])
         print(f"  📄 Saved Plot 1 data to {csv_path}")
     except Exception as e:
         print(f"  ⚠ Failed to save CSV data for Plot 1: {e}")
@@ -396,6 +407,11 @@ def generate_sanity_checks(
         realized_tt=best_sanity_data['realized_tt'],
         fftt_chosen=best_sanity_data['fftt_chosen'],
         output_path=os.path.join(output_dir, 'sanity_01_tt_vs_fftt.png'),
+        original_idx=best_sanity_data.get('original_leg_idx'),
+        planned_dep=best_sanity_data.get('planned_dep'),
+        actual_dep=best_sanity_data.get('actual_dep'),
+        arrival=best_sanity_data.get('arrival'),
+        chosen_path_idx=best_sanity_data.get('chosen_path_idx'),
     )
 
     # ── Plot 2: V/C Ratio ──

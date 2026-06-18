@@ -249,46 +249,6 @@ def test_event_tracking():
     print("Test 6 Passed\n")
 
 
-def test_rl_mode():
-    print("Test 7: RL Mode")
-    edge_static = torch.tensor([
-        [10, 10, 10, 3600, 1],
-        [10, 10, 10, 3600, 1]
-    ], dtype=torch.float32)
-    
-    # RL mode: paths=None
-    departure_times = torch.tensor([0], dtype=torch.int32)
-    edge_endpoints = torch.tensor([[0, 1], [1, 2]], dtype=torch.int32)
-    first_edges = torch.tensor([[0]], dtype=torch.long)
-    destinations = torch.tensor([[2]], dtype=torch.long) # Dest node = 2
-    
-    dnl = TorchDNLMATSim(edge_static, paths=None, device='cpu', 
-                         departure_times=departure_times, 
-                         edge_endpoints=edge_endpoints,
-                         stuck_threshold=10,
-                         first_edges=first_edges, 
-                         destinations=destinations)
-    
-    # Agent should enter first_edge (0)
-    dnl.step()
-    assert dnl.status[0].item() == 2
-    assert dnl.current_edge[0].item() == 0
-    assert dnl.next_edge[0].item() == -1
-    
-    # Environment supplies the next edge (1)
-    dnl.next_edge[0] = 1
-    
-    # Agent moves to edge 1 spatial
-    dnl.step()
-    assert dnl.status[0].item() == 1
-    assert dnl.current_edge[0].item() == 1
-    
-    # Agent reaches edge 1 end. As node is 2 (the destination), agent should exit!
-    dnl.step()
-    assert dnl.status[0].item() == 3
-    
-    print("Test 7 Passed\n")
-
 if __name__ == "__main__":
     test_basic_movement()
     test_spillback()
@@ -296,4 +256,3 @@ if __name__ == "__main__":
     test_force_spillback_entry()
     test_disconnected_abort()
     test_event_tracking()
-    test_rl_mode()

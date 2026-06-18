@@ -159,6 +159,11 @@ def _compute_stats(env: AgentLevelWrapper, rewards: np.ndarray, infos: dict, wal
     n_masked = infos.get("n_masked_legs", 0)
     if n_masked > 0:
         stats['n_masked_legs'] = n_masked
+
+    # Report imputed legs count
+    n_imputed = infos.get("n_imputed_legs", 0)
+    if n_imputed > 0:
+        stats['n_imputed_legs'] = n_imputed
     
     # Pull empirical Nash metrics from infos (computed in AgentLevelWrapper.step)
     for k in ['mean_regret', 'max_regret', 'std_regret', 'epsilon_compliance_rate']:
@@ -578,6 +583,11 @@ def train(
                     'mean_tt': current_mean_tt,
                     'realized_tt': torch.from_numpy(raw_infos['_episode']['t']).cpu(),
                     'fftt_chosen': torch.from_numpy(raw_infos['fftt_chosen']).cpu(),
+                    'original_leg_idx': raw_infos.get('original_leg_idx'),
+                    'planned_dep': torch.from_numpy(raw_infos['_episode']['planned_dep']).cpu() if 'planned_dep' in raw_infos['_episode'] else None,
+                    'actual_dep': torch.from_numpy(raw_infos['_episode']['actual_dep']).cpu() if 'actual_dep' in raw_infos['_episode'] else None,
+                    'arrival': torch.from_numpy(raw_infos['_episode']['arrival']).cpu() if 'arrival' in raw_infos['_episode'] else None,
+                    'chosen_path_idx': torch.from_numpy(raw_infos['_episode']['act']).cpu() if 'act' in raw_infos['_episode'] else None,
                 }
                 # V/C data: clone interval counts from DNL
                 if hasattr(env.bandit.dnl, 'interval_tt_count') and env.bandit.collect_link_tt:

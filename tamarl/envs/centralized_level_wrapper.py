@@ -364,6 +364,9 @@ class CentralizedLevelWrapper:
         if n_masked > 0:
             info["n_masked_legs"] = n_masked
 
+        if hasattr(self.bandit.dnl, "n_imputed_legs"):
+            info["n_imputed_legs"] = int(self.bandit.dnl.n_imputed_legs)
+
         # ── Métriques Nash empiriques ─────────────────────────────────
         # Les métriques Nash sont calculées par paire OD réelle (num_od_pairs),
         # pas par bloc de paramètres (num_models = 1).

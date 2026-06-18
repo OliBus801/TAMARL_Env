@@ -352,6 +352,26 @@ class AgentLevelWrapper:
         travel_times = (-rewards).astype(np.float32)
         valid_travel_times = travel_times[valid_mask_np]
 
+        # ── Calculate Timestamps for Leg Metrics ─────────────────────
+        agents = self._leg_agent_idx
+        legs = self._leg_leg_idx
+        
+        planned_dep = torch.full_like(legs, -1, dtype=torch.int32)
+        # Leg 0 planned departure
+        mask_leg_0 = (legs == 0)
+        if mask_leg_0.any():
+            planned_dep[mask_leg_0] = self.bandit.dnl.departure_times[agents[mask_leg_0]]
+            
+        # Leg > 0 planned departure (uses preceding activity's end time)
+        mask_leg_gt_0 = (legs > 0)
+        if mask_leg_gt_0.any() and self.bandit.dnl.act_end_times.shape[1] > 0:
+            planned_dep[mask_leg_gt_0] = self.bandit.dnl.act_end_times[agents[mask_leg_gt_0], legs[mask_leg_gt_0] - 1]
+            
+        actual_dep = self.bandit.dnl.leg_departure_times[agents, legs]
+        # Arrival = Actual Departure + Leg Travel Time (which is leg_metrics[:, :, 1])
+        leg_tt_int = self.bandit.dnl.leg_metrics[agents, legs, 1].to(torch.int32)
+        arrival_time = actual_dep + leg_tt_int
+
         info = self._get_info(valid_travel_times if valid_travel_times.size > 0 else travel_times)
         if semi_bandit_costs is not None:
             info["semi_bandit_feedback"] = semi_bandit_costs.cpu().numpy()
@@ -359,13 +379,21 @@ class AgentLevelWrapper:
             "r": rewards[valid_mask_np],
             "l": np.ones(int(valid_mask_np.sum()), dtype=np.int32),
             "t": valid_travel_times,
+            "planned_dep": planned_dep[valid_mask_np].cpu().numpy(),
+            "actual_dep": actual_dep[valid_mask_np].cpu().numpy(),
+            "arrival": arrival_time[valid_mask_np].cpu().numpy(),
+            "act": act_np[valid_mask_np]
         }
         info["fftt_chosen"] = fftt_chosen[valid_mask_np]
         info["valid_leg_mask"] = valid_mask_np
+        info["original_leg_idx"] = np.where(valid_mask_np)[0]
 
         n_masked = int((~valid_leg_mask).sum().item())
         if n_masked > 0:
             info["n_masked_legs"] = n_masked
+
+        if hasattr(self.bandit.dnl, "n_imputed_legs"):
+            info["n_imputed_legs"] = int(self.bandit.dnl.n_imputed_legs)
 
         # ── Compute Path-Based Empirical Regret Metrics ──────────────
         if self.bandit.collect_link_tt:

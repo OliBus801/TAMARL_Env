@@ -112,43 +112,36 @@ class TorchDNLMATSim:
         # Move constants to device
         self.edge_static = edge_static.to(device)
         
-        # RL mode: paths is None AND paths_flat is None
-        self.rl_mode = (paths is None and paths_flat is None)
-        
-        if not self.rl_mode:
-            # Sparse CSR format (preferred): paths_flat + path_offsets
-            if paths_flat is not None:
-                self.paths_flat = paths_flat.to(device, dtype=torch.int32)
-                self.path_offsets = path_offsets.to(device, dtype=torch.long)
-                self.num_agents = self.path_offsets.shape[0] - 1
-            else:
-                # Legacy dense format: convert to CSR on the fly
-                paths_dev = paths.to(device, dtype=torch.int32)
-                self.num_agents = paths_dev.shape[0]
-                flat_list = []
-                offsets = [0]
-                for i in range(self.num_agents):
-                    row = paths_dev[i]
-                    # Find last valid (non -1) element, keeping -2 separators
-                    valid_mask = row != -1
-                    if valid_mask.any():
-                        last_valid = valid_mask.nonzero(as_tuple=True)[0][-1].item()
-                        flat_list.append(row[:last_valid + 1])
-                        offsets.append(offsets[-1] + last_valid + 1)
-                    else:
-                        offsets.append(offsets[-1])
-                if flat_list:
-                    self.paths_flat = torch.cat(flat_list).to(device, dtype=torch.int32)
-                else:
-                    self.paths_flat = torch.empty(0, device=device, dtype=torch.int32)
-                self.path_offsets = torch.tensor(offsets, device=device, dtype=torch.long)
-                del paths_dev
+        if paths is None and paths_flat is None:
+            raise ValueError("Either 'paths' or 'paths_flat' + 'path_offsets' must be provided.")
+            
+        # Sparse CSR format (preferred): paths_flat + path_offsets
+        if paths_flat is not None:
+            self.paths_flat = paths_flat.to(device, dtype=torch.int32)
+            self.path_offsets = path_offsets.to(device, dtype=torch.long)
+            self.num_agents = self.path_offsets.shape[0] - 1
         else:
-            self.paths_flat = None
-            self.path_offsets = None
-            if departure_times is None:
-                raise ValueError("departure_times is mandatory in RL mode (paths=None).")
-            self.num_agents = departure_times.shape[0]
+            # Legacy dense format: convert to CSR on the fly
+            paths_dev = paths.to(device, dtype=torch.int32)
+            self.num_agents = paths_dev.shape[0]
+            flat_list = []
+            offsets = [0]
+            for i in range(self.num_agents):
+                row = paths_dev[i]
+                # Find last valid (non -1) element, keeping -2 separators
+                valid_mask = row != -1
+                if valid_mask.any():
+                    last_valid = valid_mask.nonzero(as_tuple=True)[0][-1].item()
+                    flat_list.append(row[:last_valid + 1])
+                    offsets.append(offsets[-1] + last_valid + 1)
+                else:
+                    offsets.append(offsets[-1])
+            if flat_list:
+                self.paths_flat = torch.cat(flat_list).to(device, dtype=torch.int32)
+            else:
+                self.paths_flat = torch.empty(0, device=device, dtype=torch.int32)
+            self.path_offsets = torch.tensor(offsets, device=device, dtype=torch.long)
+            del paths_dev
             
         # Initialize event buffer now that self.num_agents is defined
         self._init_event_buffer()
@@ -237,26 +230,8 @@ class TorchDNLMATSim:
              
         self.start_time.copy_(self.departure_times)
         
-        if first_edges is not None:
-            self._all_first_edges = first_edges.to(device).long()
-            self._first_edges = self._all_first_edges[:, 0]
-
-        if destinations is not None:
-            self.destinations = destinations.to(device).long()
-        else:
-            self.destinations = None
-
         # Pre-set first edge as next_edge for waiting agents
-        if not self.rl_mode:
-            self.next_edge[:] = self.paths_flat[self.path_offsets[:-1]].long()
-        else:
-            # RL mode: first_edges must be provided
-            if first_edges is None:
-                raise ValueError("first_edges is mandatory in RL mode (paths=None).")
-            self.next_edge[:] = self._first_edges
-            
-            # Build outgoing-edges-per-node lookup for action masking
-            self._build_node_out_edges()
+        self.next_edge[:] = self.paths_flat[self.path_offsets[:-1]].long()
         
         # Leg Metrics [A, MaxLegs, 2] -> [accumulated_distance, final_travel_time]
         self.leg_metrics = torch.zeros((self.num_agents, self.max_legs_count, 2), device=self.device, dtype=torch.float32)
@@ -276,6 +251,7 @@ class TorchDNLMATSim:
 
         self.current_step = 0
         self.active_agents_count = self.num_agents
+        self.n_imputed_legs = 0
 
     def _init_event_buffer(self):
         """Initialize event buffer as a pre-allocated tensor (or None if not tracking)."""
@@ -292,33 +268,7 @@ class TorchDNLMATSim:
             self._event_count = 0
             self._cpu_events_blocks = []
 
-    def _build_node_out_edges(self):
-        """Build outgoing-edges-per-node lookup from edge_endpoints.
-        
-        Creates:
-            self.num_nodes: int
-            self.max_out_degree: int
-            self.node_out_edges: Tensor [N, max_out_degree] padded with -1
-            self.node_out_degree: Tensor [N] actual number of outgoing edges per node
-        """
-        from_nodes = self.edge_endpoints[:, 0].long()
-        to_nodes = self.edge_endpoints[:, 1].long()
-        self.num_nodes = max(from_nodes.max().item(), to_nodes.max().item()) + 1
-        
-        # Count outgoing edges per node
-        out_count = torch.zeros(self.num_nodes, device=self.device, dtype=torch.long)
-        out_count.scatter_add_(0, from_nodes.to(self.device), torch.ones(self.num_edges, device=self.device, dtype=torch.long))
-        self.max_out_degree = out_count.max().item()
-        self.node_out_degree = out_count
-        
-        # Build padded lookup: node_out_edges[node, local_idx] = edge_id
-        self.node_out_edges = torch.full((self.num_nodes, self.max_out_degree), -1, device=self.device, dtype=torch.long)
-        fill_idx = torch.zeros(self.num_nodes, device=self.device, dtype=torch.long)
-        for e in range(self.num_edges):
-            n = from_nodes[e].item()
-            idx = fill_idx[n].item()
-            self.node_out_edges[n, idx] = e
-            fill_idx[n] += 1
+
 
     def reset(self):
         self.edge_occupancy.fill_(0)
@@ -329,11 +279,7 @@ class TorchDNLMATSim:
         self.status.fill_(0)
         self.current_edge.fill_(-1)
         self.current_leg.fill_(0)
-        if not self.rl_mode:
-            self.next_edge[:] = self.paths_flat[self.path_offsets[:-1]].long()
-        else:
-            self._first_edges = self._all_first_edges[:, 0]
-            self.next_edge[:] = self._first_edges
+        self.next_edge[:] = self.paths_flat[self.path_offsets[:-1]].long()
             
         self.path_ptr.fill_(0)
         self.arrival_time.fill_(0)
@@ -347,6 +293,7 @@ class TorchDNLMATSim:
         self.current_step = 0
         self.active_agents_count = self.num_agents
         self.stuck_count = 0
+        self.n_imputed_legs = 0
         if self.seed is not None:
             self.rng.manual_seed(self.seed)
         self._init_event_buffer()
@@ -596,20 +543,13 @@ class TorchDNLMATSim:
         next_ptrs_sorted = ptrs_sorted + 1
 
         # Determine exiter vs mover
-        if not self.rl_mode:
-            # Path-based: exiter if next path step is beyond agent's path length or is a sentinel
-            agent_path_lens = self.path_offsets[arrived_sorted + 1] - self.path_offsets[arrived_sorted]
-            is_exiter = (next_ptrs_sorted >= agent_path_lens)
-            valid = ~is_exiter
-            abs_ptrs = self.path_offsets[arrived_sorted[valid]] + next_ptrs_sorted[valid]
-            path_next = self.paths_flat[abs_ptrs].long()
-            is_exiter[valid] = (path_next == -1) | (path_next == -2)
-        else:
-            # RL mode: exiter if current edge's to_node == agent's destination
-            curr_to_nodes = self.edge_endpoints[edges_sorted, 1].long()
-            c_legs = self.current_leg[arrived_sorted]
-            agent_dests = self.destinations[arrived_sorted, c_legs]
-            is_exiter = (curr_to_nodes == agent_dests)
+        # Path-based: exiter if next path step is beyond agent's path length or is a sentinel
+        agent_path_lens = self.path_offsets[arrived_sorted + 1] - self.path_offsets[arrived_sorted]
+        is_exiter = (next_ptrs_sorted >= agent_path_lens)
+        valid = ~is_exiter
+        abs_ptrs = self.path_offsets[arrived_sorted[valid]] + next_ptrs_sorted[valid]
+        path_next = self.paths_flat[abs_ptrs].long()
+        is_exiter[valid] = (path_next == -1) | (path_next == -2)
         is_mover = ~is_exiter
 
         # --- Per-link grouping ---
@@ -696,16 +636,14 @@ class TorchDNLMATSim:
         self.buffer_counts.scatter_add_(0, w_edges, ones)
 
         # Compute next_edge
-        self.next_edge[winners] = -1  # Default: needs decision (RL) or end-of-path
-        if not self.rl_mode:
-            w_next_ptrs = next_ptrs_sorted[proc_win_mask]
-            w_agent_path_lens = self.path_offsets[winners + 1] - self.path_offsets[winners]
-            valid_ptr = w_next_ptrs < w_agent_path_lens
-            valid_winners = winners[valid_ptr]
-            valid_w_next_ptrs = w_next_ptrs[valid_ptr]
-            abs_ptrs = self.path_offsets[valid_winners] + valid_w_next_ptrs
-            self.next_edge[valid_winners] = self.paths_flat[abs_ptrs].long()
-        # In RL mode, next_edge stays -1 → environment will set it before next step()
+        self.next_edge[winners] = -1  # Default: end-of-path
+        w_next_ptrs = next_ptrs_sorted[proc_win_mask]
+        w_agent_path_lens = self.path_offsets[winners + 1] - self.path_offsets[winners]
+        valid_ptr = w_next_ptrs < w_agent_path_lens
+        valid_winners = winners[valid_ptr]
+        valid_w_next_ptrs = w_next_ptrs[valid_ptr]
+        abs_ptrs = self.path_offsets[valid_winners] + valid_w_next_ptrs
+        self.next_edge[valid_winners] = self.paths_flat[abs_ptrs].long()
 
     # =========================================================================
     # C. Schedule Demand (New agents enter the network)
@@ -787,16 +725,13 @@ class TorchDNLMATSim:
                 new_legs = self.current_leg[cont_agents]
                 
                 # Setup next_edge for the upcoming leg
-                if not self.rl_mode:
-                    # In paths tensor, leg boundaries are separated by single -2
-                    # We just need to advance path_ptr by 2 (current is -2, next is start)
-                    self.path_ptr[cont_agents] += 2
-                    next_ptrs = self.path_ptr[cont_agents]
-                    # safe because next_ptrs < agent path len by definition of having more legs
-                    abs_ptrs = self.path_offsets[cont_agents] + next_ptrs
-                    self.next_edge[cont_agents] = self.paths_flat[abs_ptrs].long()
-                else:
-                    self.next_edge[cont_agents] = self._all_first_edges[cont_agents, new_legs]
+                # In paths tensor, leg boundaries are separated by single -2
+                # We just need to advance path_ptr by 2 (current is -2, next is start)
+                self.path_ptr[cont_agents] += 2
+                next_ptrs = self.path_ptr[cont_agents]
+                # safe because next_ptrs < agent path len by definition of having more legs
+                abs_ptrs = self.path_offsets[cont_agents] + next_ptrs
+                self.next_edge[cont_agents] = self.paths_flat[abs_ptrs].long()
 
         # --- Phase 2: Process Waiting Agents (status=0) ---
         demand_mask = (self.status == 0) & (self.wakeup_time <= self.current_step)
@@ -866,16 +801,14 @@ class TorchDNLMATSim:
         self.buffer_counts.scatter_add_(0, w_edges, ones)
 
         # Compute next_edge
-        self.next_edge[winners] = -1  # Default: needs decision (RL) or end-of-path
-        if not self.rl_mode:
-            next_ptrs = self.path_ptr[winners] + 1
-            w_agent_path_lens = self.path_offsets[winners + 1] - self.path_offsets[winners]
-            valid_ptr_mask = next_ptrs < w_agent_path_lens
-            v_agents = winners[valid_ptr_mask]
-            v_next_ptrs = next_ptrs[valid_ptr_mask]
-            abs_ptrs = self.path_offsets[v_agents] + v_next_ptrs
-            self.next_edge[v_agents] = self.paths_flat[abs_ptrs].long()
-        # In RL mode, next_edge stays -1 → environment will set it before next step()
+        self.next_edge[winners] = -1  # Default: end-of-path
+        next_ptrs = self.path_ptr[winners] + 1
+        w_agent_path_lens = self.path_offsets[winners + 1] - self.path_offsets[winners]
+        valid_ptr_mask = next_ptrs < w_agent_path_lens
+        v_agents = winners[valid_ptr_mask]
+        v_next_ptrs = next_ptrs[valid_ptr_mask]
+        abs_ptrs = self.path_offsets[v_agents] + v_next_ptrs
+        self.next_edge[v_agents] = self.paths_flat[abs_ptrs].long()
 
     # =========================================================================
     # Finalize agents that are still in-network when simulation ends
@@ -885,34 +818,76 @@ class TorchDNLMATSim:
 
         Called after the simulation loop completes. For each agent:
         - If the agent has started a leg but not finished (status 0/1/2/4),
-          record travel_time = current_step - departure_time for their current leg.
-        - Legs that never started (leg_departure_times == -1) are left with
-          leg_metrics[:, :, 1] == 0. The caller uses leg_departure_times == -1
-          as the canonical "unstarted leg" mask.
+          impute travel_time = (current_step - departure_time) + FFTT of remaining edges.
+        - If the agent is in status 0 (waiting) and hasn't started the leg,
+          impute travel_time = FFTT of the entire leg, and set departure time to current_step.
         """
-        # Agents that are still active (not done, not never-started)
-        not_done = (self.status != 3)
-        # Among those, only finalize legs that actually departed
-        active_agents = torch.nonzero(not_done, as_tuple=True)[0]
-
-        if active_agents.numel() == 0:
+        if self.paths_flat is None:
+            # Fallback to original logic if paths_flat is not available
+            # (e.g. RL mode or empty paths)
+            not_done = (self.status != 3)
+            active_agents = torch.nonzero(not_done, as_tuple=True)[0]
+            if active_agents.numel() > 0:
+                c_legs = self.current_leg[active_agents]
+                dep_times = self.leg_departure_times[active_agents, c_legs]
+                started_mask = dep_times >= 0
+                if started_mask.any():
+                    started_agents = active_agents[started_mask]
+                    started_c_legs = c_legs[started_mask]
+                    started_dep = dep_times[started_mask]
+                    self.leg_metrics[started_agents, started_c_legs, 1] = (
+                        self.current_step - started_dep
+                    ).float()
+                    self.n_imputed_legs = int(started_mask.sum().item())
             return
 
-        c_legs = self.current_leg[active_agents]
-        dep_times = self.leg_departure_times[active_agents, c_legs]
-
-        # Only finalize agents whose current leg actually started (dep_time >= 0)
-        started_mask = dep_times >= 0
-        if not started_mask.any():
-            return
-
-        started_agents = active_agents[started_mask]
-        started_c_legs = c_legs[started_mask]
-        started_dep = dep_times[started_mask]
-
-        self.leg_metrics[started_agents, started_c_legs, 1] = (
-            self.current_step - started_dep
-        ).float()
+        import numpy as np
+        status_cpu = self.status.cpu().numpy()
+        current_leg_cpu = self.current_leg.cpu().numpy()
+        leg_dep_cpu = self.leg_departure_times.cpu().numpy()
+        path_ptr_cpu = self.path_ptr.cpu().numpy()
+        path_offsets_cpu = self.path_offsets.cpu().numpy()
+        paths_flat_cpu = self.paths_flat.cpu().numpy()
+        ff_travel_time_steps_cpu = self.ff_travel_time_steps.cpu().numpy()
+        
+        leg_metrics_cpu = self.leg_metrics.cpu().numpy()
+        
+        n_imputed = 0
+        active_indices = np.nonzero(status_cpu != 3)[0]
+        
+        for i in active_indices:
+            l = current_leg_cpu[i]
+            dep_time = leg_dep_cpu[i, l]
+            
+            if dep_time >= 0:
+                start_ptr = path_ptr_cpu[i] + 1
+                elapsed = self.current_step - dep_time
+            else:
+                start_ptr = path_ptr_cpu[i]
+                elapsed = 0
+                
+            start_idx = path_offsets_cpu[i] + start_ptr
+            end_idx = path_offsets_cpu[i + 1]
+            
+            remaining_fftt = 0.0
+            for idx in range(start_idx, end_idx):
+                edge = paths_flat_cpu[idx]
+                if edge == -2:
+                    break
+                if edge >= 0:
+                    remaining_fftt += ff_travel_time_steps_cpu[edge]
+                    
+            imputed_tt = float(elapsed) + remaining_fftt
+            leg_metrics_cpu[i, l, 1] = imputed_tt
+            
+            if dep_time < 0:
+                leg_dep_cpu[i, l] = self.current_step
+                
+            n_imputed += 1
+            
+        self.leg_metrics.copy_(torch.from_numpy(leg_metrics_cpu).to(self.device))
+        self.leg_departure_times.copy_(torch.from_numpy(leg_dep_cpu).to(self.device))
+        self.n_imputed_legs = n_imputed
 
     # =========================================================================
     # Step
@@ -1028,7 +1003,8 @@ class TorchDNLMATSim:
             "arrived_count": arrived_count,
             "en_route_count": en_route_count,
             "avg_travel_time": avg_time,
-            "avg_travel_dist": avg_dist
+            "avg_travel_dist": avg_dist,
+            "n_imputed_legs": getattr(self, "n_imputed_legs", 0)
         }
 
     def get_leg_histogram(self):

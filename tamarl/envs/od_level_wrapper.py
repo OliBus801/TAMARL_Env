@@ -341,6 +341,9 @@ class ODLevelWrapper:
         if n_masked > 0:
             info["n_masked_legs"] = n_masked
 
+        if hasattr(self.bandit.dnl, "n_imputed_legs"):
+            info["n_imputed_legs"] = int(self.bandit.dnl.n_imputed_legs)
+
         # ── Compute Path-Based Empirical Regret Metrics ──────────────
         if self.bandit.collect_link_tt:
             estimated_times, _ = self.evaluator.evaluate(
