@@ -34,6 +34,9 @@
         "eta": 0.01,
         "gamma": 0.05
     },
+    "replicator_dynamics": {
+        "beta": 0.1
+    },
     "logging": {
         "log_interval": 100,
         "wandb_enabled": false,

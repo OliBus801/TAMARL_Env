@@ -232,6 +232,8 @@ def train(
     # Exp3
     exp3_eta: float = 0.01,
     exp3_gamma: float = 0.05,
+    # Replicator Dynamics
+    rd_beta: float = 0.1,
     # Reload paths
     reload_paths: bool = False,
     # Profiling
@@ -280,6 +282,7 @@ def train(
         'ts_env_std': ts_env_std,
         'exp3_eta': exp3_eta,
         'exp3_gamma': exp3_gamma,
+        'rd_beta': rd_beta,
         'reload_paths': reload_paths,
         'wandb_agent': wandb_agent,
     }
@@ -449,6 +452,20 @@ def train(
             eta=exp3_eta,
             gamma=exp3_gamma,
             rho=rho,
+            device=device,
+            seed=seed
+        )
+
+    elif agent_type == "rd":
+        from tamarl.rl.agents.replicator_dynamics_agent import ReplicatorDynamicsAgent
+        agent = ReplicatorDynamicsAgent(
+            num_agents=num_agent_models,
+            k_paths=top_k_paths,
+            beta=rd_beta,
+            prior_mean=prior_means,
+            epsilon_start=epsilon_start,
+            epsilon_end=epsilon_end,
+            epsilon_decay=epsilon_decay,
             device=device,
             seed=seed
         )
@@ -644,6 +661,8 @@ def train(
             
             if hasattr(agent, "epsilon"):
                 wandb_metrics['agent/epsilon'] = agent.epsilon
+            if hasattr(agent, "entropy"):
+                wandb_metrics['agent/entropy'] = agent.entropy
 
             for k, v in agg.items():
                 if k not in ['tstt_mean', 'mean_travel_time_mean',
@@ -783,6 +802,7 @@ def load_config(config_path: str) -> dict:
         "ts_env_std": "ts_env_std",
         "exp3_eta": "exp3_eta",
         "exp3_gamma": "exp3_gamma",
+        "rd_beta": "rd_beta",
         "reload_paths": "reload_paths",
     }
     for json_key, kwarg_key in _map.items():
@@ -820,6 +840,11 @@ def load_config(config_path: str) -> dict:
         kwargs["exp3_eta"] = exp3["eta"]
     if "gamma" in exp3:
         kwargs["exp3_gamma"] = exp3["gamma"]
+
+    # ── Replicator Dynamics ──
+    rd = cfg.get("replicator_dynamics", {})
+    if "beta" in rd:
+        kwargs["rd_beta"] = rd["beta"]
 
     # ── Logging ──
     log = cfg.get("logging", {})
@@ -897,8 +922,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # Agent
     parser.add_argument("--agent", default=None,
-                        choices=["random", "epsilon_greedy", "ucb", "aon", "frank_wolfe", "ts", "exp3", "msa", "evo_swap"],
-                        help="Agent type: 'random', 'epsilon_greedy', 'ucb', 'aon', 'frank_wolfe', 'ts', 'exp3', 'msa', or 'evo_swap'")
+                        choices=["random", "epsilon_greedy", "ucb", "aon", "frank_wolfe", "ts", "exp3", "msa", "evo_swap", "rd"],
+                        help="Agent type: 'random', 'epsilon_greedy', 'ucb', 'aon', 'frank_wolfe', 'ts', 'exp3', 'msa', 'evo_swap', or 'rd'")
 
     # Training
     parser.add_argument("--episodes", type=int, default=None, help="Number of episodes")
@@ -949,6 +974,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ts_env_std", type=float, default=None, help="Assumed environment noise for TS (overrides dynamic std if set)")
     parser.add_argument("--exp3_eta", type=float, default=None, help="Learning rate for Exp3 agent")
     parser.add_argument("--exp3_gamma", type=float, default=None, help="Exploration parameter for Exp3 agent")
+    parser.add_argument("--rd_beta", type=float, default=None, help="Temperature parameter for RD agent")
 
     # Metrics Config
     parser.add_argument("--epsilon_ratio", type=float, default=None, help="Threshold ratio for Epsilon-compliance (e.g., 0.10 for 10%%)")
@@ -982,6 +1008,7 @@ _CLI_TO_KWARGS = {
     "ts_env_std": "ts_env_std",
     "exp3_eta": "exp3_eta",
     "exp3_gamma": "exp3_gamma",
+    "rd_beta": "rd_beta",
     "wandb": "wandb_enabled",
     "wandb_project": "wandb_project",
     "wandb_tags": "wandb_tags",
