@@ -9,6 +9,9 @@ wandb/
 # Agent
 .agent/
 
+# Logs
+.logs/
+
 # Scripts
 *.sh
 
