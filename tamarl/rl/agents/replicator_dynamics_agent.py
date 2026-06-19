@@ -67,6 +67,10 @@ class ReplicatorDynamicsAgent:
             # Initialize with Softmax over beta * prior_mean (prior_mean is negative FFTT)
             prior_mean = prior_mean.to(device).float()
             self.rd_probs = torch.softmax(self.beta * prior_mean, dim=1)
+            # Fallback to uniform if all values are -inf (yielding nan)
+            nan_rows = torch.isnan(self.rd_probs).any(dim=1)
+            if nan_rows.any():
+                self.rd_probs[nan_rows] = 1.0 / k_paths
         else:
             self.rd_probs = torch.ones((self.num_models, k_paths), device=device, dtype=torch.float32) / k_paths
 
@@ -106,14 +110,28 @@ class ReplicatorDynamicsAgent:
         row_sums = p_rd.sum(dim=1, keepdim=True)
         zero_rows = (row_sums == 0).squeeze(1)
         if zero_rows.any():
-            p_rd[zero_rows] = masks[zero_rows].float()
+            # If the mask is all zeros, we fallback to uniform over all actions (all ones)
+            # otherwise we fallback to uniform over the valid paths (masks)
+            mask_sums = masks[zero_rows].sum(dim=1, keepdim=True)
+            fallback_probs = masks[zero_rows].float()
+            all_zero_masks = (mask_sums == 0).squeeze(1)
+            if all_zero_masks.any():
+                fallback_probs[all_zero_masks] = 1.0
+            
+            p_rd[zero_rows] = fallback_probs
             row_sums = p_rd.sum(dim=1, keepdim=True)
             
         p_rd = p_rd / row_sums.clamp(min=1e-10)
 
         # 3. Add exploration noise
         p_uniform = masks.float()
-        p_uniform = p_uniform / p_uniform.sum(dim=1, keepdim=True).clamp(min=1e-10)
+        p_uniform_sums = p_uniform.sum(dim=1, keepdim=True)
+        zero_uniform_rows = (p_uniform_sums == 0).squeeze(1)
+        if zero_uniform_rows.any():
+            p_uniform[zero_uniform_rows] = 1.0
+            p_uniform_sums = p_uniform.sum(dim=1, keepdim=True)
+
+        p_uniform = p_uniform / p_uniform_sums.clamp(min=1e-10)
 
         p_final = (1.0 - self.epsilon) * p_rd + self.epsilon * p_uniform
 
@@ -198,6 +216,12 @@ class ReplicatorDynamicsAgent:
         
         # Normalize to prevent drift
         new_probs = new_probs / new_probs.sum(dim=1, keepdim=True).clamp(min=1e-10)
+        
+        # Guard against NaNs
+        nan_mask = torch.isnan(new_probs).any(dim=1)
+        if nan_mask.any():
+            new_probs[nan_mask] = 1.0 / self.k_paths
+            
         self.rd_probs = new_probs
 
     def decay_epsilon(self) -> None:

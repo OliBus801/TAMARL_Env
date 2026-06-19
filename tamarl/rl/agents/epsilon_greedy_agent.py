@@ -121,7 +121,12 @@ class EpsilonGreedyAgent:
 
         # 3. Exploration: uniform sampling among valid paths
         valid_probs = masks.float()
-        valid_probs = valid_probs / valid_probs.sum(dim=1, keepdim=True).clamp(min=1e-6)
+        valid_sums = valid_probs.sum(dim=1, keepdim=True)
+        zero_uniform_rows = (valid_sums == 0).squeeze(1)
+        if zero_uniform_rows.any():
+            valid_probs[zero_uniform_rows] = 1.0
+            valid_sums = valid_probs.sum(dim=1, keepdim=True)
+        valid_probs = valid_probs / valid_sums.clamp(min=1e-6)
         random_actions = torch.multinomial(valid_probs, 1).squeeze(1)  # [N]
 
         # 4. Epsilon-greedy decision

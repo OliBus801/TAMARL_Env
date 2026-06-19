@@ -140,7 +140,14 @@ class MSAAgent:
         # Fallback uniforme sur les routes valides si toutes les probs d'une ligne sont nulles (ex: underflow)
         zero_rows = (row_sums == 0).squeeze(1)
         if zero_rows.any():
-            p[zero_rows] = masks[zero_rows].float()
+            # If the mask is all zeros, fallback to uniform over all actions (all ones)
+            # otherwise fallback to valid paths (masks)
+            mask_sums = masks[zero_rows].sum(dim=1, keepdim=True)
+            fallback_probs = masks[zero_rows].float()
+            all_zero_masks = (mask_sums == 0).squeeze(1)
+            if all_zero_masks.any():
+                fallback_probs[all_zero_masks] = 1.0
+            p[zero_rows] = fallback_probs
             row_sums = p.sum(dim=1, keepdim=True)
 
         row_sums = row_sums.clamp(min=1e-10)

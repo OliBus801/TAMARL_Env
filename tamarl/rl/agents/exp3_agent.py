@@ -118,11 +118,19 @@ class Exp3Agent:
 
         # 2. Distribution Hedge (normalisation par la somme des poids)
         sum_w = w.sum(dim=1, keepdim=True)
+        zero_w_rows = (sum_w == 0).squeeze(1)
         p_hedge = w / (sum_w + 1e-10)  # [N, K]
+        if zero_w_rows.any():
+            p_hedge[zero_w_rows] = 1.0 / self.k_paths
 
         # 3. Mélange avec distribution uniforme sur les chemins valides
         k_valid = masks.float().sum(dim=1, keepdim=True)
-        p_uniform = masks.float() / (k_valid + 1e-8)  # [N, K]
+        zero_mask_rows = (k_valid == 0).squeeze(1)
+        p_uniform = masks.float()
+        if zero_mask_rows.any():
+            p_uniform[zero_mask_rows] = 1.0
+            k_valid = p_uniform.sum(dim=1, keepdim=True)
+        p_uniform = p_uniform / (k_valid + 1e-8)  # [N, K]
 
         probs = (1.0 - self.gamma) * p_hedge + self.gamma * p_uniform  # [N, K]
 

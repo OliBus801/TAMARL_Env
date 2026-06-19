@@ -158,6 +158,13 @@ class CentralizedLevelWrapper:
         self.fftt_matrix        = fftt_np
         self.num_unique_od      = num_unique_od
 
+        # Check for agents/legs with no possible paths
+        od_has_no_paths = ~masks_np.any(axis=1)
+        inverse_od_np = self.od_indices_all_legs.cpu().numpy()
+        no_path_legs = int(np.sum(od_has_no_paths[inverse_od_np]))
+        if no_path_legs > 0:
+            print(f"⚠️ WARNING: {no_path_legs} agents/legs have no possible routes in the network.")
+
         # ── Gymnasium VectorEnv setup ─────────────────────────────────
         self.single_observation_space = spaces.Box(
             low=0, high=np.inf, shape=(top_k,), dtype=np.float32

@@ -50,8 +50,12 @@ class RandomAgent:
         """
         # Distribution uniforme sur les routes valides
         valid_probs = masks.float()
-        row_sums = valid_probs.sum(dim=1, keepdim=True).clamp(min=1e-6)
-        valid_probs = valid_probs / row_sums
+        row_sums = valid_probs.sum(dim=1, keepdim=True)
+        zero_rows = (row_sums == 0).squeeze(1)
+        if zero_rows.any():
+            valid_probs[zero_rows] = 1.0
+            row_sums = valid_probs.sum(dim=1, keepdim=True)
+        valid_probs = valid_probs / row_sums.clamp(min=1e-6)
         return torch.multinomial(valid_probs, 1).squeeze(1)
 
     def act(self) -> torch.Tensor:
