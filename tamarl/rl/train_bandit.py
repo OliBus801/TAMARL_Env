@@ -543,7 +543,16 @@ def train(
     # ── Sanity Check tracking ──
     best_mean_tt = float('inf')
     best_sanity_data = None          # Will hold CPU tensors for the best episode
-    best_sanity_data = None          # Will hold CPU tensors for the best episode
+    
+    route_allocation_history = []
+    major_od_idx = None
+    major_od_count = 0
+    if sanity_checks and hasattr(env, "od_indices_all_legs"):
+        od_indices = env.od_indices_all_legs
+        od_counts = torch.bincount(od_indices)
+        major_od_idx = int(torch.argmax(od_counts).item())
+        major_od_count = int(od_counts[major_od_idx].item())
+        print(f"  Sanity Checks: Identified major OD pair {major_od_idx} with {major_od_count} agents.")
 
     pbar = tqdm(range(n_episodes), desc="Training", unit="ep", dynamic_ncols=True)
 
@@ -613,7 +622,29 @@ def train(
                     best_sanity_data['link_tt_interval'] = env.bandit.dnl.link_tt_interval
                     best_sanity_data['dt'] = env.bandit.dnl.dt
 
-                # (Histogram logic was here but is now removed for memory efficiency and visualization change)
+                # Save extra data for new sanity check plots
+                best_sanity_data['od_indices'] = env.od_indices_all_legs.cpu() if hasattr(env, "od_indices_all_legs") else None
+                best_sanity_data['major_od_idx'] = major_od_idx
+                best_sanity_data['major_od_count'] = major_od_count
+                best_sanity_data['routes_flat_csr'] = env.routes_flat_csr.cpu() if hasattr(env, "routes_flat_csr") else None
+                best_sanity_data['K'] = top_k_paths
+
+            # Track route allocation for the major OD pair for all episodes
+            if major_od_idx is not None and 'act' in raw_infos.get('_episode', {}):
+                act_np = raw_infos['_episode']['act']
+                valid_mask = raw_infos.get('valid_leg_mask', np.ones(len(act_np), dtype=bool))
+                # Reconstruct full array to match od_indices length, or use original_leg_idx
+                if 'original_leg_idx' in raw_infos:
+                    original_leg_idx = raw_infos['original_leg_idx']
+                    # Get ODs for the valid legs
+                    valid_ods = env.od_indices_all_legs.cpu().numpy()[original_leg_idx]
+                    major_od_mask = (valid_ods == major_od_idx)
+                    major_acts = act_np[major_od_mask]
+                    if len(major_acts) > 0:
+                        counts = np.bincount(major_acts, minlength=top_k_paths)
+                        route_allocation_history.append(counts / len(major_acts))
+                    else:
+                        route_allocation_history.append(np.zeros(top_k_paths))
                 pass
 
         all_stats.append(stats)
@@ -758,6 +789,7 @@ def train(
                 (s.get('mean_regret'), s.get('max_regret'), s.get('std_regret'), s.get('epsilon_compliance_rate'))
                 for s in all_stats
             ],
+            route_allocation_history=route_allocation_history,
             output_dir=output_dir,
             scenario_id=scenario_id,
             agent_type=agent_type,

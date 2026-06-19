@@ -379,6 +379,334 @@ def plot_nash_convergence(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  Block 1: Route Choice Distribution
+# ══════════════════════════════════════════════════════════════════════════════
+
+def plot_route_allocation_heatmap(
+    route_allocation_history: List[np.ndarray],
+    major_od_idx: int,
+    major_od_count: int,
+    output_path: str,
+):
+    """Plot heatmap of route allocation over episodes for the major OD pair.
+    
+    Args:
+        route_allocation_history: List of arrays (one per episode) containing the 
+                                  fraction of agents choosing each of the K routes.
+        major_od_idx: The integer ID of the major OD pair.
+        major_od_count: The number of agents for this OD pair.
+        output_path: Where to save the plot.
+    """
+    if not route_allocation_history:
+        print("  ⚠ No route allocation history available for heatmap.")
+        return
+
+    data = np.stack(route_allocation_history).T  # [K, num_episodes]
+    num_routes, num_episodes = data.shape
+
+    # Save CSV
+    csv_path = output_path.replace('.png', '.csv')
+    try:
+        with open(csv_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            header = ['episode'] + [f'route_{k}_fraction' for k in range(num_routes)]
+            writer.writerow(header)
+            for ep in range(num_episodes):
+                writer.writerow([ep] + data[:, ep].tolist())
+        print(f"  📄 Saved Route Allocation Heatmap data to {csv_path}")
+    except Exception as e:
+        print(f"  ⚠ Failed to save CSV data for Heatmap: {e}")
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    _apply_dark_theme(ax, fig)
+
+    cmap = plt.cm.get_cmap('magma').copy()
+    cmap.set_bad(_DARK_BG)
+    im = ax.imshow(data, aspect='auto', cmap=cmap, origin='lower',
+                   extent=[0, num_episodes, -0.5, num_routes - 0.5], vmin=0, vmax=1)
+
+    cb = fig.colorbar(im, ax=ax, pad=0.02)
+    cb.set_label('Agent Fraction (Modal Share)', color=_TEXT_COLOR, fontsize=10)
+    cb.ax.tick_params(colors=_TEXT_COLOR, labelsize=8)
+
+    ax.set_xlabel('Training Episodes', fontsize=11)
+    ax.set_ylabel('Candidate Routes (k)', fontsize=11)
+    ax.set_yticks(range(num_routes))
+    ax.set_yticklabels([f'Route {k}' for k in range(num_routes)])
+    ax.set_title(f'Route Allocation Heatmap (OD {major_od_idx}, {major_od_count} agents)', fontsize=12, fontweight='bold')
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200, facecolor=fig.get_facecolor(), bbox_inches='tight')
+    plt.close(fig)
+    print(f"  📊 Route Allocation Heatmap saved to {output_path}")
+
+
+def plot_entropy_scatter(
+    chosen_paths: np.ndarray,
+    od_indices: np.ndarray,
+    original_leg_idx: np.ndarray,
+    K: int,
+    mean_tt: float,
+    output_path: str,
+):
+    """Calculate and save entropy vs mean travel time for convergence."""
+    # Filter to actual valid departed legs
+    valid_ods = od_indices[original_leg_idx]
+    
+    unique_ods = np.unique(valid_ods)
+    entropies = []
+    
+    for od in unique_ods:
+        od_mask = (valid_ods == od)
+        acts = chosen_paths[od_mask]
+        if len(acts) > 0:
+            counts = np.bincount(acts, minlength=K)
+            p = counts / len(acts)
+            p_nz = p[p > 0]
+            H = -np.sum(p_nz * np.log(p_nz))
+            entropies.append(H)
+            
+    avg_entropy = np.mean(entropies) if entropies else 0.0
+
+    csv_path = output_path.replace('.png', '.csv')
+    try:
+        with open(csv_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['mean_entropy', 'mean_tt_seconds'])
+            writer.writerow([avg_entropy, mean_tt])
+        print(f"  📄 Saved Entropy data to {csv_path}")
+    except Exception as e:
+        print(f"  ⚠ Failed to save CSV data for Entropy: {e}")
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    _apply_dark_theme(ax, fig)
+    
+    # Just plotting one point for the current algorithm
+    ax.scatter([avg_entropy], [mean_tt], color=_ACCENT_CYAN, s=150, zorder=5, edgecolor=_TEXT_COLOR, label='Current Run')
+    
+    ax.set_xlim(0, max(np.log(K), avg_entropy) * 1.1)
+    ax.set_ylim(max(0, mean_tt * 0.8), mean_tt * 1.2)
+    ax.set_xlabel('Average Entropy (H)', fontsize=11)
+    ax.set_ylabel('Mean Travel Time (s)', fontsize=11)
+    ax.set_title('Choice Entropy vs Mean Travel Time', fontsize=12, fontweight='bold')
+    ax.legend(loc='best', fontsize=9, framealpha=0.8, facecolor=_DARK_CARD, edgecolor=_GRID_COLOR, labelcolor=_TEXT_COLOR)
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200, facecolor=fig.get_facecolor(), bbox_inches='tight')
+    plt.close(fig)
+    print(f"  📊 Entropy Scatter Plot saved to {output_path}")
+
+
+def plot_lorenz_concentration(
+    chosen_paths: np.ndarray,
+    od_indices: np.ndarray,
+    original_leg_idx: np.ndarray,
+    major_od_idx: int,
+    major_od_count: int,
+    K: int,
+    output_path: str,
+):
+    """Plot the Lorenz curve of flows for the major OD pair."""
+    valid_ods = od_indices[original_leg_idx]
+    major_od_mask = (valid_ods == major_od_idx)
+    major_acts = chosen_paths[major_od_mask]
+    
+    if len(major_acts) == 0:
+        print("  ⚠ No actions for major OD to plot Lorenz concentration.")
+        return
+        
+    counts = np.bincount(major_acts, minlength=K)
+    # Sort routes implicitly by FFTT (since K routes are usually returned sorted by FFTT)
+    # So we just take counts as they are: route 0 is shortest, route K-1 is longest.
+    p = counts / len(major_acts)
+    cumulative_p = np.cumsum(p) * 100
+
+    csv_path = output_path.replace('.png', '.csv')
+    try:
+        with open(csv_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['route_idx', 'fraction', 'cumulative_pct'])
+            for k in range(K):
+                writer.writerow([k, p[k], cumulative_p[k]])
+        print(f"  📄 Saved Lorenz data to {csv_path}")
+    except Exception as e:
+        print(f"  ⚠ Failed to save CSV data for Lorenz: {e}")
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    _apply_dark_theme(ax, fig)
+    
+    x_routes = np.arange(K)
+    ax.plot(x_routes, cumulative_p, marker='o', color=_ACCENT_GREEN, linewidth=2, label='Current Run')
+    
+    # Random Uniform Line
+    ax.plot(x_routes, np.cumsum(np.ones(K)/K) * 100, linestyle='--', color=_TEXT_COLOR, alpha=0.5, label='Uniform (Random)')
+
+    ax.set_xlabel('Routes (Sorted by FFTT)', fontsize=11)
+    ax.set_ylabel('Cumulative % of Population', fontsize=11)
+    ax.set_xticks(x_routes)
+    ax.set_xticklabels([f'R{k}' for k in range(K)])
+    ax.set_ylim(0, 105)
+    ax.set_title(f'Route Concentration Profile (OD {major_od_idx}, {major_od_count} agents)', fontsize=12, fontweight='bold')
+    ax.legend(loc='lower right', fontsize=9, framealpha=0.8, facecolor=_DARK_CARD, edgecolor=_GRID_COLOR, labelcolor=_TEXT_COLOR)
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200, facecolor=fig.get_facecolor(), bbox_inches='tight')
+    plt.close(fig)
+    print(f"  📊 Lorenz Concentration Plot saved to {output_path}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Block 2: Agent Distribution on Network Links
+# ══════════════════════════════════════════════════════════════════════════════
+
+def plot_spatiotemporal_violins(
+    link_counts: torch.Tensor,
+    flow_capacity_per_step: torch.Tensor,
+    link_tt_interval: float,
+    dt: float,
+    output_path: str,
+):
+    """Plot hourly violins of V/C ratios, dropping 0 volume links."""
+    counts = link_counts.float().numpy()
+    num_intervals, num_edges = counts.shape
+
+    steps_per_interval = link_tt_interval / dt
+    capacity_per_interval = flow_capacity_per_step.float().numpy() * steps_per_interval
+    safe_cap = np.maximum(capacity_per_interval, 1e-6)
+
+    # Convert to hourly
+    intervals_per_hour = int(3600 / link_tt_interval)
+    num_hours = int(np.ceil(num_intervals / intervals_per_hour))
+    
+    hourly_vc_data = []
+    
+    csv_path = output_path.replace('.png', '.csv')
+    try:
+        with open(csv_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['hour', 'median_vc', 'p90_vc', 'max_vc', 'num_active_links'])
+            for h in range(num_hours):
+                start_i = h * intervals_per_hour
+                end_i = min((h + 1) * intervals_per_hour, num_intervals)
+                
+                # Sum volumes in this hour
+                hr_counts = counts[start_i:end_i].sum(axis=0)
+                # Capacity in this hour
+                hr_cap = safe_cap * (end_i - start_i)
+                
+                # Drop 0 volume links
+                active_mask = hr_counts > 0
+                if active_mask.sum() > 0:
+                    hr_vc = hr_counts[active_mask] / hr_cap[active_mask]
+                    hourly_vc_data.append((h, hr_vc))
+                    writer.writerow([h, np.median(hr_vc), np.percentile(hr_vc, 90), np.max(hr_vc), np.sum(active_mask)])
+                else:
+                    hourly_vc_data.append((h, np.array([])))
+                    writer.writerow([h, 0, 0, 0, 0])
+        print(f"  📄 Saved Hourly Violins data to {csv_path}")
+    except Exception as e:
+        print(f"  ⚠ Failed to save CSV data for Hourly Violins: {e}")
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    _apply_dark_theme(ax, fig)
+
+    valid_hours = [h for h, vc in hourly_vc_data if len(vc) > 0]
+    valid_data = [vc for h, vc in hourly_vc_data if len(vc) > 0]
+
+    if valid_data:
+        parts = ax.violinplot(valid_data, positions=valid_hours, showmeans=False, showextrema=True, showmedians=True)
+        for pc in parts['bodies']:
+            pc.set_facecolor(_ACCENT_PURPLE)
+            pc.set_edgecolor(_TEXT_COLOR)
+            pc.set_alpha(0.7)
+        parts['cmedians'].set_color(_ACCENT_GREEN)
+        parts['cmins'].set_color(_TEXT_COLOR)
+        parts['cmaxes'].set_color(_TEXT_COLOR)
+        parts['cbars'].set_color(_TEXT_COLOR)
+
+        ax.axhline(1.0, color=_ACCENT_RED, linestyle='--', alpha=0.8, label='Capacity (V/C=1.0)')
+
+    ax.set_xlabel('Time (Hour)', fontsize=11)
+    ax.set_ylabel('V/C Ratio (Active Links Only)', fontsize=11)
+    ax.set_title('Spatio-Temporal Distribution of Load (Hourly Violins)', fontsize=12, fontweight='bold')
+    if valid_hours:
+        ax.set_xticks(valid_hours)
+    ax.legend(loc='upper right', fontsize=9, framealpha=0.8, facecolor=_DARK_CARD, edgecolor=_GRID_COLOR, labelcolor=_TEXT_COLOR)
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200, facecolor=fig.get_facecolor(), bbox_inches='tight')
+    plt.close(fig)
+    print(f"  📊 Spatiotemporal Violins Plot saved to {output_path}")
+
+
+def plot_critical_corridors_heatmap(
+    link_counts: torch.Tensor,
+    flow_capacity_per_step: torch.Tensor,
+    link_tt_interval: float,
+    dt: float,
+    routes_flat_csr: torch.Tensor,
+    output_path: str,
+):
+    """Plot V/C heatmap for the Top 100 links by Routing Centrality."""
+    if routes_flat_csr is None:
+        print("  ⚠ routes_flat_csr not available. Skipping Critical Corridors Heatmap.")
+        return
+
+    # Compute routing centrality
+    flat_routes_np = routes_flat_csr.numpy()
+    valid_edges = flat_routes_np[flat_routes_np >= 0]
+    edge_counts = np.bincount(valid_edges)
+    
+    # Get top 100 edges
+    top_100_edges = np.argsort(edge_counts)[::-1][:100]
+    top_100_edges = top_100_edges[edge_counts[top_100_edges] > 0] # Filter out edges with 0 frequency
+
+    if len(top_100_edges) == 0:
+        print("  ⚠ No active edges found in candidate routes.")
+        return
+
+    counts = link_counts.float().numpy()
+    steps_per_interval = link_tt_interval / dt
+    capacity_per_interval = flow_capacity_per_step.float().numpy() * steps_per_interval
+    safe_cap = np.maximum(capacity_per_interval, 1e-6)
+    vc_matrix = counts / safe_cap[None, :]
+
+    # Extract V/C for top 100 links [Time, Top100]
+    heatmap_data = vc_matrix[:, top_100_edges].T  # [Top100, Time]
+
+    csv_path = output_path.replace('.png', '.csv')
+    try:
+        with open(csv_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            time_labels = [f"t_{int((i * link_tt_interval) // 60)}" for i in range(heatmap_data.shape[1])]
+            writer.writerow(['link_idx', 'centrality'] + time_labels)
+            for i, edge in enumerate(top_100_edges):
+                writer.writerow([edge, edge_counts[edge]] + heatmap_data[i].tolist())
+        print(f"  📄 Saved Critical Corridors Heatmap data to {csv_path}")
+    except Exception as e:
+        print(f"  ⚠ Failed to save CSV data for Critical Corridors: {e}")
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    _apply_dark_theme(ax, fig)
+
+    cmap = plt.cm.get_cmap('jet').copy()  # Blue to Red
+    cmap.set_bad(_DARK_BG)
+    
+    im = ax.imshow(heatmap_data, aspect='auto', cmap=cmap, origin='upper', vmin=0, vmax=2.0)
+    
+    cb = fig.colorbar(im, ax=ax, pad=0.02)
+    cb.set_label('V/C Ratio', color=_TEXT_COLOR, fontsize=10)
+    cb.ax.tick_params(colors=_TEXT_COLOR, labelsize=8)
+
+    ax.set_xlabel(f'Time Bins ({int(link_tt_interval // 60)} min)', fontsize=11)
+    ax.set_ylabel('Top Critical Links (Sorted by Centrality)', fontsize=11)
+    ax.set_title('Spatiotemporal Corridors Heatmap (Top Critical Links)', fontsize=12, fontweight='bold')
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200, facecolor=fig.get_facecolor(), bbox_inches='tight')
+    plt.close(fig)
+    print(f"  📊 Critical Corridors Heatmap saved to {output_path}")
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  Main Entry Point
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -386,6 +714,7 @@ def generate_sanity_checks(
     best_sanity_data: Dict,
     regret_history: List[Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]],
     output_dir: str,
+    route_allocation_history: Optional[List[np.ndarray]] = None,
     scenario_id: str = "",
     agent_type: str = "",
 ):
@@ -431,3 +760,51 @@ def generate_sanity_checks(
         regret_history=regret_history,
         output_path=os.path.join(output_dir, 'sanity_03_regret_convergence.png'),
     )
+
+    # ── New Plots (Block 1 & 2) ──
+    if route_allocation_history and best_sanity_data.get('major_od_idx') is not None:
+        plot_route_allocation_heatmap(
+            route_allocation_history=route_allocation_history,
+            major_od_idx=best_sanity_data['major_od_idx'],
+            major_od_count=best_sanity_data.get('major_od_count', 0),
+            output_path=os.path.join(output_dir, 'sanity_04_route_heatmap.png'),
+        )
+
+    if 'chosen_path_idx' in best_sanity_data and 'od_indices' in best_sanity_data and best_sanity_data['od_indices'] is not None:
+        plot_entropy_scatter(
+            chosen_paths=best_sanity_data['chosen_path_idx'].numpy(),
+            od_indices=best_sanity_data['od_indices'].numpy(),
+            original_leg_idx=best_sanity_data.get('original_leg_idx', np.arange(len(best_sanity_data['chosen_path_idx']))),
+            K=best_sanity_data.get('K', 3),
+            mean_tt=best_sanity_data.get('mean_tt', 0.0),
+            output_path=os.path.join(output_dir, 'sanity_05_entropy_scatter.png'),
+        )
+        
+        if best_sanity_data.get('major_od_idx') is not None:
+            plot_lorenz_concentration(
+                chosen_paths=best_sanity_data['chosen_path_idx'].numpy(),
+                od_indices=best_sanity_data['od_indices'].numpy(),
+                original_leg_idx=best_sanity_data.get('original_leg_idx', np.arange(len(best_sanity_data['chosen_path_idx']))),
+                major_od_idx=best_sanity_data['major_od_idx'],
+                major_od_count=best_sanity_data.get('major_od_count', 0),
+                K=best_sanity_data.get('K', 3),
+                output_path=os.path.join(output_dir, 'sanity_06_lorenz_concentration.png'),
+            )
+
+    if 'link_counts' in best_sanity_data:
+        plot_spatiotemporal_violins(
+            link_counts=best_sanity_data['link_counts'],
+            flow_capacity_per_step=best_sanity_data['flow_capacity_per_step'],
+            link_tt_interval=best_sanity_data['link_tt_interval'],
+            dt=best_sanity_data['dt'],
+            output_path=os.path.join(output_dir, 'sanity_07_spatiotemporal_violins.png'),
+        )
+
+        plot_critical_corridors_heatmap(
+            link_counts=best_sanity_data['link_counts'],
+            flow_capacity_per_step=best_sanity_data['flow_capacity_per_step'],
+            link_tt_interval=best_sanity_data['link_tt_interval'],
+            dt=best_sanity_data['dt'],
+            routes_flat_csr=best_sanity_data.get('routes_flat_csr'),
+            output_path=os.path.join(output_dir, 'sanity_08_critical_corridors.png'),
+        )
