@@ -449,18 +449,39 @@ def plot_entropy_scatter(
     mean_tt: float,
     output_path: str,
     unique_od: Optional[np.ndarray] = None,
+    macro_od_size: Optional[float] = None,
+    node_coords: Optional[torch.Tensor] = None,
 ):
     """Calculate and save entropy vs mean travel time for convergence."""
     # Filter to actual valid departed legs
     valid_ods = od_indices[original_leg_idx]
     
-    unique_ods, od_counts = np.unique(valid_ods, return_counts=True)
+    if macro_od_size is not None and unique_od is not None and node_coords is not None:
+        origins = unique_od[valid_ods, 0]
+        dests = unique_od[valid_ods, 1]
+        
+        ox = node_coords[origins, 0].numpy()
+        oy = node_coords[origins, 1].numpy()
+        dx = node_coords[dests, 0].numpy()
+        dy = node_coords[dests, 1].numpy()
+        
+        grid_ox = (ox // macro_od_size).astype(int)
+        grid_oy = (oy // macro_od_size).astype(int)
+        grid_dx = (dx // macro_od_size).astype(int)
+        grid_dy = (dy // macro_od_size).astype(int)
+        
+        macro_pairs = np.stack([grid_ox, grid_oy, grid_dx, grid_dy], axis=1)
+        _, target_ods = np.unique(macro_pairs, axis=0, return_inverse=True)
+    else:
+        target_ods = valid_ods
+        
+    unique_target_ods, od_counts = np.unique(target_ods, return_counts=True)
     weighted_entropy_sum = 0.0
     total_valid_agents = 0
     
-    for od, count in zip(unique_ods, od_counts):
+    for od, count in zip(unique_target_ods, od_counts):
         if count > 1:  # Ignore OD pairs with only 1 agent
-            od_mask = (valid_ods == od)
+            od_mask = (target_ods == od)
             acts = chosen_paths[od_mask]
             act_counts = np.bincount(acts, minlength=K)
             p = act_counts / count
@@ -489,11 +510,12 @@ def plot_entropy_scatter(
             writer = csv.writer(f)
             writer.writerow(['leg_idx', 'od_idx', 'origin_node', 'destination_node', 'chosen_path_idx'])
             for i, leg_idx in enumerate(original_leg_idx):
-                od_idx = valid_ods[i]
+                od_idx = target_ods[i]
+                orig_od = valid_ods[i]
                 act = chosen_paths[i]
                 orig, dest = -1, -1
-                if unique_od is not None and 0 <= od_idx < len(unique_od):
-                    orig, dest = unique_od[od_idx]
+                if unique_od is not None and 0 <= orig_od < len(unique_od):
+                    orig, dest = unique_od[orig_od]
                 writer.writerow([leg_idx, od_idx, orig, dest, act])
         print(f"  📄 Saved Raw Choices data to {raw_csv_path}")
     except Exception as e:
@@ -800,6 +822,8 @@ def generate_sanity_checks(
             mean_tt=best_sanity_data.get('mean_tt', 0.0),
             output_path=os.path.join(output_dir, 'sanity_05_entropy_scatter.png'),
             unique_od=best_sanity_data.get('unique_od'),
+            macro_od_size=best_sanity_data.get('macro_od_size'),
+            node_coords=best_sanity_data.get('node_coords'),
         )
         
         if best_sanity_data.get('major_od_idx') is not None:

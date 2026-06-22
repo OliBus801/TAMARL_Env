@@ -16,6 +16,7 @@ class ScenarioData:
     """All tensors needed to instantiate TorchDNLMATSim in RL mode."""
     edge_static: torch.Tensor        # [E, 5]
     edge_endpoints: torch.Tensor     # [E, 2]
+    node_coords: torch.Tensor        # [N, 2]
     departure_times: torch.Tensor    # [A]
     first_edges: torch.Tensor        # [A, MaxLegs]
     destinations: torch.Tensor       # [A, MaxLegs] destination node indices
@@ -40,6 +41,7 @@ def parse_network(network_file: str, scale_factor: float = 1.0, timestep: float 
     node_id_to_idx = {}
     edges = []
     link_id_to_idx = {}
+    node_coords = []
     valid_links = 0
     eff_cell_size = 7.5
 
@@ -48,6 +50,9 @@ def parse_network(network_file: str, scale_factor: float = 1.0, timestep: float 
         if elem.tag == "node":
             nid = elem.get('id')
             node_id_to_idx[nid] = len(node_id_to_idx)
+            x = float(elem.get('x', 0.0))
+            y = float(elem.get('y', 0.0))
+            node_coords.append([x, y])
             elem.clear()
         elif elem.tag == "link":
             modes = elem.get('modes')
@@ -77,7 +82,7 @@ def parse_network(network_file: str, scale_factor: float = 1.0, timestep: float 
                     valid_links += 1
             elem.clear()
 
-    return node_id_to_idx, edges, link_id_to_idx
+    return node_id_to_idx, edges, link_id_to_idx, node_coords
 
 
 def parse_population(pop_file: str, link_id_to_idx: Dict[str, int], node_id_to_idx: Dict[str, int]):
@@ -227,7 +232,7 @@ def load_scenario(
         raise FileNotFoundError(f"No population file found in {root_folder}")
 
     # Parse
-    node_id_to_idx, edges_data, link_id_to_idx = parse_network(network_file, scale_factor, timestep)
+    node_id_to_idx, edges_data, link_id_to_idx, node_coords_list = parse_network(network_file, scale_factor, timestep)
     agents = parse_population(population_file, link_id_to_idx, node_id_to_idx)
 
     if len(agents) == 0:
@@ -240,6 +245,7 @@ def load_scenario(
     # Build tensors
     edge_static = torch.tensor([e['attr'] for e in edges_data], dtype=torch.float32)
     edge_endpoints = torch.tensor([[e['u'], e['v']] for e in edges_data], dtype=torch.int32)
+    node_coords = torch.tensor(node_coords_list, dtype=torch.float32)
     
     departure_times = torch.tensor([a['dep_time'] for a in agents], dtype=torch.int32)
     
@@ -274,6 +280,7 @@ def load_scenario(
     return ScenarioData(
         edge_static=edge_static,
         edge_endpoints=edge_endpoints,
+        node_coords=node_coords,
         departure_times=departure_times,
         first_edges=first_edges,
         destinations=destinations,

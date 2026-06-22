@@ -240,6 +240,7 @@ def train(
     profile_memory: bool = False,
     # Sanity Checks
     sanity_checks: bool = False,
+    macro_od_size: Optional[float] = None,
 ):
     """Run the training loop for the One-Shot Bandit environment.
 
@@ -629,6 +630,8 @@ def train(
                 best_sanity_data['major_od_count'] = major_od_count
                 best_sanity_data['routes_flat_csr'] = env.routes_flat_csr.cpu() if hasattr(env, "routes_flat_csr") else None
                 best_sanity_data['K'] = top_k_paths
+                best_sanity_data['macro_od_size'] = macro_od_size
+                best_sanity_data['node_coords'] = env.bandit.scenario.node_coords.cpu() if hasattr(env.bandit.scenario, "node_coords") else None
 
             # Track route allocation for the major OD pair for all episodes
             if major_od_idx is not None and 'act' in raw_infos.get('_episode', {}):
@@ -997,6 +1000,8 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="Force recalculation and overwrite of the cached shortest paths .pkl file")
     parser.add_argument("--sanity_checks", action="store_true",
                         help="Generate sanity check plots (FFTT scatter, V/C histogram, regret violin) at end of training")
+    parser.add_argument("--macro_od_size", type=float, default=None,
+                        help="Spatial zone cell size in meters for macro-OD aggregation (e.g. 1000.0).")
 
     parser.add_argument("--epsilon_start", type=float, default=None)
     parser.add_argument("--epsilon_end", type=float, default=None)
@@ -1056,6 +1061,7 @@ _CLI_TO_KWARGS = {
     "profile_memory": "profile_memory",
     "reload_paths": "reload_paths",
     "sanity_checks": "sanity_checks",
+    "macro_od_size": "macro_od_size",
 }
 
 
