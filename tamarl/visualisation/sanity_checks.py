@@ -454,20 +454,22 @@ def plot_entropy_scatter(
     # Filter to actual valid departed legs
     valid_ods = od_indices[original_leg_idx]
     
-    unique_ods = np.unique(valid_ods)
-    entropies = []
+    unique_ods, od_counts = np.unique(valid_ods, return_counts=True)
+    weighted_entropy_sum = 0.0
+    total_valid_agents = 0
     
-    for od in unique_ods:
-        od_mask = (valid_ods == od)
-        acts = chosen_paths[od_mask]
-        if len(acts) > 0:
-            counts = np.bincount(acts, minlength=K)
-            p = counts / len(acts)
+    for od, count in zip(unique_ods, od_counts):
+        if count > 1:  # Ignore OD pairs with only 1 agent
+            od_mask = (valid_ods == od)
+            acts = chosen_paths[od_mask]
+            act_counts = np.bincount(acts, minlength=K)
+            p = act_counts / count
             p_nz = p[p > 0]
             H = -np.sum(p_nz * np.log(p_nz))
-            entropies.append(H)
+            weighted_entropy_sum += H * count
+            total_valid_agents += count
             
-    avg_entropy = np.mean(entropies) if entropies else 0.0
+    avg_entropy = weighted_entropy_sum / total_valid_agents if total_valid_agents > 0 else 0.0
 
     # Save summary CSV
     csv_path = output_path.replace('.png', '.csv')
