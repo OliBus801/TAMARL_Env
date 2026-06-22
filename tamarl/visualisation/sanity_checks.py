@@ -448,6 +448,7 @@ def plot_entropy_scatter(
     K: int,
     mean_tt: float,
     output_path: str,
+    unique_od: Optional[np.ndarray] = None,
 ):
     """Calculate and save entropy vs mean travel time for convergence."""
     # Filter to actual valid departed legs
@@ -468,6 +469,7 @@ def plot_entropy_scatter(
             
     avg_entropy = np.mean(entropies) if entropies else 0.0
 
+    # Save summary CSV
     csv_path = output_path.replace('.png', '.csv')
     try:
         with open(csv_path, 'w', newline='') as f:
@@ -477,6 +479,23 @@ def plot_entropy_scatter(
         print(f"  📄 Saved Entropy data to {csv_path}")
     except Exception as e:
         print(f"  ⚠ Failed to save CSV data for Entropy: {e}")
+
+    # Save raw choices CSV
+    raw_csv_path = output_path.replace('.png', '_raw_choices.csv')
+    try:
+        with open(raw_csv_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['leg_idx', 'od_idx', 'origin_node', 'destination_node', 'chosen_path_idx'])
+            for i, leg_idx in enumerate(original_leg_idx):
+                od_idx = valid_ods[i]
+                act = chosen_paths[i]
+                orig, dest = -1, -1
+                if unique_od is not None and 0 <= od_idx < len(unique_od):
+                    orig, dest = unique_od[od_idx]
+                writer.writerow([leg_idx, od_idx, orig, dest, act])
+        print(f"  📄 Saved Raw Choices data to {raw_csv_path}")
+    except Exception as e:
+        print(f"  ⚠ Failed to save Raw Choices data: {e}")
 
     fig, ax = plt.subplots(figsize=(6, 5))
     _apply_dark_theme(ax, fig)
@@ -778,6 +797,7 @@ def generate_sanity_checks(
             K=best_sanity_data.get('K', 3),
             mean_tt=best_sanity_data.get('mean_tt', 0.0),
             output_path=os.path.join(output_dir, 'sanity_05_entropy_scatter.png'),
+            unique_od=best_sanity_data.get('unique_od'),
         )
         
         if best_sanity_data.get('major_od_idx') is not None:

@@ -101,6 +101,7 @@ class ODLevelWrapper:
             np.stack([leg_origins, leg_dests], axis=1),
             axis=0, return_inverse=True
         )
+        self.unique_od = unique_od
         self.od_indices_all_legs = torch.tensor(inverse_od, dtype=torch.long, device=self._device)
         self.first_edges_all_legs = torch.tensor(self.leg_first_edges, dtype=torch.long, device=self._device)
 

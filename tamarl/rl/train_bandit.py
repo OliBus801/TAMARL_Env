@@ -624,6 +624,7 @@ def train(
 
                 # Save extra data for new sanity check plots
                 best_sanity_data['od_indices'] = env.od_indices_all_legs.cpu() if hasattr(env, "od_indices_all_legs") else None
+                best_sanity_data['unique_od'] = env.unique_od if hasattr(env, "unique_od") else None
                 best_sanity_data['major_od_idx'] = major_od_idx
                 best_sanity_data['major_od_count'] = major_od_count
                 best_sanity_data['routes_flat_csr'] = env.routes_flat_csr.cpu() if hasattr(env, "routes_flat_csr") else None

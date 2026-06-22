@@ -114,6 +114,7 @@ class CentralizedLevelWrapper:
         # od_indices_all_legs : utilisé UNIQUEMENT pour les métriques Nash
         # (calcul du regret par paire OD). La sélection de route utilise
         # toujours candidate_routes[od_indices, action].
+        self.unique_od = unique_od
         self.od_indices_all_legs = torch.tensor(
             inverse_od, dtype=torch.long, device=self._device
         )
