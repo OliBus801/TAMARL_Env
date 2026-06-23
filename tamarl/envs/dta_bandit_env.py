@@ -45,6 +45,7 @@ class DTABanditEnv:
         track_events: bool = False,
         link_tt_interval: float = 300.0,
         profile_memory: bool = False,
+        save_pickle: bool = False,
     ):
         self._scenario_path = scenario_path
         self._max_steps = max_steps
@@ -58,6 +59,7 @@ class DTABanditEnv:
             population_filter=population_filter,
             timestep=timestep,
             scale_factor=scale_factor,
+            save_pickle=save_pickle,
         )
 
         self.num_agents = self.scenario.num_agents

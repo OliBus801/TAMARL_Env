@@ -241,6 +241,8 @@ def train(
     # Sanity Checks
     sanity_checks: bool = False,
     macro_od_size: Optional[float] = None,
+    # Save Pickles
+    save_pickle: bool = False,
 ):
     """Run the training loop for the One-Shot Bandit environment.
 
@@ -330,6 +332,7 @@ def train(
         track_events=need_events,
         link_tt_interval=link_tt_interval,
         profile_memory=profile_memory,
+        save_pickle=save_pickle,
     )
     
     # 2. Wrap it in the appropriate wrapper (based on formulation)
@@ -1002,6 +1005,8 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="Generate sanity check plots (FFTT scatter, V/C histogram, regret violin) at end of training")
     parser.add_argument("--macro_od_size", type=float, default=None,
                         help="Spatial zone cell size in meters for macro-OD aggregation (e.g. 1000.0).")
+    parser.add_argument("--save_pickle", action="store_true",
+                        help="Save/load the parsed network and population to/from a .pkl file")
 
     parser.add_argument("--epsilon_start", type=float, default=None)
     parser.add_argument("--epsilon_end", type=float, default=None)
@@ -1062,6 +1067,7 @@ _CLI_TO_KWARGS = {
     "reload_paths": "reload_paths",
     "sanity_checks": "sanity_checks",
     "macro_od_size": "macro_od_size",
+    "save_pickle": "save_pickle",
 }
 
 

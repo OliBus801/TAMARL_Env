@@ -7,6 +7,7 @@ for the RL environment.
 import os
 import xml.etree.ElementTree as ET
 import torch
+import pickle
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -184,6 +185,7 @@ def load_scenario(
     population_filter: Optional[str] = None,
     timestep: float = 1.0,
     scale_factor: float = 1.0,
+    save_pickle: bool = False,
 ) -> ScenarioData:
     """Load a MATSim scenario (network + population) for RL mode.
     
@@ -196,6 +198,18 @@ def load_scenario(
     Returns:
         ScenarioData with all tensors ready for TorchDNLMATSim RL mode
     """
+    cache_name = "scenario_data"
+    if population_filter:
+        cache_name += f"_{population_filter}"
+    cache_name += ".pkl"
+    pickle_path = os.path.join(root_folder, cache_name)
+
+    # Check if pickle exists
+    if os.path.exists(pickle_path):
+        print(f"Loading scenario data from {pickle_path}...")
+        with open(pickle_path, 'rb') as f:
+            return pickle.load(f)
+
     # Locate files
     files = [f for f in os.listdir(root_folder) if f.endswith('.xml')]
     network_file = None
@@ -277,7 +291,7 @@ def load_scenario(
     num_nodes = len(node_id_to_idx)
     num_edges = len(edges_data)
 
-    return ScenarioData(
+    scenario_data = ScenarioData(
         edge_static=edge_static,
         edge_endpoints=edge_endpoints,
         node_coords=node_coords,
@@ -293,3 +307,10 @@ def load_scenario(
         node_id_to_idx=node_id_to_idx,
         link_id_to_idx=link_id_to_idx,
     )
+
+    if save_pickle:
+        print(f"Saving scenario data to {pickle_path}...")
+        with open(pickle_path, 'wb') as f:
+            pickle.dump(scenario_data, f)
+
+    return scenario_data
