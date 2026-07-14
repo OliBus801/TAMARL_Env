@@ -1,0 +1,1145 @@
+"""Core rendering logic for TrafficGym simulation visualization.
+
+Parses the network XML and events CSV, reconstructs per-agent states at each
+timestep, and renders an animated GIF or MP4.
+"""
+
+import csv
+import glob
+import math
+import os
+import re
+import xml.etree.ElementTree as ET
+from collections import defaultdict
+
+import matplotlib
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from matplotlib.animation import FFMpegWriter, FuncAnimation, PillowWriter
+from tqdm import tqdm
+
+# ─── Agent visual states ───────────────────────────────────────────────────────
+STATE_GONE = 0  # Not drawn
+STATE_WAITING = 1
+STATE_DEPARTED = 2  # Shown for exactly 1 frame (ping), then gone
+STATE_TRAVELING = 3
+STATE_BUFFER = 4
+STATE_ARRIVED = 5  # Shown for exactly 1 frame (ping), then gone
+STATE_STUCK = 6  # Shown for exactly 1 frame (ping), then gone
+
+STATE_COLORS = {
+    STATE_WAITING: "#F5C542",  # warm yellow
+    STATE_DEPARTED: "#9B59B6",  # purple
+    STATE_TRAVELING: "#4A90D9",  # blue
+    STATE_BUFFER: "#E67E22",  # orange
+    STATE_ARRIVED: "#2ECC71",  # green
+    STATE_STUCK: "#E74C3C",  # red
+}
+
+# Margin fraction: traveling agents use [MARGIN, 1-MARGIN] of the link
+# so they never sit exactly on a node.
+LINK_MARGIN = 0.10
+
+
+# ─── Network parsing ──────────────────────────────────────────────────────────
+
+
+def parse_network(scenario_folder: str):
+    """Parse a traffic network XML from the scenario folder.
+
+    Returns:
+        nodes: dict  node_id -> {'x': float, 'y': float}
+        links: dict  link_id -> {'from': node_id, 'to': node_id,
+                                  'length': float, 'freespeed': float}
+    """
+    candidates = glob.glob(os.path.join(scenario_folder, "*network*.xml"))
+    if not candidates:
+        raise FileNotFoundError(f"No *network*.xml found in {scenario_folder}")
+    network_file = candidates[0]
+    print(f"📄 Parsing network: {os.path.basename(network_file)}")
+
+    nodes = {}
+    links = {}
+
+    tree = ET.parse(network_file)
+    root = tree.getroot()
+
+    for node_elem in root.iter("node"):
+        nid = node_elem.get("id")
+        nodes[nid] = {
+            "x": float(node_elem.get("x")),
+            "y": float(node_elem.get("y")),
+        }
+
+    for link_elem in root.iter("link"):
+        lid = link_elem.get("id")
+        length = float(link_elem.get("length"))
+        freespeed = float(link_elem.get("freespeed"))
+        capacity_h = float(link_elem.get("capacity"))  # veh/h
+        lanes = float(link_elem.get("permlanes", "1"))
+
+        # Derived metrics
+        ff_time = length / freespeed if freespeed > 0 else 0  # seconds
+        flow_cap_s = capacity_h / 3600.0  # veh/s
+        eff_cell_size = 7.5
+        storage_cap = (length * lanes) / eff_cell_size  # veh
+        storage_cap = max(storage_cap, flow_cap_s)  # at least flow cap
+        storage_cap = max(storage_cap, ff_time * flow_cap_s)  # at least ff flux
+
+        links[lid] = {
+            "from": link_elem.get("from"),
+            "to": link_elem.get("to"),
+            "length": length,
+            "freespeed": freespeed,
+            "ff_time": ff_time,
+            "flow_cap": flow_cap_s,
+            "storage_cap": storage_cap,
+        }
+
+    print(f"   → {len(nodes)} nodes, {len(links)} links")
+    return nodes, links
+
+
+# ─── Events parsing ───────────────────────────────────────────────────────────
+
+
+def parse_events(output_folder: str, events_file: str = None):
+    """Parse a simulation events CSV from the output folder using pandas.
+
+    Returns:
+        df: pandas DataFrame
+        max_time: float
+    """
+    if events_file is None:
+        candidates = glob.glob(os.path.join(output_folder, "*events*.csv"))
+        if not candidates:
+            raise FileNotFoundError(f"No *events*.csv found in {output_folder}")
+        events_file = candidates[0]
+    print(f"📄 Parsing events: {os.path.basename(events_file)}")
+
+    df = pd.read_csv(events_file)
+    df.columns = df.columns.str.strip()
+    # Fill NAs safely and strip
+    df.fillna({"person": "", "link": "", "type": ""}, inplace=True)
+    for col in ["type", "person", "link"]:
+        df[col] = df[col].astype(str).str.strip()
+
+    df.sort_values("time", inplace=True)
+    max_time = df["time"].max() if not df.empty else 0
+    print(f"   → {len(df)} events, max_time={max_time}")
+    return df, max_time
+
+
+# ─── Agent state reconstruction ───────────────────────────────────────────────
+
+
+def build_agent_timelines(df, max_time, links):
+    """Reconstruct per-agent states at each integer timestep.
+
+    Arrived and stuck agents are visible for exactly 1 frame (ping effect),
+    then become STATE_GONE. Matrix operations used for extreme speed.
+
+    Returns:
+        agent_ids: sorted list of agent id strings
+        link_ids: sorted list of link id strings
+        states: (n_agents, total_steps) uint8 matrix
+        links_mat: (n_agents, total_steps) int32 matrix (indices mapping to link_ids)
+        enters_mat: (n_agents, total_steps) float32 matrix
+        total_steps: int
+        per_step_stats: list of dicts per timestep with cumulative counts
+    """
+    total_steps = int(max_time) + 2  # +1 for the arrival frame, +1 buffer
+
+    agent_ids = sorted(df["person"].unique())
+    agent_to_idx = {aid: i for i, aid in enumerate(agent_ids)}
+    num_agents = len(agent_ids)
+
+    link_ids = list(links.keys())
+    link_to_idx = {lid: i for i, lid in enumerate(link_ids)}
+
+    # Map fast indices
+    df["person_idx"] = df["person"].map(agent_to_idx)
+    df["link_idx"] = df["link"].map(link_to_idx).fillna(-1).astype(np.int32)
+
+    # Group events by integer time step
+    events_by_time = {}
+    for t, group in df.groupby(df["time"].astype(int)):
+        events_by_time[t] = group.to_dict("records")
+
+    # Result matrices
+    states = np.empty((num_agents, total_steps), dtype=np.uint8)
+    links_mat = np.empty((num_agents, total_steps), dtype=np.int32)
+    enters_mat = np.empty((num_agents, total_steps), dtype=np.float32)
+
+    # Current trackers
+    current_state = np.full(num_agents, STATE_GONE, dtype=np.uint8)
+    current_link = np.full(num_agents, -1, dtype=np.int32)
+    current_enter = np.zeros(num_agents, dtype=np.float32)
+
+    # Daily counts
+    new_departed = np.zeros(total_steps, dtype=np.int32)
+    new_arrived = np.zeros(total_steps, dtype=np.int32)
+    new_stuck = np.zeros(total_steps, dtype=np.int32)
+
+    for t in range(total_steps):
+        # Apply 1-frame pings decay
+        mask_arrived = (current_state == STATE_ARRIVED) | (current_state == STATE_STUCK)
+        current_state[mask_arrived] = STATE_GONE
+
+        mask_departed = current_state == STATE_DEPARTED
+        current_state[mask_departed] = STATE_WAITING
+
+        # Process new events
+        if t in events_by_time:
+            for e in events_by_time[t]:
+                aid = e["person_idx"]
+                etype = e["type"]
+                lk = e["link_idx"]
+
+                if etype == "actend":
+                    current_state[aid] = STATE_WAITING
+                    current_link[aid] = lk
+                elif etype == "departure":
+                    current_state[aid] = STATE_DEPARTED
+                    current_link[aid] = lk
+                    new_departed[t] += 1
+                elif etype == "enters_traffic":
+                    current_state[aid] = STATE_BUFFER
+                    current_link[aid] = lk
+                    current_enter[aid] = t
+                elif etype == "entered_link":
+                    current_state[aid] = STATE_TRAVELING
+                    current_link[aid] = lk
+                    current_enter[aid] = t
+                elif etype == "left_link":
+                    current_state[aid] = STATE_BUFFER
+                    current_link[aid] = lk
+                elif etype == "entered_buffer":
+                    current_state[aid] = STATE_BUFFER
+                    current_link[aid] = lk
+                elif etype in ("leaves_traffic", "arrival", "actstart"):
+                    if current_state[aid] != STATE_ARRIVED:
+                        current_state[aid] = STATE_ARRIVED
+                        current_link[aid] = lk
+                        new_arrived[t] += 1
+                elif etype == "stuckAndAbort":
+                    if current_state[aid] != STATE_STUCK:
+                        current_state[aid] = STATE_STUCK
+                        current_link[aid] = lk
+                        new_stuck[t] += 1
+
+        states[:, t] = current_state
+        links_mat[:, t] = current_link
+        enters_mat[:, t] = current_enter
+
+    # Counters vector computation
+    waiting_counts = np.sum(states == STATE_WAITING, axis=0)
+    traveling_counts = np.sum(states == STATE_TRAVELING, axis=0)
+    buffer_counts = np.sum(states == STATE_BUFFER, axis=0)
+    departed_total = np.cumsum(new_departed)
+    arrived_total = np.cumsum(new_arrived)
+    stuck_total = np.cumsum(new_stuck)
+
+    per_step_stats = []
+    for t in range(total_steps):
+        per_step_stats.append(
+            {
+                "waiting": waiting_counts[t],
+                "traveling": traveling_counts[t],
+                "buffer": buffer_counts[t],
+                "departed_total": departed_total[t],
+                "arrived_total": arrived_total[t],
+                "stuck_total": stuck_total[t],
+                "new_departed": new_departed[t],
+                "new_arrived": new_arrived[t],
+                "new_stuck": new_stuck[t],
+            }
+        )
+
+    return agent_ids, link_ids, states, links_mat, enters_mat, total_steps, per_step_stats
+
+
+# ─── Geometry helpers ─────────────────────────────────────────────────────────
+
+
+def _link_geometry(nodes, link):
+    """Get start/end coords for a link."""
+    n_from = nodes[link["from"]]
+    n_to = nodes[link["to"]]
+    return n_from["x"], n_from["y"], n_to["x"], n_to["y"]
+
+
+def _interpolate_on_link(x0, y0, x1, y1, progress):
+    """Interpolate position along a link. progress in [0, 1]."""
+    p = min(max(progress, 0.0), 1.0)
+    return x0 + p * (x1 - x0), y0 + p * (y1 - y0)
+
+
+def _perpendicular_offset(x0, y0, x1, y1, offset):
+    """Compute a perpendicular offset vector from the link direction."""
+    dx = x1 - x0
+    dy = y1 - y0
+    length = math.sqrt(dx * dx + dy * dy)
+    if length < 1e-9:
+        return 0.0, 0.0
+    nx = -dy / length
+    ny = dx / length
+    return nx * offset, ny * offset
+
+
+# ─── Rendering ─────────────────────────────────────────────────────────────────
+
+
+def _compute_agent_positions(
+    agent_ids,
+    link_ids,
+    states_col,
+    links_col,
+    enters_col,
+    timestep,
+    nodes,
+    links,
+    disable_fanning=False,
+):
+    """Compute (x, y, color, state) for each visible agent at a timestep.
+
+    Handles overlap by fanning out agents at the same position.
+    """
+    raw_positions = []
+
+    visible_mask = states_col != STATE_GONE
+    if not np.any(visible_mask):
+        return []
+
+    vis_agents = np.where(visible_mask)[0]
+
+    for idx in vis_agents:
+        st = states_col[idx]
+        lk_idx = links_col[idx]
+
+        if lk_idx < 0 or lk_idx >= len(link_ids):
+            continue
+
+        link_id = link_ids[lk_idx]
+        if link_id not in links:
+            continue
+
+        link = links[link_id]
+        x0, y0, x1, y1 = _link_geometry(nodes, link)
+
+        is_longitudinal_queue = False
+
+        if st == STATE_WAITING:
+            # Waiting at the origin node of their link
+            px, py = x0, y0
+            is_longitudinal_queue = True
+
+        elif st == STATE_DEPARTED:
+            # Ping at origin node of their link
+            px, py = x0, y0
+            is_longitudinal_queue = True
+
+        elif st == STATE_TRAVELING:
+            # Interpolate along [MARGIN, 1-MARGIN] of the link so
+            # traveling agents never sit exactly on a node.
+            ff_time = link["length"] / link["freespeed"] if link["freespeed"] > 0 else 1.0
+            elapsed = timestep - enters_col[idx]
+            raw_progress = elapsed / ff_time if ff_time > 0 else 1.0
+            raw_progress = min(max(raw_progress, 0.0), 1.0)
+            if raw_progress == 1.0:
+                is_longitudinal_queue = True
+            progress = LINK_MARGIN + raw_progress * (1.0 - 2 * LINK_MARGIN)
+            px, py = _interpolate_on_link(x0, y0, x1, y1, progress)
+
+        elif st == STATE_BUFFER:
+            # At the end of the link (destination node)
+            px, py = x1, y1
+            is_longitudinal_queue = True
+
+        elif st in (STATE_ARRIVED, STATE_STUCK):
+            # Ping frame: show at end of link
+            px, py = x1, y1
+            is_longitudinal_queue = True
+
+        else:
+            continue
+
+        color = STATE_COLORS.get(st, "#888888")
+
+        raw_positions.append(
+            {
+                "aid": agent_ids[idx],
+                "x": px,
+                "y": py,
+                "color": color,
+                "state": st,
+                "link": link_id,
+                "is_longitudinal_queue": is_longitudinal_queue,
+            }
+        )
+
+    if disable_fanning or len(raw_positions) == 0:
+        return raw_positions
+
+    # Fan out overlapping agents perpendicular to the link
+    # Cap at N_MAX_STACK visible dots; show overflow with "×N" label
+    N_MAX_STACK = 3
+    pos_groups = defaultdict(list)
+    for p in raw_positions:
+        key = (round(p["x"], 4), round(p["y"], 4), p["link"])
+        pos_groups[key].append(p)
+
+    result = []
+
+    for key, group in pos_groups.items():
+        n = len(group)
+        if n == 1:
+            result.append(group[0])
+        else:
+            link_id = group[0]["link"]
+            link = links[link_id]
+            x0, y0, x1, y1 = _link_geometry(nodes, link)
+
+            # Cap visible dots
+            visible = group[:N_MAX_STACK]
+            overflow = n - N_MAX_STACK if n > N_MAX_STACK else 0
+            nv = len(visible)
+
+            # Calculate spacing dynamically based on the Euclidean length of the link
+            dx_geom = x1 - x0
+            dy_geom = y1 - y0
+            geom_len = math.sqrt(dx_geom * dx_geom + dy_geom * dy_geom)
+            link_spacing = geom_len * 0.06 if geom_len > 1e-9 else 1.0
+
+            is_longitudinal = group[0].get("is_longitudinal_queue", False)
+
+            if is_longitudinal:
+                dx = x0 - x1
+                dy = y0 - y1
+                length = math.sqrt(dx * dx + dy * dy)
+                if length > 1e-9:
+                    ux = dx / length
+                    uy = dy / length
+                else:
+                    ux, uy = 0.0, 0.0
+
+                for i, p in enumerate(visible):
+                    p["x"] += ux * i * link_spacing
+                    p["y"] += uy * i * link_spacing
+                    result.append(p)
+            else:
+                for i, p in enumerate(visible):
+                    offset = (i - (nv - 1) / 2.0) * link_spacing
+                    ox, oy = _perpendicular_offset(x0, y0, x1, y1, offset)
+                    p["x"] += ox
+                    p["y"] += oy
+                    result.append(p)
+
+            # Tag last visible dot with overflow count
+            if overflow > 0:
+                visible[-1]["overflow"] = n
+
+    return result
+
+
+def draw_network(
+    ax,
+    nodes,
+    links,
+    node_size,
+    scale_factor=1.0,
+    text_scale_factor=1.0,
+    show_labels=True,
+    zoom_factor=1.0,
+    zoom_center=None,
+):
+    """Draw the static parts of the network: nodes and links."""
+    ax.set_facecolor("#1a1a2e")
+    ax.set_aspect("equal")
+
+    # Compute bounds
+    all_x = [n["x"] for n in nodes.values()]
+    all_y = [n["y"] for n in nodes.values()]
+    if not all_x:
+        return
+
+    range_x = max(all_x) - min(all_x)
+    range_y = max(all_y) - min(all_y)
+
+    if zoom_center is None:
+        center_x = min(all_x) + range_x / 2
+        center_y = min(all_y) + range_y / 2
+    else:
+        center_x, center_y = zoom_center
+
+    visible_range_x = range_x / zoom_factor
+    visible_range_y = range_y / zoom_factor
+
+    span = max(visible_range_x, visible_range_y, 10 / zoom_factor)
+    margin = span * 0.10 + (2 / zoom_factor)
+
+    ax.set_xlim(center_x - visible_range_x / 2 - margin, center_x + visible_range_x / 2 + margin)
+    ax.set_ylim(center_y - visible_range_y / 2 - margin, center_y + visible_range_y / 2 + margin)
+
+    # Draw links (directed arrows or lines)
+    if len(links) > 2000:
+        # Fast bulk draw for large networks
+        from matplotlib.collections import LineCollection
+
+        segments = []
+        for lid, link in links.items():
+            x0, y0, x1, y1 = _link_geometry(nodes, link)
+            segments.append([(x0, y0), (x1, y1)])
+
+        lc = LineCollection(segments, color="#4a4a6a", linewidths=1.5 * scale_factor)
+        ax.add_collection(lc)
+        # Disable heavy text labeling for super large networks
+        show_labels_links = show_labels and len(links) <= 2000
+    else:
+        # High quality directed arrows for smaller networks
+        link_lw = 1.5 * scale_factor
+        arrow_scale = 12 * scale_factor
+        for lid, link in links.items():
+            x0, y0, x1, y1 = _link_geometry(nodes, link)
+            ax.annotate(
+                "",
+                xy=(x1, y1),
+                xytext=(x0, y0),
+                arrowprops=dict(
+                    arrowstyle="-|>",
+                    color="#4a4a6a",
+                    lw=link_lw,
+                    mutation_scale=arrow_scale,
+                ),
+            )
+        show_labels_links = show_labels
+
+    # Link info labels
+    if show_labels_links:
+        link_fontsize = 5.5 * scale_factor * text_scale_factor
+        seen_node_pairs = set()
+        for lid, link in links.items():
+            # Avoid overlapping labels on two-way or parallel links
+            pair = frozenset([link["from"], link["to"]])
+            if pair in seen_node_pairs:
+                continue
+            seen_node_pairs.add(pair)
+
+            x0, y0, x1, y1 = _link_geometry(nodes, link)
+            mx, my = (x0 + x1) / 2, (y0 + y1) / 2
+            label_offset = 0.3 * scale_factor
+            ox, oy = _perpendicular_offset(x0, y0, x1, y1, label_offset)
+
+            d_val = link.get("flow_cap", 0)
+            s_val = link.get("storage_cap", 0)
+            ff_val = link.get("ff_time", 0)
+            top_label = f"{d_val:.1f} v/s | {s_val:.0f} veh"
+            bot_label = f"{ff_val:.0f}s"
+
+            ax.text(
+                mx + ox,
+                my + oy,
+                top_label,
+                fontsize=link_fontsize,
+                color="#7a7a9a",
+                ha="center",
+                va="bottom",
+                fontweight="light",
+            )
+            ax.text(
+                mx - ox,
+                my - oy,
+                bot_label,
+                fontsize=link_fontsize,
+                color="#7a7a9a",
+                ha="center",
+                va="top",
+                fontweight="light",
+            )
+
+    # Draw nodes
+    node_fontsize = 7 * scale_factor
+    node_edge_w = 1.2 * scale_factor
+
+    # Fast plot nodes
+    node_x = [n["x"] for n in nodes.values()]
+    node_y = [n["y"] for n in nodes.values()]
+    if len(nodes) > 10000:
+        # Extremely huge networks: dots are too dense to be useful except as topological bg
+        ax.plot(node_x, node_y, ",", color="#e0e0e0", zorder=5)  # 1 pixel dot
+    else:
+        ax.plot(
+            node_x,
+            node_y,
+            "o",
+            color="#e0e0e0",
+            markersize=node_size,
+            markeredgecolor="#8888aa",
+            markeredgewidth=node_edge_w,
+            zorder=5,
+        )
+
+    if show_labels:
+        # Only label nodes if the network isn't massive
+        if len(nodes) <= 2000:
+            for nid, node in nodes.items():
+                ax.text(
+                    node["x"],
+                    node["y"],
+                    nid,
+                    fontsize=node_fontsize,
+                    color="#1a1a2e",
+                    ha="center",
+                    va="center",
+                    fontweight="bold",
+                    zorder=6,
+                )
+
+    ax.set_title("")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+
+
+def _draw_agents_and_hud(
+    ax,
+    nodes,
+    links,
+    agent_ids,
+    link_ids,
+    states_col,
+    links_col,
+    enters_col,
+    timestep,
+    per_step_stats,
+    agent_size,
+    scale_factor=1.0,
+    show_labels=True,
+    disable_fanning=False,
+):
+    """Draw dynamic elements (agents and HUD). Returns standard matplotlib artists to be removed later."""
+    artists = []
+
+    # Draw agents
+    positions = _compute_agent_positions(
+        agent_ids,
+        link_ids,
+        states_col,
+        links_col,
+        enters_col,
+        timestep,
+        nodes,
+        links,
+        disable_fanning,
+    )
+
+    if positions:
+        # Pings (glow ring)
+        pings = [p for p in positions if p["state"] in (STATE_ARRIVED, STATE_STUCK, STATE_DEPARTED)]
+        if pings:
+            px = [p["x"] for p in pings]
+            py = [p["y"] for p in pings]
+            colors = [p["color"] for p in pings]
+            art1 = ax.scatter(
+                px, py, c=colors, s=(agent_size * 2.0) ** 2, alpha=0.3, zorder=9, edgecolors="none"
+            )
+            art2 = ax.scatter(
+                px, py, c=colors, s=(agent_size * 1.4) ** 2, alpha=0.6, zorder=9, edgecolors="none"
+            )
+            artists.extend([art1, art2])
+
+        # Core dots
+        px = [p["x"] for p in positions]
+        py = [p["y"] for p in positions]
+        colors = [p["color"] for p in positions]
+        art3 = ax.scatter(
+            px,
+            py,
+            c=colors,
+            s=agent_size**2,
+            alpha=1.0,
+            edgecolors="white",
+            linewidths=0.5 * scale_factor,
+            zorder=10,
+        )
+        artists.append(art3)
+
+        # Labels
+        for p in positions:
+            if show_labels:
+                aid_str = p["aid"]
+                m = re.search(r"(\d+)", aid_str)
+                label = str(int(m.group(1))) if m else aid_str
+                agent_fontsize = agent_size * 0.35
+                txt = ax.text(
+                    p["x"],
+                    p["y"],
+                    label,
+                    fontsize=agent_fontsize,
+                    color="white",
+                    ha="center",
+                    va="center",
+                    fontweight="bold",
+                    zorder=11,
+                )
+                artists.append(txt)
+
+            if "overflow" in p:
+                overflow_fontsize = max(6, agent_size * 0.4) * scale_factor
+                txt = ax.text(
+                    p["x"],
+                    p["y"] + agent_size * 0.08 * scale_factor,
+                    f"×{p['overflow']}",
+                    fontsize=overflow_fontsize,
+                    color="white",
+                    ha="center",
+                    va="bottom",
+                    fontweight="bold",
+                    zorder=12,
+                    bbox=dict(
+                        boxstyle="round,pad=0.15",
+                        facecolor="#1a1a2e",
+                        edgecolor="white",
+                        alpha=0.8,
+                        linewidth=0.5,
+                    ),
+                )
+                artists.append(txt)
+
+    # ─── HUD (multi-color, rendered with fig.text) ──────────────────────────
+    stats = per_step_stats[timestep] if timestep < len(per_step_stats) else {}
+
+    waiting = stats.get("waiting", 0)
+    traveling = stats.get("traveling", 0)
+    buffer_n = stats.get("buffer", 0)
+    departed_t = stats.get("departed_total", 0)
+    arrived_t = stats.get("arrived_total", 0)
+    stuck_t = stats.get("stuck_total", 0)
+    new_dep = stats.get("new_departed", 0)
+    new_arr = stats.get("new_arrived", 0)
+    new_stk = stats.get("new_stuck", 0)
+
+    # Helper to add a HUD section with optional (+N) indicator
+    def _hud_cumulative(segments, state, label, total, new_count):
+        segments.append(("● ", STATE_COLORS[state]))
+        txt = f"{label} {total}"
+        segments.append((txt, "#e0e0e0"))
+        if new_count > 0:
+            segments.append((f"  (+{new_count})", STATE_COLORS[state]))
+
+    def _hud_dynamic(segments, state, label, count):
+        segments.append(("● ", STATE_COLORS[state]))
+        segments.append((f"{label} {count}", "#e0e0e0"))
+
+    SEP = ("   |   ", "#666680")
+
+    hud_segments = [
+        (f"t={timestep}", "#e0e0e0"),
+        SEP,
+    ]
+    _hud_dynamic(hud_segments, STATE_WAITING, "Waiting", waiting)
+    hud_segments.append(SEP)
+    _hud_cumulative(hud_segments, STATE_DEPARTED, "Departed", departed_t, new_dep)
+    hud_segments.append(SEP)
+    _hud_dynamic(hud_segments, STATE_TRAVELING, "Traveling", traveling)
+    hud_segments.append(SEP)
+    _hud_dynamic(hud_segments, STATE_BUFFER, "Buffer", buffer_n)
+    hud_segments.append(SEP)
+    _hud_cumulative(hud_segments, STATE_ARRIVED, "Arrived", arrived_t, new_arr)
+    hud_segments.append(SEP)
+    _hud_cumulative(hud_segments, STATE_STUCK, "Stuck", stuck_t, new_stk)
+
+    # Render as concatenated fig.text segments
+    fig = ax.get_figure()
+    for txt in list(fig.texts):
+        txt.remove()
+
+    fontsize = 11
+    approx_char_width = 0.007
+    full_text = "".join(seg[0] for seg in hud_segments)
+    total_width = len(full_text) * approx_char_width
+    x_cursor = 0.5 - total_width / 2
+
+    for text, color in hud_segments:
+        fig.text(
+            x_cursor,
+            0.96,
+            text,
+            fontsize=fontsize,
+            color=color,
+            fontfamily="monospace",
+            va="top",
+            ha="left",
+            transform=fig.transFigure,
+        )
+        x_cursor += len(text) * approx_char_width
+
+    return artists
+
+
+# ─── Public API ────────────────────────────────────────────────────────────────
+
+
+def _filter_events_by_time(df, max_time, time_range):
+    """Filter events to a time range and rebase timestamps to start from 0."""
+    if time_range is None:
+        return df, max_time
+
+    t_start, t_end = time_range
+    df = df[(df["time"] >= t_start) & (df["time"] < t_end)].copy()
+
+    # Rebase timestamps
+    df["time"] = df["time"] - t_start
+    new_max = min(max_time, t_end) - t_start
+    print(
+        f"⏱️  Time filter: {t_start / 3600:.0f}h–{t_end / 3600:.0f}h → {len(df)} events, {new_max:.0f}s"
+    )
+    return df, new_max
+
+
+def render_animation(
+    scenario_folder: str,
+    output_folder: str,
+    output_path: str = None,
+    fmt: str = "gif",
+    scale_factor: float = 1.0,
+    text_scale_factor: float = 1.0,
+    show_labels: bool = True,
+    fps: int = 5,
+    dpi: int = 150,
+    fade_steps: int = 5,
+    time_range: tuple = None,
+    speed: int = 1,
+    zoom_factor: float = 1.0,
+    zoom_center: tuple = None,
+    events_file: str = None,
+):
+    """Generate a GIF or MP4 animation of a simulation.
+
+    Args:
+        scenario_folder: Path containing *network*.xml
+        output_folder: Path containing *events*.csv
+        output_path: Output file path; defaults to output_folder/simulation.<fmt>
+        fmt: 'gif' or 'mp4'
+        fps: Frames per second
+        dpi: Resolution
+        fade_steps: (unused, kept for CLI compat)
+        time_range: Optional (start_sec, end_sec) tuple to filter events
+        speed: Render 1 out of every `speed` frames (speed up factor)
+    """
+    matplotlib.use("Agg")  # Non-interactive backend for file rendering
+
+    if output_path is None:
+        output_path = os.path.join(output_folder, f"simulation.{fmt}")
+
+    print("🎬 TrafficGym Visualization")
+    print(f"   Scenario: {scenario_folder}")
+    print(f"   Output:   {output_path}")
+    print()
+
+    # 1. Parse
+    nodes, links = parse_network(scenario_folder)
+    events, max_time = parse_events(output_folder, events_file=events_file)
+
+    if events.empty:
+        print("⚠️  No events found. Nothing to render.")
+        return
+
+    # Filter by time range
+    events, max_time = _filter_events_by_time(events, max_time, time_range)
+    if events.empty:
+        print("⚠️  No events in the specified time range.")
+        return
+
+    # 2. Build agent timelines (Vectorized)
+    agent_ids, link_ids, states, links_mat, enters_mat, total_steps, per_step_stats = (
+        build_agent_timelines(events, max_time, links)
+    )
+    print(f"👥 {len(agent_ids)} agents, {total_steps} timesteps")
+
+    # Trim trailing frames where all agents are gone
+    # states shape: (num_agents, total_steps)
+    visible_counts = np.sum(states != STATE_GONE, axis=0)
+    last_visible = np.max(np.where(visible_counts > 0)[0]) if np.any(visible_counts > 0) else 0
+    total_steps = int(last_visible) + 1
+    print(f"   Trimmed to {total_steps} visible timesteps")
+
+    # 3. Adaptive sizing (doubled defaults) + scale_factor
+    num_nodes = len(nodes)
+    if num_nodes <= 10:
+        base_node, base_agent, base_fig = 28, 22, (10, 7)
+    elif num_nodes <= 50:
+        base_node, base_agent, base_fig = 18, 14, (12, 9)
+    elif num_nodes <= 500:
+        base_node, base_agent, base_fig = 10, 8, (16, 12)
+    else:
+        base_node, base_agent, base_fig = 5, 4, (20, 15)
+
+    node_size = base_node * scale_factor
+    agent_size = base_agent * scale_factor
+    # Scale figure dimensions so larger elements have room
+    fig_w = base_fig[0] * max(1.0, scale_factor**0.5)
+    fig_h = base_fig[1] * max(1.0, scale_factor**0.5)
+
+    # 4. Create animation
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h), facecolor="#1a1a2e")
+
+    # Draw static network once
+    draw_network(
+        ax,
+        nodes,
+        links,
+        node_size,
+        scale_factor,
+        text_scale_factor,
+        show_labels,
+        zoom_factor,
+        zoom_center,
+    )
+
+    frames_to_render = range(0, total_steps, speed)
+    num_frames = len(frames_to_render)
+
+    pbar = tqdm(
+        total=num_frames,
+        desc="🎞️  Rendering",
+        unit="frame",
+        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]",
+    )
+
+    disable_fanning = False
+
+    last_dynamic_artists = []
+
+    def animate(i):
+        nonlocal last_dynamic_artists
+        for art in last_dynamic_artists:
+            art.remove()
+
+        frame = frames_to_render[i]
+
+        last_dynamic_artists = _draw_agents_and_hud(
+            ax,
+            nodes,
+            links,
+            agent_ids,
+            link_ids,
+            states[:, frame],
+            links_mat[:, frame],
+            enters_mat[:, frame],
+            frame,
+            per_step_stats,
+            agent_size,
+            scale_factor,
+            show_labels,
+            disable_fanning,
+        )
+        pbar.update(1)
+
+    print(f"\n🎞️  Rendering {num_frames} frames (speed {speed}x) at {fps} FPS...")
+    anim = FuncAnimation(fig, animate, frames=num_frames, interval=1000 // fps)
+
+    if fmt == "gif":
+        print("💾 Saving as GIF...")
+        writer = PillowWriter(fps=fps)
+    elif fmt == "mp4":
+        print("💾 Saving as MP4...")
+        writer = FFMpegWriter(fps=fps, codec="libx264", bitrate=2000)
+    else:
+        raise ValueError(f"Unknown format: {fmt}")
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    anim.save(output_path, writer=writer, dpi=dpi)
+    pbar.close()
+    plt.close(fig)
+
+    file_size = os.path.getsize(output_path) / 1024
+    print(f"\n✅ Saved to {output_path} ({file_size:.1f} KB)")
+
+
+def render_live(
+    scenario_folder: str,
+    output_folder: str,
+    scale_factor: float = 1.0,
+    text_scale_factor: float = 1.0,
+    show_labels: bool = True,
+    initial_speed: int = 1,
+    time_range: tuple = None,
+    zoom_factor: float = 1.0,
+    zoom_center: tuple = None,
+    events_file: str = None,
+):
+    """Open an interactive matplotlib window for live simulation playback.
+
+    Args:
+        scenario_folder: Path containing *network*.xml
+        output_folder: Path containing *events*.csv
+        scale_factor: Scale factor for graph elements
+        text_scale_factor: Scale factor for text labels
+        show_labels: Whether to show text labels
+        initial_speed: Initial timesteps per frame tick
+        time_range: Optional (start_sec, end_sec) tuple to filter events
+    """
+    matplotlib.use("TkAgg")  # Interactive backend
+    from matplotlib.widgets import Button, Slider
+
+    print("🎬 TrafficGym Live Viewer")
+    print(f"   Scenario: {scenario_folder}")
+    print()
+
+    # 1. Parse
+    nodes, links = parse_network(scenario_folder)
+    events, max_time = parse_events(output_folder, events_file=events_file)
+
+    if events.empty:
+        print("⚠️  No events found. Nothing to render.")
+        return
+
+    # Filter by time range
+    events, max_time = _filter_events_by_time(events, max_time, time_range)
+    if events.empty:
+        print("⚠️  No events in the specified time range.")
+        return
+
+    # 2. Build agent timelines (Vectorized)
+    agent_ids, link_ids, states, links_mat, enters_mat, total_steps, per_step_stats = (
+        build_agent_timelines(events, max_time, links)
+    )
+    print(f"👥 {len(agent_ids)} agents, {total_steps} timesteps")
+
+    # Trim trailing frames
+    visible_counts = np.sum(states != STATE_GONE, axis=0)
+    last_visible = np.max(np.where(visible_counts > 0)[0]) if np.any(visible_counts > 0) else 0
+    total_steps = int(last_visible) + 1
+    print(f"   Trimmed to {total_steps} visible timesteps")
+
+    # 3. Adaptive sizing
+    num_nodes = len(nodes)
+    if num_nodes <= 10:
+        base_node, base_agent, base_fig = 28, 22, (10, 7)
+    elif num_nodes <= 50:
+        base_node, base_agent, base_fig = 18, 14, (12, 9)
+    elif num_nodes <= 500:
+        base_node, base_agent, base_fig = 10, 8, (16, 12)
+    else:
+        base_node, base_agent, base_fig = 5, 4, (20, 15)
+
+    node_size = base_node * scale_factor
+    agent_size = base_agent * scale_factor
+    fig_w = base_fig[0] * max(1.0, scale_factor**0.5)
+    fig_h = base_fig[1] * max(1.0, scale_factor**0.5)
+
+    # 4. Create figure with space for controls at the bottom
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h + 1.5), facecolor="#1a1a2e")
+    fig.subplots_adjust(bottom=0.18)
+
+    draw_network(
+        ax,
+        nodes,
+        links,
+        node_size,
+        scale_factor,
+        text_scale_factor,
+        show_labels,
+        zoom_factor,
+        zoom_center,
+    )
+
+    # State
+    state = {
+        "playing": False,
+        "current_frame": 0,
+        "speed": initial_speed,
+        "timer": None,
+        "artists": [],
+    }
+    disable_fanning = False
+
+    def draw_current():
+        for art in state["artists"]:
+            art.remove()
+        frame = state["current_frame"]
+
+        state["artists"] = _draw_agents_and_hud(
+            ax,
+            nodes,
+            links,
+            agent_ids,
+            link_ids,
+            states[:, frame],
+            links_mat[:, frame],
+            enters_mat[:, frame],
+            frame,
+            per_step_stats,
+            agent_size,
+            scale_factor,
+            show_labels,
+            disable_fanning,
+        )
+        fig.canvas.draw_idle()
+
+    # ─── Widgets ────────────────────────────────────────────────────────────
+
+    # Time scrubber slider
+    ax_time = fig.add_axes([0.15, 0.08, 0.55, 0.03], facecolor="#2a2a4a")
+    slider_time = Slider(ax_time, "t", 0, total_steps - 1, valinit=0, valstep=1, color="#6c63ff")
+
+    # Speed slider
+    max_speed = max(10, total_steps // 100)
+    ax_speed = fig.add_axes([0.15, 0.03, 0.35, 0.03], facecolor="#2a2a4a")
+    slider_speed = Slider(
+        ax_speed, "Speed", 1, max_speed, valinit=initial_speed, valstep=1, color="#ff6b6b"
+    )
+
+    # Play/Pause button
+    ax_btn = fig.add_axes([0.78, 0.03, 0.12, 0.05])
+    btn_play = Button(ax_btn, "▶ Play", color="#2a2a4a", hovercolor="#4a4a6a")
+    btn_play.label.set_color("white")
+
+    def on_time_change(val):
+        state["current_frame"] = int(val)
+        draw_current()
+
+    def on_speed_change(val):
+        state["speed"] = int(val)
+
+    def tick():
+        """Advance one tick while playing."""
+        if not state["playing"]:
+            return
+        new_frame = state["current_frame"] + state["speed"]
+        if new_frame >= total_steps:
+            new_frame = total_steps - 1
+            state["playing"] = False
+            btn_play.label.set_text("▶ Play")
+        state["current_frame"] = new_frame
+        slider_time.set_val(new_frame)
+        # Schedule next tick (~30ms target, enough for smooth UI)
+        if state["playing"]:
+            state["timer"] = fig.canvas.manager.window.after(30, tick)
+
+    def on_play_pause(event):
+        state["playing"] = not state["playing"]
+        if state["playing"]:
+            btn_play.label.set_text("Pause")
+            # Reset to start if at end
+            if state["current_frame"] >= total_steps - 1:
+                state["current_frame"] = 0
+                slider_time.set_val(0)
+            tick()
+        else:
+            btn_play.label.set_text("▶ Play")
+            if state["timer"] is not None:
+                fig.canvas.manager.window.after_cancel(state["timer"])
+                state["timer"] = None
+
+    slider_time.on_changed(on_time_change)
+    slider_speed.on_changed(on_speed_change)
+    btn_play.on_clicked(on_play_pause)
+
+    # Initial draw
+    draw_current()
+    print("🖥️  Live viewer ready. Close the window to exit.")
+    plt.show()

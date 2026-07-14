@@ -1,0 +1,86 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trafficgym"
+version = "0.1.0"
+description = "A GPU-accelerated multi-agent environment for traffic assignment and equilibrium research"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+keywords = ["traffic assignment", "multi-agent reinforcement learning", "dynamic network loading", "wardrop equilibrium", "pytorch"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    # Deep learning core
+    "torch>=2.1.0",
+    # Scientific computing
+    "numpy>=1.24.0",
+    "scipy>=1.10.0",
+    # RL / Environment framework
+    "gymnasium>=1.0.0",
+    "pettingzoo>=1.24.0",
+    # Graph / Network
+    "igraph>=0.10.0",
+    "networkx>=3.0",
+    # Data processing & visualisation
+    "matplotlib>=3.7.0",
+    "pandas>=2.0.0",
+    "pillow>=10.0.0",
+    "tqdm>=4.65.0",
+    # System monitoring (used in profiling utilities)
+    "psutil>=5.9.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.4.0",
+]
+geo = [
+    # Optional: only required for geo-visualisation scripts
+    "geopandas>=1.0.0",
+    "shapely>=2.0.0",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/anonymous/TrafficGym"
+"Bug Tracker" = "https://github.com/anonymous/TrafficGym/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["trafficgym*", "tamarl*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+# =============================================================================
+# Ruff — Linter & Formatter
+# =============================================================================
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+# E: pycodestyle errors, F: pyflakes, I: isort, UP: pyupgrade
+select = ["E", "F", "I", "UP"]
+ignore = [
+    "E501",   # line too long (handled by formatter)
+    "E741",   # ambiguous variable name (l, O, I) — common in math/tensor code
+    "F401",   # imported but unused — review manually
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["F401", "F811"]  # Test files may re-import for fixture purposes
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
