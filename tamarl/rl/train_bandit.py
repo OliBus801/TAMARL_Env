@@ -8,28 +8,38 @@ import argparse
 import json
 import os
 import time
-import numpy as np
-import torch
 from typing import Dict, List, Optional
 
+import numpy as np
+import torch
 from tqdm import tqdm
 
-from tamarl.envs.dta_bandit_env import DTABanditEnv
+from tamarl.core.memory_profiler import analyze_tensor_memory
 from tamarl.envs.agent_level_wrapper import AgentLevelWrapper
-from tamarl.envs.od_level_wrapper import ODLevelWrapper
 from tamarl.envs.centralized_level_wrapper import CentralizedLevelWrapper
 from tamarl.envs.components.metrics import (
-    compute_tstt, compute_mean_travel_time, compute_arrival_rate,
-    compute_travel_time_stats, compute_mean_episode_reward, compute_reward_stats,
+    compute_arrival_rate,
+    compute_mean_episode_reward,
+    compute_mean_travel_time,
+    compute_reward_stats,
+    compute_travel_time_stats,
+    compute_tstt,
 )
+from tamarl.envs.dta_bandit_env import DTABanditEnv
+from tamarl.envs.od_level_wrapper import ODLevelWrapper
 from tamarl.envs.scenario_loader import load_scenario
-from tamarl.rl.wandb_logger import WandbLogger
-from tamarl.rl.render_helper import render_episode
 from tamarl.rl.agents.random_agent import RandomAgent
-from tamarl.core.memory_profiler import analyze_tensor_memory
+from tamarl.rl.render_helper import render_episode
+from tamarl.rl.wandb_logger import WandbLogger
 
 
-def run_episode(env, agent, epsilon_ratio: float = 0.10, profile_memory: bool = False, return_raw_infos: bool = False):
+def run_episode(
+    env,
+    agent,
+    epsilon_ratio: float = 0.10,
+    profile_memory: bool = False,
+    return_raw_infos: bool = False,
+):
     """Run a single episode using the bandit paradigm.
 
     Génère un tenseur ``aggregation_indices`` [N] qui est passé uniformément
@@ -49,7 +59,7 @@ def run_episode(env, agent, epsilon_ratio: float = 0.10, profile_memory: bool = 
     """
     if profile_memory:
         analyze_tensor_memory("BEFORE EPISODE")
-    
+
     with torch.no_grad():
         obs, infos = env.reset()
     device = getattr(env, "_device", "cpu")
@@ -63,20 +73,18 @@ def run_episode(env, agent, epsilon_ratio: float = 0.10, profile_memory: bool = 
     else:
         aggregation_indices = torch.arange(N, device=device)
 
-    if hasattr(agent, 'get_actions_batched'):
+    if hasattr(agent, "get_actions_batched"):
         # Agents vectorisés : passage uniforme de aggregation_indices
         masks = infos.get("action_mask")
         obs_t = torch.from_numpy(obs).to(device)
         masks_t = torch.from_numpy(masks).to(device)
 
-        actions = agent.get_actions_batched(
-            obs_t, masks_t, aggregation_indices=aggregation_indices
-        )
+        actions = agent.get_actions_batched(obs_t, masks_t, aggregation_indices=aggregation_indices)
         actions = actions.detach().contiguous().cpu().numpy()
-    elif hasattr(agent, 'act'):
+    elif hasattr(agent, "act"):
         # Agents basiques (RandomAgent legacy)
         actions = agent.act()
-    elif hasattr(agent, 'predict'):
+    elif hasattr(agent, "predict"):
         # Compatibilité SB3
         actions, _ = agent.predict(obs)
     else:
@@ -86,7 +94,7 @@ def run_episode(env, agent, epsilon_ratio: float = 0.10, profile_memory: bool = 
     if isinstance(actions, torch.Tensor):
         actions = actions.detach().contiguous().cpu().numpy()
     elif isinstance(actions, np.ndarray):
-        pass # Already numpy
+        pass  # Already numpy
     else:
         # Probablement un scalaire ou une liste, on laisse tel quel ou on convertit si besoin
         pass
@@ -97,7 +105,7 @@ def run_episode(env, agent, epsilon_ratio: float = 0.10, profile_memory: bool = 
     wall_time = time.time() - t0
 
     # ── Mise à jour de l'agent ───────────────────────────────────────────
-    if hasattr(agent, 'update'):
+    if hasattr(agent, "update"):
         actions_t = torch.from_numpy(actions).to(device)
         rewards_t = torch.from_numpy(rewards).to(device)
 
@@ -110,25 +118,33 @@ def run_episode(env, agent, epsilon_ratio: float = 0.10, profile_memory: bool = 
         if valid_mask is not None:
             valid_mask_t = torch.from_numpy(valid_mask).to(device)
 
-        agent.update(actions_t, rewards_t, aggregation_indices=aggregation_indices,
-                     valid_mask=valid_mask_t)
+        agent.update(
+            actions_t, rewards_t, aggregation_indices=aggregation_indices, valid_mask=valid_mask_t
+        )
 
     if profile_memory:
         analyze_tensor_memory("AFTER EPISODE")
-    
+
     stats = _compute_stats(env, rewards, infos, wall_time, len(actions), epsilon_ratio)
     if return_raw_infos:
         return stats, infos
     return stats
 
 
-def _compute_stats(env: AgentLevelWrapper, rewards: np.ndarray, infos: dict, wall_time: float, n_decisions: int, epsilon_ratio: float = 0.10) -> dict:
+def _compute_stats(
+    env: AgentLevelWrapper,
+    rewards: np.ndarray,
+    infos: dict,
+    wall_time: float,
+    n_decisions: int,
+    epsilon_ratio: float = 0.10,
+) -> dict:
     """Compute metrics from a completed episode."""
     # Use only valid (departed) legs for all metrics
     tt = infos["_episode"]["t"]  # already filtered by valid_leg_mask in wrapper
     mean_tt = infos["mean_travel_time"]
     tstt = tt.sum()
-    
+
     # In the bandit setup, the simulation runs until all agents finish or max_steps is reached.
     # We can check arrival rate using the DNL's status
     arrival_rate = float((env.bandit.dnl.status >= 3).float().mean().cpu())
@@ -137,67 +153,78 @@ def _compute_stats(env: AgentLevelWrapper, rewards: np.ndarray, infos: dict, wal
     valid_rewards = infos["_episode"]["r"]
 
     stats = {
-        'tstt': float(tstt),
-        'mean_travel_time': mean_tt,
-        'arrival_rate': arrival_rate,
-        'mean_reward': float(valid_rewards.mean()) if valid_rewards.size > 0 else 0.0,
-        'episode_length': int(env.bandit.dnl.current_step),  # Number of simulation steps taken
-        'n_decisions': n_decisions,
-        'tt_std': float(np.std(tt)) if tt.size > 0 else 0.0,
-        'tt_min': float(np.min(tt)) if tt.size > 0 else 0.0,
-        'tt_max': float(np.max(tt)) if tt.size > 0 else 0.0,
-        'tt_median': float(np.median(tt)) if tt.size > 0 else 0.0,
-        'tt_p90': float(np.percentile(tt, 90)) if tt.size > 0 else 0.0,
-        'tt_p95': float(np.percentile(tt, 95)) if tt.size > 0 else 0.0,
-        'reward_std': float(np.std(valid_rewards)) if valid_rewards.size > 0 else 0.0,
-        'reward_min': float(np.min(valid_rewards)) if valid_rewards.size > 0 else 0.0,
-        'reward_max': float(np.max(valid_rewards)) if valid_rewards.size > 0 else 0.0,
-        'wall_time': wall_time
+        "tstt": float(tstt),
+        "mean_travel_time": mean_tt,
+        "arrival_rate": arrival_rate,
+        "mean_reward": float(valid_rewards.mean()) if valid_rewards.size > 0 else 0.0,
+        "episode_length": int(env.bandit.dnl.current_step),  # Number of simulation steps taken
+        "n_decisions": n_decisions,
+        "tt_std": float(np.std(tt)) if tt.size > 0 else 0.0,
+        "tt_min": float(np.min(tt)) if tt.size > 0 else 0.0,
+        "tt_max": float(np.max(tt)) if tt.size > 0 else 0.0,
+        "tt_median": float(np.median(tt)) if tt.size > 0 else 0.0,
+        "tt_p90": float(np.percentile(tt, 90)) if tt.size > 0 else 0.0,
+        "tt_p95": float(np.percentile(tt, 95)) if tt.size > 0 else 0.0,
+        "reward_std": float(np.std(valid_rewards)) if valid_rewards.size > 0 else 0.0,
+        "reward_min": float(np.min(valid_rewards)) if valid_rewards.size > 0 else 0.0,
+        "reward_max": float(np.max(valid_rewards)) if valid_rewards.size > 0 else 0.0,
+        "wall_time": wall_time,
     }
-    
+
     # Report masked legs count
     n_masked = infos.get("n_masked_legs", 0)
     if n_masked > 0:
-        stats['n_masked_legs'] = n_masked
+        stats["n_masked_legs"] = n_masked
 
     # Report imputed legs count
     n_imputed = infos.get("n_imputed_legs", 0)
     if n_imputed > 0:
-        stats['n_imputed_legs'] = n_imputed
-    
+        stats["n_imputed_legs"] = n_imputed
+
     # Pull empirical Nash metrics from infos (computed in AgentLevelWrapper.step)
-    for k in ['mean_regret', 'max_regret', 'std_regret', 'epsilon_compliance_rate']:
+    for k in ["mean_regret", "max_regret", "std_regret", "epsilon_compliance_rate"]:
         if k in infos:
             stats[k] = infos[k]
 
     return stats
 
 
-def _aggregate_stats(window: List[Dict]) -> Dict[str, float]:
+def _aggregate_stats(window: list[dict]) -> dict[str, float]:
     """Aggregate stats over a window of episodes."""
-    keys = ['tstt', 'mean_travel_time', 'arrival_rate', 'mean_reward',
-            'episode_length', 'n_decisions', 'tt_p90', 'tt_p95',
-            'wall_time', 'mean_regret', 'max_regret', 'std_regret',
-            'epsilon_compliance_rate']
+    keys = [
+        "tstt",
+        "mean_travel_time",
+        "arrival_rate",
+        "mean_reward",
+        "episode_length",
+        "n_decisions",
+        "tt_p90",
+        "tt_p95",
+        "wall_time",
+        "mean_regret",
+        "max_regret",
+        "std_regret",
+        "epsilon_compliance_rate",
+    ]
     agg = {}
     for k in keys:
         vals = [s[k] for s in window if k in s]
         if vals:
-            agg[f'{k}_mean'] = float(np.mean(vals))
-            agg[f'{k}_std'] = float(np.std(vals))
+            agg[f"{k}_mean"] = float(np.mean(vals))
+            agg[f"{k}_std"] = float(np.std(vals))
     return agg
 
 
 def train(
     scenario_path: str,
-    population_filter: Optional[str] = None,
+    population_filter: str | None = None,
     n_episodes: int = 5,
     max_steps: int = 86400,
     stuck_threshold: int = 10,
     timestep: float = 1.0,
     scale_factor: float = 1.0,
     device: str = "cpu",
-    seed: Optional[int] = None,
+    seed: int | None = None,
     # Agent
     agent_type: str = "random",
     top_k_paths: int = 3,
@@ -206,16 +233,16 @@ def train(
     # Logging
     log_interval: int = 100,
     # Render
-    render: Optional[str] = None,
-    render_format: str = 'gif',
+    render: str | None = None,
+    render_format: str = "gif",
     render_fps: int = 5,
-    render_hours: Optional[tuple] = None,
+    render_hours: tuple | None = None,
     render_speed: int = 1,
     # W&B
     wandb_enabled: bool = False,
     wandb_project: str = "tamarl",
-    wandb_tags: Optional[list] = None,
-    wandb_agent: Optional[str] = None,
+    wandb_tags: list | None = None,
+    wandb_agent: str | None = None,
     # Metrics
     epsilon_ratio: float = 0.10,
     link_tt_interval: float = 60.0,
@@ -228,7 +255,7 @@ def train(
     ucb_c: float = 100.0,
     # Thompson Sampling
     ts_prior_std: float = 10000.0,
-    ts_env_std: Optional[float] = None,
+    ts_env_std: float | None = None,
     # Exp3
     exp3_eta: float = 0.01,
     exp3_gamma: float = 0.05,
@@ -240,7 +267,7 @@ def train(
     profile_memory: bool = False,
     # Sanity Checks
     sanity_checks: bool = False,
-    macro_od_size: Optional[float] = None,
+    macro_od_size: float | None = None,
     # Save Pickles
     save_pickle: bool = False,
 ):
@@ -256,7 +283,7 @@ def train(
         seed: random seed
         log_interval: compute & log detailed metrics every N episodes
     """
-    scenario_name = os.path.basename(scenario_path.rstrip('/'))
+    scenario_name = os.path.basename(scenario_path.rstrip("/"))
 
     scenario_id = scenario_name
     if population_filter:
@@ -264,45 +291,46 @@ def train(
 
     # ── Config ──
     config = {
-        'scenario_path': scenario_path,
-        'population_filter': population_filter,
-        'n_episodes': n_episodes,
-        'max_steps': max_steps,
-        'stuck_threshold': stuck_threshold,
-        'timestep': timestep,
-        'scale_factor': scale_factor,
-        'device': device,
-        'seed': seed,
-        'log_interval': log_interval,
-        'agent_type': agent_type,
-        'top_k_paths': top_k_paths,
-        'formulation': formulation,
-        'bandit_feedback': bandit_feedback,
-        'epsilon_ratio': epsilon_ratio,
-        'epsilon_alpha': epsilon_alpha,
-        'ucb_c': ucb_c,
-        'ts_prior_std': ts_prior_std,
-        'ts_env_std': ts_env_std,
-        'exp3_eta': exp3_eta,
-        'exp3_gamma': exp3_gamma,
-        'rd_beta': rd_beta,
-        'reload_paths': reload_paths,
-        'wandb_agent': wandb_agent,
+        "scenario_path": scenario_path,
+        "population_filter": population_filter,
+        "n_episodes": n_episodes,
+        "max_steps": max_steps,
+        "stuck_threshold": stuck_threshold,
+        "timestep": timestep,
+        "scale_factor": scale_factor,
+        "device": device,
+        "seed": seed,
+        "log_interval": log_interval,
+        "agent_type": agent_type,
+        "top_k_paths": top_k_paths,
+        "formulation": formulation,
+        "bandit_feedback": bandit_feedback,
+        "epsilon_ratio": epsilon_ratio,
+        "epsilon_alpha": epsilon_alpha,
+        "ucb_c": ucb_c,
+        "ts_prior_std": ts_prior_std,
+        "ts_env_std": ts_env_std,
+        "exp3_eta": exp3_eta,
+        "exp3_gamma": exp3_gamma,
+        "rd_beta": rd_beta,
+        "reload_paths": reload_paths,
+        "wandb_agent": wandb_agent,
     }
 
-
-    print(f"{'='*65}")
-    print(f"  One-Shot Bandit DTA — Training Runner")
-    print(f"{'='*65}")
+    print(f"{'=' * 65}")
+    print("  One-Shot Bandit DTA — Training Runner")
+    print(f"{'=' * 65}")
     print(f"  Scenario:      {scenario_path}")
     print(f"  Population:    {population_filter}")
     print(f"  Agent:         {agent_type}")
-    print(f"  Episodes:      {n_episodes} | Max steps: {max_steps} | Stuck threshold: {stuck_threshold}")
+    print(
+        f"  Episodes:      {n_episodes} | Max steps: {max_steps} | Stuck threshold: {stuck_threshold}"
+    )
     print(f"  Log interval:  every {log_interval} episodes")
     print(f"  Device:        {device} | Seed: {seed}")
     print(f"  Top-k Paths:   {top_k_paths} | Scale Factor: {scale_factor}")
     print(f"  Formulation:   {formulation} | Feedback: {bandit_feedback}")
-    print(f"{'='*65}\n")
+    print(f"{'=' * 65}\n")
 
     # ── W&B init ──
     logger = WandbLogger(
@@ -316,9 +344,9 @@ def train(
     )
 
     # ── Environment ──
-    need_events = render == 'interval'
+    need_events = render == "interval"
     need_render = render is not None
-    
+
     # 1. Init DTABanditEnv
     bandit = DTABanditEnv(
         scenario_path=scenario_path,
@@ -334,7 +362,7 @@ def train(
         profile_memory=profile_memory,
         save_pickle=save_pickle,
     )
-    
+
     # 2. Wrap it in the appropriate wrapper (based on formulation)
     if formulation == "agent":
         env = AgentLevelWrapper(
@@ -375,7 +403,7 @@ def train(
     # Dynamic Priors Logic (used by Thompson Sampling and Epsilon Greedy)
     prior_means = None
     ts_env_stds = None
-    
+
     if hasattr(env, "fftt_matrix") and hasattr(env, "od_indices_all_legs"):
         if formulation == "od_pair":
             # OD-pair formulation: priors are per OD pair [num_od_pairs, K]
@@ -407,6 +435,7 @@ def train(
 
     if agent_type == "epsilon_greedy":
         from tamarl.rl.agents.epsilon_greedy_agent import EpsilonGreedyAgent
+
         agent = EpsilonGreedyAgent(
             num_agents=num_agent_models,
             k_paths=top_k_paths,
@@ -416,19 +445,17 @@ def train(
             epsilon_decay=epsilon_decay,
             alpha=epsilon_alpha,
             device=device,
-            seed=seed
+            seed=seed,
         )
     elif agent_type == "ucb":
         from tamarl.rl.agents.ucb_agent import UCBAgent
+
         agent = UCBAgent(
-            num_agents=num_agent_models,
-            k_paths=top_k_paths,
-            c_exploration=ucb_c,
-            device=device
+            num_agents=num_agent_models, k_paths=top_k_paths, c_exploration=ucb_c, device=device
         )
     elif agent_type == "ts":
         from tamarl.rl.agents.thompson_sampling_agent import ThompsonSamplingAgent
-        
+
         agent = ThompsonSamplingAgent(
             num_agents=num_agent_models,
             k_paths=top_k_paths,
@@ -436,12 +463,12 @@ def train(
             prior_std=ts_prior_std,
             env_std=ts_env_stds,
             device=device,
-            seed=seed
+            seed=seed,
         )
 
     elif agent_type == "exp3":
         from tamarl.rl.agents.exp3_agent import Exp3Agent
-        
+
         # Calculate rho: 2 * max freeflow travel time among all valid paths
         rho = 1.0
         if hasattr(env, "fftt_matrix"):
@@ -449,7 +476,7 @@ def train(
             valid_fftts = env.fftt_matrix[env.fftt_matrix != np.inf]
             if len(valid_fftts) > 0:
                 rho = float(np.max(valid_fftts)) * 2.0
-                
+
         agent = Exp3Agent(
             num_agents=num_agent_models,
             k_paths=top_k_paths,
@@ -457,11 +484,12 @@ def train(
             gamma=exp3_gamma,
             rho=rho,
             device=device,
-            seed=seed
+            seed=seed,
         )
 
     elif agent_type == "rd":
         from tamarl.rl.agents.replicator_dynamics_agent import ReplicatorDynamicsAgent
+
         agent = ReplicatorDynamicsAgent(
             num_agents=num_agent_models,
             k_paths=top_k_paths,
@@ -471,21 +499,22 @@ def train(
             epsilon_end=epsilon_end,
             epsilon_decay=epsilon_decay,
             device=device,
-            seed=seed
+            seed=seed,
         )
 
     elif agent_type == "frank_wolfe":
         from tamarl.rl.agents.frank_wolfe_agent import FrankWolfeBanditAgent
+
         agent = FrankWolfeBanditAgent(
-            env=env,
-            num_edges=env.bandit.scenario.num_edges,
-            device=device
+            env=env, num_edges=env.bandit.scenario.num_edges, device=device
         )
     elif agent_type == "aon":
         from tamarl.rl.agents.aon_agent import AONAgent
+
         agent = AONAgent(seed=seed)
     elif agent_type == "msa":
         from tamarl.rl.agents.msa_agent import MSAAgent
+
         agent = MSAAgent(
             env=env,
             k_paths=top_k_paths,
@@ -494,6 +523,7 @@ def train(
         )
     elif agent_type == "evo_swap":
         from tamarl.rl.agents.evo_swap_agent import EvoSwapAgent
+
         agent = EvoSwapAgent(
             env=env,
             k_paths=top_k_paths,
@@ -505,10 +535,13 @@ def train(
         )
     else:
         from tamarl.rl.agents.random_agent import RandomAgent
+
         agent = RandomAgent(num_agents=env.num_envs, k=top_k_paths, seed=seed)
 
-    print(f"Environment: {env.bandit.num_agents} agents, "
-          f"{env.bandit.scenario.num_edges} edges, {env.bandit.scenario.num_nodes} nodes")
+    print(
+        f"Environment: {env.bandit.num_agents} agents, "
+        f"{env.bandit.scenario.num_edges} edges, {env.bandit.scenario.num_nodes} nodes"
+    )
     _wrapper_names = {
         "agent": "AgentLevelWrapper",
         "od_pair": "ODLevelWrapper",
@@ -524,12 +557,14 @@ def train(
     print(f"Agent models: {num_agent_models} (formulation={formulation})")
     print(f"Agent: {agent}\n")
 
-    logger.log_config({
-        'num_agents': env.bandit.num_agents,
-        'num_edges': env.bandit.scenario.num_edges,
-        'num_nodes': env.bandit.scenario.num_nodes,
-        'bandit_top_k': top_k_paths,
-    })
+    logger.log_config(
+        {
+            "num_agents": env.bandit.num_agents,
+            "num_edges": env.bandit.scenario.num_edges,
+            "num_nodes": env.bandit.scenario.num_nodes,
+            "bandit_top_k": top_k_paths,
+        }
+    )
 
     # Load scenario data (required for rendering reverse mapping)
     idx_to_link_id = None
@@ -543,11 +578,11 @@ def train(
     all_stats = []
     window_stats = []
     cumulative_max_regret = 0.0
-    
+
     # ── Sanity Check tracking ──
-    best_mean_tt = float('inf')
-    best_sanity_data = None          # Will hold CPU tensors for the best episode
-    
+    best_mean_tt = float("inf")
+    best_sanity_data = None  # Will hold CPU tensors for the best episode
+
     route_allocation_history = []
     major_od_idx = None
     major_od_count = 0
@@ -556,14 +591,16 @@ def train(
         od_counts = torch.bincount(od_indices)
         major_od_idx = int(torch.argmax(od_counts).item())
         major_od_count = int(od_counts[major_od_idx].item())
-        print(f"  Sanity Checks: Identified major OD pair {major_od_idx} with {major_od_count} agents.")
+        print(
+            f"  Sanity Checks: Identified major OD pair {major_od_idx} with {major_od_count} agents."
+        )
 
     pbar = tqdm(range(n_episodes), desc="Training", unit="ep", dynamic_ncols=True)
 
     for ep in pbar:
         # Determine if this episode requires full metric logging
         is_log_step = (ep == 0) or ((ep + 1) % log_interval == 0) or (ep == n_episodes - 1)
-        
+
         # Configure env to collect metric if RGap is enabled
         needs_tt = is_log_step
         # MSA and EvoSwap agents always need collect_link_tt (TD evaluator requirement)
@@ -575,7 +612,7 @@ def train(
         env.bandit.collect_link_tt = needs_tt
 
         # Enable event tracking for rendering if it's the last episode and render == 'end'
-        if ep == n_episodes - 1 and render == 'end':
+        if ep == n_episodes - 1 and render == "end":
             env.bandit._track_events = True
             env.bandit.collect_link_tt = True
 
@@ -584,68 +621,85 @@ def train(
             agent.decay_epsilon()
 
         # Run the episode, optionally returning raw infos for sanity checks
-        result = run_episode(env, agent, epsilon_ratio, profile_memory=profile_memory,
-                             return_raw_infos=sanity_checks)
+        result = run_episode(
+            env, agent, epsilon_ratio, profile_memory=profile_memory, return_raw_infos=sanity_checks
+        )
         if sanity_checks:
             stats, raw_infos = result
         else:
             stats = result
             raw_infos = None
-        
+
         # Accumulate cumulative regret
-        if 'max_regret' in stats:
-            cumulative_max_regret += stats['max_regret']
-        stats['cumulative_max_regret'] = cumulative_max_regret
+        if "max_regret" in stats:
+            cumulative_max_regret += stats["max_regret"]
+        stats["cumulative_max_regret"] = cumulative_max_regret
 
         # Update agent state at end of episode if supported (e.g. UCB)
         if hasattr(agent, "end_episode"):
             agent.end_episode()
 
-
         # ── Sanity Check: track best episode & histogram regrets ──────
         if sanity_checks and raw_infos is not None:
-            current_mean_tt = stats['mean_travel_time']
+            current_mean_tt = stats["mean_travel_time"]
             if current_mean_tt < best_mean_tt:
                 best_mean_tt = current_mean_tt
                 # Clone only the data needed for plots 1 & 2 to CPU
                 best_sanity_data = {
-                    'episode': ep,
-                    'mean_tt': current_mean_tt,
-                    'realized_tt': torch.from_numpy(raw_infos['_episode']['t']).cpu(),
-                    'fftt_chosen': torch.from_numpy(raw_infos['fftt_chosen']).cpu(),
-                    'original_leg_idx': raw_infos.get('original_leg_idx'),
-                    'planned_dep': torch.from_numpy(raw_infos['_episode']['planned_dep']).cpu() if 'planned_dep' in raw_infos['_episode'] else None,
-                    'actual_dep': torch.from_numpy(raw_infos['_episode']['actual_dep']).cpu() if 'actual_dep' in raw_infos['_episode'] else None,
-                    'arrival': torch.from_numpy(raw_infos['_episode']['arrival']).cpu() if 'arrival' in raw_infos['_episode'] else None,
-                    'chosen_path_idx': torch.from_numpy(raw_infos['_episode']['act']).cpu() if 'act' in raw_infos['_episode'] else None,
+                    "episode": ep,
+                    "mean_tt": current_mean_tt,
+                    "realized_tt": torch.from_numpy(raw_infos["_episode"]["t"]).cpu(),
+                    "fftt_chosen": torch.from_numpy(raw_infos["fftt_chosen"]).cpu(),
+                    "original_leg_idx": raw_infos.get("original_leg_idx"),
+                    "planned_dep": torch.from_numpy(raw_infos["_episode"]["planned_dep"]).cpu()
+                    if "planned_dep" in raw_infos["_episode"]
+                    else None,
+                    "actual_dep": torch.from_numpy(raw_infos["_episode"]["actual_dep"]).cpu()
+                    if "actual_dep" in raw_infos["_episode"]
+                    else None,
+                    "arrival": torch.from_numpy(raw_infos["_episode"]["arrival"]).cpu()
+                    if "arrival" in raw_infos["_episode"]
+                    else None,
+                    "chosen_path_idx": torch.from_numpy(raw_infos["_episode"]["act"]).cpu()
+                    if "act" in raw_infos["_episode"]
+                    else None,
                 }
                 # V/C data: clone interval counts from DNL
-                if hasattr(env.bandit.dnl, 'interval_tt_count') and env.bandit.collect_link_tt:
-                    best_sanity_data['link_counts'] = env.bandit.dnl.interval_tt_count.clone().cpu()
-                    best_sanity_data['flow_capacity_per_step'] = env.bandit.dnl.flow_capacity_per_step.clone().cpu()
-                    best_sanity_data['link_tt_interval'] = env.bandit.dnl.link_tt_interval
-                    best_sanity_data['dt'] = env.bandit.dnl.dt
+                if hasattr(env.bandit.dnl, "interval_tt_count") and env.bandit.collect_link_tt:
+                    best_sanity_data["link_counts"] = env.bandit.dnl.interval_tt_count.clone().cpu()
+                    best_sanity_data["flow_capacity_per_step"] = (
+                        env.bandit.dnl.flow_capacity_per_step.clone().cpu()
+                    )
+                    best_sanity_data["link_tt_interval"] = env.bandit.dnl.link_tt_interval
+                    best_sanity_data["dt"] = env.bandit.dnl.dt
 
                 # Save extra data for new sanity check plots
-                best_sanity_data['od_indices'] = env.od_indices_all_legs.cpu() if hasattr(env, "od_indices_all_legs") else None
-                best_sanity_data['unique_od'] = env.unique_od if hasattr(env, "unique_od") else None
-                best_sanity_data['major_od_idx'] = major_od_idx
-                best_sanity_data['major_od_count'] = major_od_count
-                best_sanity_data['routes_flat_csr'] = env.routes_flat_csr.cpu() if hasattr(env, "routes_flat_csr") else None
-                best_sanity_data['K'] = top_k_paths
-                best_sanity_data['macro_od_size'] = macro_od_size
-                best_sanity_data['node_coords'] = env.bandit.scenario.node_coords.cpu() if hasattr(env.bandit.scenario, "node_coords") else None
+                best_sanity_data["od_indices"] = (
+                    env.od_indices_all_legs.cpu() if hasattr(env, "od_indices_all_legs") else None
+                )
+                best_sanity_data["unique_od"] = env.unique_od if hasattr(env, "unique_od") else None
+                best_sanity_data["major_od_idx"] = major_od_idx
+                best_sanity_data["major_od_count"] = major_od_count
+                best_sanity_data["routes_flat_csr"] = (
+                    env.routes_flat_csr.cpu() if hasattr(env, "routes_flat_csr") else None
+                )
+                best_sanity_data["K"] = top_k_paths
+                best_sanity_data["macro_od_size"] = macro_od_size
+                best_sanity_data["node_coords"] = (
+                    env.bandit.scenario.node_coords.cpu()
+                    if hasattr(env.bandit.scenario, "node_coords")
+                    else None
+                )
 
             # Track route allocation for the major OD pair for all episodes
-            if major_od_idx is not None and 'act' in raw_infos.get('_episode', {}):
-                act_np = raw_infos['_episode']['act']
-                valid_mask = raw_infos.get('valid_leg_mask', np.ones(len(act_np), dtype=bool))
+            if major_od_idx is not None and "act" in raw_infos.get("_episode", {}):
+                act_np = raw_infos["_episode"]["act"]
                 # Reconstruct full array to match od_indices length, or use original_leg_idx
-                if 'original_leg_idx' in raw_infos:
-                    original_leg_idx = raw_infos['original_leg_idx']
+                if "original_leg_idx" in raw_infos:
+                    original_leg_idx = raw_infos["original_leg_idx"]
                     # Get ODs for the valid legs
                     valid_ods = env.od_indices_all_legs.cpu().numpy()[original_leg_idx]
-                    major_od_mask = (valid_ods == major_od_idx)
+                    major_od_mask = valid_ods == major_od_idx
                     major_acts = act_np[major_od_mask]
                     if len(major_acts) > 0:
                         counts = np.bincount(major_acts, minlength=top_k_paths)
@@ -658,8 +712,8 @@ def train(
         window_stats.append(stats)
 
         postfix = {
-            'Mean TT': f"{stats['mean_travel_time']:.0f}",
-            'Arr': f"{stats['arrival_rate']*100:.0f}%",
+            "Mean TT": f"{stats['mean_travel_time']:.0f}",
+            "Arr": f"{stats['arrival_rate'] * 100:.0f}%",
         }
         pbar.set_postfix(postfix)
 
@@ -673,46 +727,62 @@ def train(
                 f"({len(window_stats)} eps) ───────────────────────"
             )
             tqdm.write(f"  │ TSTT:       {agg['tstt_mean']:.0f} ± {agg['tstt_std']:.0f}")
-            tqdm.write(f"  │ Mean TT:    {agg['mean_travel_time_mean']:.1f} ± {agg['mean_travel_time_std']:.1f}")
-            if 'mean_regret_mean' in agg:
+            tqdm.write(
+                f"  │ Mean TT:    {agg['mean_travel_time_mean']:.1f} ± {agg['mean_travel_time_std']:.1f}"
+            )
+            if "mean_regret_mean" in agg:
                 tqdm.write(f"  │ Max Regret: {agg['max_regret_mean']:.1f}s")
                 tqdm.write(f"  │ Cum Regret: {stats['cumulative_max_regret']:.1f}s")
-                tqdm.write(f"  │ ε-Compl:    {agg['epsilon_compliance_rate_mean']*100:.1f}%")
-            tqdm.write(f"  │ p95:        {agg.get('tt_p95_mean', 0):.1f} ± {agg.get('tt_p95_std', 0):.1f}")
-            tqdm.write(f"  │ Arrival:    {agg['arrival_rate_mean']*100:.1f}%")
-            tqdm.write(f"  │ Length:     {agg['episode_length_mean']:.1f} ± {agg['episode_length_std']:.1f}")
-            tqdm.write(f"  │ Reward:     {agg['mean_reward_mean']:.1f} ± {agg['mean_reward_std']:.1f}")
-            tqdm.write(f"  └─────────────────────────────────────────────")
+                tqdm.write(f"  │ ε-Compl:    {agg['epsilon_compliance_rate_mean'] * 100:.1f}%")
+            tqdm.write(
+                f"  │ p95:        {agg.get('tt_p95_mean', 0):.1f} ± {agg.get('tt_p95_std', 0):.1f}"
+            )
+            tqdm.write(f"  │ Arrival:    {agg['arrival_rate_mean'] * 100:.1f}%")
+            tqdm.write(
+                f"  │ Length:     {agg['episode_length_mean']:.1f} ± {agg['episode_length_std']:.1f}"
+            )
+            tqdm.write(
+                f"  │ Reward:     {agg['mean_reward_mean']:.1f} ± {agg['mean_reward_std']:.1f}"
+            )
+            tqdm.write("  └─────────────────────────────────────────────")
 
             # W&B logging: log aggregated metrics into folders
             wandb_metrics = {
-                'metrics/TSTT': agg['tstt_mean'],
-                'metrics/Mean TT': agg['mean_travel_time_mean'],
-                'metrics/Arrival Rate': agg['arrival_rate_mean'],
-                'metrics/Mean Reward': agg['mean_reward_mean'],
+                "metrics/TSTT": agg["tstt_mean"],
+                "metrics/Mean TT": agg["mean_travel_time_mean"],
+                "metrics/Arrival Rate": agg["arrival_rate_mean"],
+                "metrics/Mean Reward": agg["mean_reward_mean"],
             }
-            if 'mean_regret_mean' in agg:
-                wandb_metrics['metrics/Mean Nash Regret'] = agg['mean_regret_mean']
-                wandb_metrics['metrics/Max Nash Regret'] = agg['max_regret_mean']
-                wandb_metrics['metrics/Cumulative Nash Regret'] = stats['cumulative_max_regret']
-                wandb_metrics['metrics/Epsilon Compliance'] = agg['epsilon_compliance_rate_mean']
-            
+            if "mean_regret_mean" in agg:
+                wandb_metrics["metrics/Mean Nash Regret"] = agg["mean_regret_mean"]
+                wandb_metrics["metrics/Max Nash Regret"] = agg["max_regret_mean"]
+                wandb_metrics["metrics/Cumulative Nash Regret"] = stats["cumulative_max_regret"]
+                wandb_metrics["metrics/Epsilon Compliance"] = agg["epsilon_compliance_rate_mean"]
+
             if hasattr(agent, "epsilon"):
-                wandb_metrics['agent/epsilon'] = agent.epsilon
+                wandb_metrics["agent/epsilon"] = agent.epsilon
             if hasattr(agent, "entropy"):
-                wandb_metrics['agent/entropy'] = agent.entropy
+                wandb_metrics["agent/entropy"] = agent.entropy
 
             for k, v in agg.items():
-                if k not in ['tstt_mean', 'mean_travel_time_mean',
-                             'arrival_rate_mean', 'mean_reward_mean', 'mean_regret_mean',
-                             'max_regret_mean', 'epsilon_compliance_rate_mean']:
-                    nice_name = k.replace('_', ' ').title().replace('Tstt', 'TSTT').replace('Tt ', 'TT ')
-                    wandb_metrics[f'charts/{nice_name}'] = v
+                if k not in [
+                    "tstt_mean",
+                    "mean_travel_time_mean",
+                    "arrival_rate_mean",
+                    "mean_reward_mean",
+                    "mean_regret_mean",
+                    "max_regret_mean",
+                    "epsilon_compliance_rate_mean",
+                ]:
+                    nice_name = (
+                        k.replace("_", " ").title().replace("Tstt", "TSTT").replace("Tt ", "TT ")
+                    )
+                    wandb_metrics[f"charts/{nice_name}"] = v
 
             logger.log_episode(ep, wandb_metrics)
 
             # ── Render at interval ──
-            if render == 'interval' and need_events:
+            if render == "interval" and need_events:
                 tqdm.write(f"  🎬 Rendering episode {ep + 1}...")
                 render_episode(
                     scenario_path=scenario_path,
@@ -729,9 +799,9 @@ def train(
             window_stats = []
 
     # ── Final Summary ──
-    print(f"\n{'='*65}")
+    print(f"\n{'=' * 65}")
     print(f"  Summary ({n_episodes} episodes)")
-    print(f"{'='*65}")
+    print(f"{'=' * 65}")
 
     def _fmt(key):
         vals = [s[key] for s in all_stats if key in s]
@@ -741,35 +811,37 @@ def train(
 
     print(f"  TSTT:             {_fmt('tstt')}")
     print(f"  Mean TT:          {_fmt('mean_travel_time')}")
-    if any('max_regret' in s for s in all_stats):
+    if any("max_regret" in s for s in all_stats):
         print(f"  Max Regret:       {_fmt('max_regret')}s")
         print(f"  Cum Regret:       {cumulative_max_regret:.1f}s")
-        compl_vals = [s['epsilon_compliance_rate'] for s in all_stats if 'epsilon_compliance_rate' in s]
-        print(f"  Epsilon Compl:    {np.mean(compl_vals)*100:.1f}%")
+        compl_vals = [
+            s["epsilon_compliance_rate"] for s in all_stats if "epsilon_compliance_rate" in s
+        ]
+        print(f"  Epsilon Compl:    {np.mean(compl_vals) * 100:.1f}%")
     print(f"  TT p95:           {_fmt('tt_p95')}")
-    print(f"  Arrival:          {np.mean([s['arrival_rate'] for s in all_stats])*100:.1f}%")
+    print(f"  Arrival:          {np.mean([s['arrival_rate'] for s in all_stats]) * 100:.1f}%")
     print(f"  Episode Length:   {_fmt('episode_length')}")
     print(f"  Mean Reward:      {_fmt('mean_reward')}")
-    print(f"{'='*65}")
+    print(f"{'=' * 65}")
 
     # Log summary to W&B
-    tstt_vals = [s['tstt'] for s in all_stats]
+    tstt_vals = [s["tstt"] for s in all_stats]
     summary = {
-        'metrics/TSTT Mean': float(np.mean(tstt_vals)),
-        'charts/TSTT Std': float(np.std(tstt_vals)),
-        'metrics/Arrival Rate Mean': float(np.mean([s['arrival_rate'] for s in all_stats])),
-        'metrics/Mean Reward Mean': float(np.mean([s['mean_reward'] for s in all_stats])),
+        "metrics/TSTT Mean": float(np.mean(tstt_vals)),
+        "charts/TSTT Std": float(np.std(tstt_vals)),
+        "metrics/Arrival Rate Mean": float(np.mean([s["arrival_rate"] for s in all_stats])),
+        "metrics/Mean Reward Mean": float(np.mean([s["mean_reward"] for s in all_stats])),
     }
-    
-    if any('max_regret' in s for s in all_stats):
-        summary['metrics/Cumulative Nash Regret Final'] = float(cumulative_max_regret)
-        
+
+    if any("max_regret" in s for s in all_stats):
+        summary["metrics/Cumulative Nash Regret Final"] = float(cumulative_max_regret)
+
     logger.log_summary(summary)
     logger.finish()
 
     # ── Render at end ──
-    if render == 'end' and env.bandit._track_events:
-        tqdm.write(f"\n🎬 Rendering final training episode...")
+    if render == "end" and env.bandit._track_events:
+        tqdm.write("\n🎬 Rendering final training episode...")
         render_episode(
             scenario_path=scenario_path,
             dnl=env.bandit.dnl,
@@ -785,6 +857,7 @@ def train(
     # ── Sanity Check Plots ──
     if sanity_checks and best_sanity_data is not None:
         from tamarl.visualisation.sanity_checks import generate_sanity_checks
+
         run_name = f"{agent_type}-seed{seed}"
         output_dir = os.path.join(scenario_path, run_name, "graphs")
         os.makedirs(output_dir, exist_ok=True)
@@ -793,7 +866,12 @@ def train(
         generate_sanity_checks(
             best_sanity_data=best_sanity_data,
             regret_history=[
-                (s.get('mean_regret'), s.get('max_regret'), s.get('std_regret'), s.get('epsilon_compliance_rate'))
+                (
+                    s.get("mean_regret"),
+                    s.get("max_regret"),
+                    s.get("std_regret"),
+                    s.get("epsilon_compliance_rate"),
+                )
                 for s in all_stats
             ],
             route_allocation_history=route_allocation_history,
@@ -809,7 +887,7 @@ def train(
 
 def load_config(config_path: str) -> dict:
     """Load a JSON config file and map it to flat train() kwargs."""
-    with open(config_path, "r") as f:
+    with open(config_path) as f:
         cfg = json.load(f)
 
     kwargs: dict = {}
@@ -923,15 +1001,17 @@ def load_config(config_path: str) -> dict:
     return kwargs
 
 
-def _parse_wandb_tags(tags_str: str) -> List[str]:
+def _parse_wandb_tags(tags_str: str) -> list[str]:
     """Parse wandb_tags string from CLI.
-    
+
     Handles JSON-like list strings (e.g. '["tag1", "tag2"]') or comma-separated lists.
     """
     if not tags_str:
         return []
     tags_str = tags_str.strip()
-    if (tags_str.startswith('[') and tags_str.endswith(']')) or (tags_str.startswith('(') and tags_str.endswith(')')):
+    if (tags_str.startswith("[") and tags_str.endswith("]")) or (
+        tags_str.startswith("(") and tags_str.endswith(")")
+    ):
         try:
             normalized = tags_str.replace("'", '"')
             parsed = json.loads(normalized)
@@ -939,8 +1019,8 @@ def _parse_wandb_tags(tags_str: str) -> List[str]:
                 return [str(t).strip() for t in parsed]
         except Exception:
             tags_str = tags_str[1:-1]
-            
-    return [t.strip().strip('"').strip("'").strip() for t in tags_str.split(',') if t.strip()]
+
+    return [t.strip().strip('"').strip("'").strip() for t in tags_str.split(",") if t.strip()]
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -948,80 +1028,171 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="One-Shot Bandit DTA — Training Runner")
 
     # Config file
-    parser.add_argument("--config", default=None,
-                        help="Path to JSON config file (overrides defaults, CLI overrides config)")
+    parser.add_argument(
+        "--config",
+        default=None,
+        help="Path to JSON config file (overrides defaults, CLI overrides config)",
+    )
 
     # Scenario
     parser.add_argument("--scenario", default=None, help="Path to scenario folder")
     parser.add_argument("--population", default=None, help="Population file filter (e.g. '100')")
-    parser.add_argument("--formulation", default=None, choices=["agent", "od_pair", "centralized"],
-                        help="Environment formulation: 'agent', 'od_pair', or 'centralized'")
-    parser.add_argument("--bandit_feedback", default=None, choices=["full", "semi"],
-                        help="Feedback type for bandit formulation: 'full' or 'semi'")
+    parser.add_argument(
+        "--formulation",
+        default=None,
+        choices=["agent", "od_pair", "centralized"],
+        help="Environment formulation: 'agent', 'od_pair', or 'centralized'",
+    )
+    parser.add_argument(
+        "--bandit_feedback",
+        default=None,
+        choices=["full", "semi"],
+        help="Feedback type for bandit formulation: 'full' or 'semi'",
+    )
 
     # Agent
-    parser.add_argument("--agent", default=None,
-                        choices=["random", "epsilon_greedy", "ucb", "aon", "frank_wolfe", "ts", "exp3", "msa", "evo_swap", "rd"],
-                        help="Agent type: 'random', 'epsilon_greedy', 'ucb', 'aon', 'frank_wolfe', 'ts', 'exp3', 'msa', 'evo_swap', or 'rd'")
+    parser.add_argument(
+        "--agent",
+        default=None,
+        choices=[
+            "random",
+            "epsilon_greedy",
+            "ucb",
+            "aon",
+            "frank_wolfe",
+            "ts",
+            "exp3",
+            "msa",
+            "evo_swap",
+            "rd",
+        ],
+        help="Agent type: 'random', 'epsilon_greedy', 'ucb', 'aon', 'frank_wolfe', 'ts', 'exp3', 'msa', 'evo_swap', or 'rd'",
+    )
 
     # Training
     parser.add_argument("--episodes", type=int, default=None, help="Number of episodes")
     parser.add_argument("--max_steps", type=int, default=None, help="Max ticks per episode")
-    parser.add_argument("--stuck_threshold", type=int, default=None, help="Steps before a stuck agent is removed")
+    parser.add_argument(
+        "--stuck_threshold", type=int, default=None, help="Steps before a stuck agent is removed"
+    )
     parser.add_argument("--timestep", type=float, default=None, help="Simulation timestep (s)")
-    parser.add_argument("--scale_factor", type=float, default=None, help="Network capacity scale factor (default: 1.0)")
+    parser.add_argument(
+        "--scale_factor",
+        type=float,
+        default=None,
+        help="Network capacity scale factor (default: 1.0)",
+    )
     parser.add_argument("--device", default=None, help="Device ('cpu' or 'cuda')")
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
 
     # Logging
-    parser.add_argument("--log_interval", type=int, default=None,
-                        help="Log metrics every N episodes (default: 100)")
+    parser.add_argument(
+        "--log_interval", type=int, default=None, help="Log metrics every N episodes (default: 100)"
+    )
 
-    parser.add_argument("--top_k_paths", type=int, default=None,
-                        help="Number of top-k loopless paths (default: 3)")
+    parser.add_argument(
+        "--top_k_paths", type=int, default=None, help="Number of top-k loopless paths (default: 3)"
+    )
 
     # W&B
-    parser.add_argument("--wandb", action="store_true", default=None,
-                        help="Enable Weights & Biases logging")
+    parser.add_argument(
+        "--wandb", action="store_true", default=None, help="Enable Weights & Biases logging"
+    )
     parser.add_argument("--wandb_project", default=None, help="W&B project name")
-    parser.add_argument("--wandb_tags", default=None,
-                        help="W&B run tags (comma-separated or JSON list string)")
-    parser.add_argument("--wandb_agent", default=None, help="Specific agent type name for W&B logging")
+    parser.add_argument(
+        "--wandb_tags", default=None, help="W&B run tags (comma-separated or JSON list string)"
+    )
+    parser.add_argument(
+        "--wandb_agent", default=None, help="Specific agent type name for W&B logging"
+    )
 
     # Render
-    parser.add_argument("--render", default=None, choices=["interval", "end"],
-                        help="Render episodes: 'interval' or 'end'")
-    parser.add_argument("--render_format", default=None, choices=["gif", "mp4", "live"],
-                        help="Render format: gif, mp4, or live")
+    parser.add_argument(
+        "--render",
+        default=None,
+        choices=["interval", "end"],
+        help="Render episodes: 'interval' or 'end'",
+    )
+    parser.add_argument(
+        "--render_format",
+        default=None,
+        choices=["gif", "mp4", "live"],
+        help="Render format: gif, mp4, or live",
+    )
     parser.add_argument("--render_fps", type=int, default=None, help="FPS for rendered animation")
-    parser.add_argument("--render_hours", type=float, nargs=2, default=None,
-                        help="Start and end hours for rendering")
+    parser.add_argument(
+        "--render_hours",
+        type=float,
+        nargs=2,
+        default=None,
+        help="Start and end hours for rendering",
+    )
     parser.add_argument("--render_speed", type=int, default=None, help="Speed factor for rendering")
 
     parser.add_argument("--profile_memory", action="store_true", help="Enable memory profiling")
-    parser.add_argument("--reload_paths", action="store_true", default=None,
-                        help="Force recalculation and overwrite of the cached shortest paths .pkl file")
-    parser.add_argument("--sanity_checks", action="store_true",
-                        help="Generate sanity check plots (FFTT scatter, V/C histogram, regret violin) at end of training")
-    parser.add_argument("--macro_od_size", type=float, default=None,
-                        help="Spatial zone cell size in meters for macro-OD aggregation (e.g. 1000.0).")
-    parser.add_argument("--save_pickle", action="store_true",
-                        help="Save/load the parsed network and population to/from a .pkl file")
+    parser.add_argument(
+        "--reload_paths",
+        action="store_true",
+        default=None,
+        help="Force recalculation and overwrite of the cached shortest paths .pkl file",
+    )
+    parser.add_argument(
+        "--sanity_checks",
+        action="store_true",
+        help="Generate sanity check plots (FFTT scatter, V/C histogram, regret violin) at end of training",
+    )
+    parser.add_argument(
+        "--macro_od_size",
+        type=float,
+        default=None,
+        help="Spatial zone cell size in meters for macro-OD aggregation (e.g. 1000.0).",
+    )
+    parser.add_argument(
+        "--save_pickle",
+        action="store_true",
+        help="Save/load the parsed network and population to/from a .pkl file",
+    )
 
     parser.add_argument("--epsilon_start", type=float, default=None)
     parser.add_argument("--epsilon_end", type=float, default=None)
     parser.add_argument("--epsilon_decay", type=float, default=None)
-    parser.add_argument("--epsilon_alpha", type=float, default=None, help="Learning rate for Epsilon-Greedy Q-values")
+    parser.add_argument(
+        "--epsilon_alpha",
+        type=float,
+        default=None,
+        help="Learning rate for Epsilon-Greedy Q-values",
+    )
     parser.add_argument("--ucb_c", type=float, default=None, help="Exploration constant for UCB")
-    parser.add_argument("--ts_prior_std", type=float, default=None, help="Initial belief uncertainty for TS")
-    parser.add_argument("--ts_env_std", type=float, default=None, help="Assumed environment noise for TS (overrides dynamic std if set)")
+    parser.add_argument(
+        "--ts_prior_std", type=float, default=None, help="Initial belief uncertainty for TS"
+    )
+    parser.add_argument(
+        "--ts_env_std",
+        type=float,
+        default=None,
+        help="Assumed environment noise for TS (overrides dynamic std if set)",
+    )
     parser.add_argument("--exp3_eta", type=float, default=None, help="Learning rate for Exp3 agent")
-    parser.add_argument("--exp3_gamma", type=float, default=None, help="Exploration parameter for Exp3 agent")
-    parser.add_argument("--rd_beta", type=float, default=None, help="Temperature parameter for RD agent")
+    parser.add_argument(
+        "--exp3_gamma", type=float, default=None, help="Exploration parameter for Exp3 agent"
+    )
+    parser.add_argument(
+        "--rd_beta", type=float, default=None, help="Temperature parameter for RD agent"
+    )
 
     # Metrics Config
-    parser.add_argument("--epsilon_ratio", type=float, default=None, help="Threshold ratio for Epsilon-compliance (e.g., 0.10 for 10%%)")
-    parser.add_argument("--link_tt_interval", type=float, default=None, help="Aggregation interval for Nash metrics (seconds)")
+    parser.add_argument(
+        "--epsilon_ratio",
+        type=float,
+        default=None,
+        help="Threshold ratio for Epsilon-compliance (e.g., 0.10 for 10%%)",
+    )
+    parser.add_argument(
+        "--link_tt_interval",
+        type=float,
+        default=None,
+        help="Aggregation interval for Nash metrics (seconds)",
+    )
 
     return parser
 
@@ -1077,11 +1248,10 @@ if __name__ == "__main__":
 
     # 1. Start with train() defaults
     import inspect
+
     sig = inspect.signature(train)
     kwargs = {
-        k: v.default
-        for k, v in sig.parameters.items()
-        if v.default is not inspect.Parameter.empty
+        k: v.default for k, v in sig.parameters.items() if v.default is not inspect.Parameter.empty
     }
 
     # 2. Override with JSON config if provided

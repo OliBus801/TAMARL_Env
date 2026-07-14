@@ -1,7 +1,7 @@
 """Evolutionary Swap Agent (EvoSwapAgent).
 
-Implements an evolutionary greedy algorithm with inertia. 
-A proportion epsilon of the population (mutation) re-evaluates their path choice 
+Implements an evolutionary greedy algorithm with inertia.
+A proportion epsilon of the population (mutation) re-evaluates their path choice
 based on the time-dependent travel time estimates from the previous episode.
 The remaining population keeps their previous path choice (inertia).
 
@@ -36,7 +36,7 @@ class EvoSwapAgent:
         env,
         k_paths: int,
         device: str = "cpu",
-        seed: Optional[int] = None,
+        seed: int | None = None,
         epsilon_max: float = 1.0,
         epsilon_min: float = 0.05,
         epsilon_decay: float = 0.01,
@@ -53,7 +53,7 @@ class EvoSwapAgent:
 
         # num_envs = N (total legs)
         self.num_envs = env.num_envs
-        
+
         # Agnostic to aggregation: we might be in OD mode or Agent mode.
         # But we maintain actions at the vehicle level (N) to preserve inertia.
         is_od_mode = hasattr(env, "num_od_pairs")
@@ -86,14 +86,14 @@ class EvoSwapAgent:
         self,
         obs: torch.Tensor,
         masks: torch.Tensor,
-        aggregation_indices: Optional[torch.Tensor] = None,
+        aggregation_indices: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         """Retourne les actions mémorisées (Inertie)."""
         N = masks.shape[0]
         if N == 0:
             return torch.empty(0, device=self.device, dtype=torch.long)
-            
+
         # On s'assure que self.current_actions a la bonne taille (cas dynamique ?)
         # Normalement N est constant dans le bandit DTA.
         return self.current_actions
@@ -102,12 +102,12 @@ class EvoSwapAgent:
         self,
         actions: torch.Tensor,
         rewards: torch.Tensor,
-        aggregation_indices: Optional[torch.Tensor] = None,
+        aggregation_indices: torch.Tensor | None = None,
         **kwargs,
     ) -> None:
         """Mise à jour évolutionnaire : mutation d'une partie de la population."""
         self.episode += 1
-        
+
         dnl = self._env.bandit.dnl
         if not dnl.collect_link_tt:
             # L'évaluateur TD requiert les données par intervalle.
@@ -121,7 +121,7 @@ class EvoSwapAgent:
         )
 
         # Strategic Ignorance: only mutate legs that actually departed
-        valid_mask = kwargs.get('valid_mask')
+        valid_mask = kwargs.get("valid_mask")
 
         # 2. Création du masque de mutation
         # On tire aléatoirement qui va changer de chemin (Mutation)

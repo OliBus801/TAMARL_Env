@@ -8,13 +8,14 @@ This environment treats the DNL simulator as a black box:
 No per-node RL decisions are made — this is a *bandit* formulation
 where the entire route is decided upfront.
 """
+
 from __future__ import annotations
 
 from typing import Optional
 
 import torch
 
-from tamarl.core.dnl_matsim import TorchDNLMATSim
+from tamarl.core.torchdnl import TorchDNL
 from tamarl.envs.scenario_loader import load_scenario
 
 
@@ -26,7 +27,7 @@ class DTABanditEnv:
     simply orchestrates reset → simulate → extract metrics.
 
     Attributes:
-        dnl: The underlying TorchDNLMATSim engine.
+        dnl: The underlying TorchDNL engine.
         scenario: The parsed ScenarioData.
         num_agents: Number of agents (vehicles).
         device: Torch device string.
@@ -35,12 +36,12 @@ class DTABanditEnv:
     def __init__(
         self,
         scenario_path: str,
-        population_filter: Optional[str] = None,
+        population_filter: str | None = None,
         timestep: float = 1.0,
         scale_factor: float = 1.0,
         max_steps: int = 36000,
         device: str = "cpu",
-        seed: Optional[int] = None,
+        seed: int | None = None,
         stuck_threshold: int = 10,
         track_events: bool = False,
         link_tt_interval: float = 300.0,
@@ -72,13 +73,18 @@ class DTABanditEnv:
         self.collect_link_tt = False
 
         # DNL will be created/configured in reset()
-        self.dnl: Optional[TorchDNLMATSim] = None
+        self.dnl: TorchDNL | None = None
 
     # ──────────────────────────────────────────────────────────────────
     #  Public API
     # ──────────────────────────────────────────────────────────────────
 
-    def reset(self, paths: torch.Tensor = None, paths_flat: torch.Tensor = None, path_offsets: torch.Tensor = None) -> None:
+    def reset(
+        self,
+        paths: torch.Tensor = None,
+        paths_flat: torch.Tensor = None,
+        path_offsets: torch.Tensor = None,
+    ) -> None:
         """Configure the DNL with the given paths and prepare for step().
 
         Args:
@@ -92,13 +98,13 @@ class DTABanditEnv:
             num_agents_check = paths.shape[0]
         else:
             raise ValueError("Must provide either paths or paths_flat + path_offsets.")
-            
+
         assert num_agents_check == self.num_agents, (
             f"paths has {num_agents_check} agents, expected {self.num_agents}"
         )
 
         # (Re-)create the DNL in paths mode (non-RL)
-        self.dnl = TorchDNLMATSim(
+        self.dnl = TorchDNL(
             edge_static=self.scenario.edge_static,
             paths=paths,
             device=self._device,
@@ -135,11 +141,16 @@ class DTABanditEnv:
             # Early exit when every agent is done
             if self.dnl.active_agents_count == 0:
                 break
-                
-            if self._profile_memory and self.dnl.current_step % 10000 == 0 and self.dnl.current_step > 0:
+
+            if (
+                self._profile_memory
+                and self.dnl.current_step % 10000 == 0
+                and self.dnl.current_step > 0
+            ):
                 from tamarl.core.memory_profiler import analyze_tensor_memory
+
                 analyze_tensor_memory(f"STEP {self.dnl.current_step}")
-                
+
             self.dnl.step()
 
         # Finalize metrics for agents still stuck in the network at timeout

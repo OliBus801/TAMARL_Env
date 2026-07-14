@@ -20,6 +20,7 @@ Flow:
          b. Run:   ``bandit.reset(paths); rewards = bandit.step()``
          c. Return: obs, rewards, terminated, truncated, info.
 """
+
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
@@ -28,11 +29,11 @@ import numpy as np
 import torch
 from gymnasium import spaces
 
-from tamarl.envs.dta_bandit_env import DTABanditEnv
-from tamarl.envs.components.path_enumerator import get_or_compute_top_k_paths
 from tamarl.envs.components.metrics import compute_empirical_nash_metrics_tensor
-from tamarl.envs.components.time_dependent_evaluator import TimeDependentEvaluator
+from tamarl.envs.components.path_enumerator import get_or_compute_top_k_paths
 from tamarl.envs.components.route_utils import build_routes_csr
+from tamarl.envs.components.time_dependent_evaluator import TimeDependentEvaluator
+from tamarl.envs.dta_bandit_env import DTABanditEnv
 
 
 class ODLevelWrapper:
@@ -71,10 +72,9 @@ class ODLevelWrapper:
         timestep = bandit._timestep
 
         edge_eps = scenario.edge_endpoints.numpy()  # [E, 2]
-        edge_static = scenario.edge_static.numpy()
 
         # ── Collect info for ALL legs of ALL agents ──────────────────
-        self.leg_to_agent = []      # list of (agent_idx, leg_in_agent_idx)
+        self.leg_to_agent = []  # list of (agent_idx, leg_in_agent_idx)
         leg_origins = []
         leg_dests = []
         self.leg_first_edges = []
@@ -98,20 +98,19 @@ class ODLevelWrapper:
 
         # ── Enumerate top-K paths for all unique ODs ─────────────────
         unique_od, inverse_od = np.unique(
-            np.stack([leg_origins, leg_dests], axis=1),
-            axis=0, return_inverse=True
+            np.stack([leg_origins, leg_dests], axis=1), axis=0, return_inverse=True
         )
         self.unique_od = unique_od
         self.od_indices_all_legs = torch.tensor(inverse_od, dtype=torch.long, device=self._device)
-        self.first_edges_all_legs = torch.tensor(self.leg_first_edges, dtype=torch.long, device=self._device)
+        self.first_edges_all_legs = torch.tensor(
+            self.leg_first_edges, dtype=torch.long, device=self._device
+        )
 
         # ── Expose OD-level properties ───────────────────────────────
         self.num_od_pairs = len(unique_od)
 
         # Free-flow times for path enumeration
-        ff_times = torch.floor(
-            scenario.edge_static[:, 4] / timestep
-        ).numpy().astype(np.float64)
+        ff_times = torch.floor(scenario.edge_static[:, 4] / timestep).numpy().astype(np.float64)
 
         paths_dict = get_or_compute_top_k_paths(
             scenario_dir=bandit._scenario_path,
@@ -131,11 +130,11 @@ class ODLevelWrapper:
             top_k=top_k,
             edge_static_np=scenario.edge_static.numpy(),
         )
-        self.routes_flat_csr    = torch.tensor(flat_np,    dtype=torch.int32, device=self._device)
-        self.routes_offsets_csr = torch.tensor(offsets_np, dtype=torch.long,  device=self._device)
-        self.action_masks       = torch.tensor(masks_np,   dtype=torch.bool,  device=self._device)
-        self.fftt_matrix        = fftt_np
-        self.num_unique_od      = num_unique_od
+        self.routes_flat_csr = torch.tensor(flat_np, dtype=torch.int32, device=self._device)
+        self.routes_offsets_csr = torch.tensor(offsets_np, dtype=torch.long, device=self._device)
+        self.action_masks = torch.tensor(masks_np, dtype=torch.bool, device=self._device)
+        self.fftt_matrix = fftt_np
+        self.num_unique_od = num_unique_od
 
         # Check for agents/legs with no possible paths
         od_has_no_paths = ~masks_np.any(axis=1)
@@ -143,7 +142,6 @@ class ODLevelWrapper:
         no_path_legs = int(np.sum(od_has_no_paths[inverse_od_np]))
         if no_path_legs > 0:
             print(f"⚠️ WARNING: {no_path_legs} agents/legs have no possible routes in the network.")
-
 
         self.single_observation_space = spaces.Box(
             low=0, high=np.inf, shape=(top_k,), dtype=np.float32
@@ -170,21 +168,23 @@ class ODLevelWrapper:
         obs_t = self.action_masks[self.od_indices_all_legs].float()
         return obs_t.cpu().numpy()
 
-    def _get_info(self, travel_times: Optional[np.ndarray] = None) -> Dict[str, Any]:
+    def _get_info(self, travel_times: np.ndarray | None = None) -> dict[str, Any]:
         """Fetch masks, OD indices, and metrics."""
         # [TotalLegs, K]
         masks_t = self.action_masks[self.od_indices_all_legs]
 
-        info: Dict[str, Any] = {
+        info: dict[str, Any] = {
             "action_mask": masks_t.cpu().numpy(),
             "od_indices": self.od_indices_all_legs.cpu().numpy(),
             "num_od_pairs": self.num_od_pairs,
         }
         if travel_times is not None:
-            info.update({
-                "travel_times": travel_times,
-                "mean_travel_time": float(travel_times.mean()),
-            })
+            info.update(
+                {
+                    "travel_times": travel_times,
+                    "mean_travel_time": float(travel_times.mean()),
+                }
+            )
         return info
 
     # ══════════════════════════════════════════════════════════════════
@@ -193,14 +193,14 @@ class ODLevelWrapper:
 
     def reset(
         self,
-        seed: Optional[int] = None,
-        options: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[np.ndarray, Dict[str, Any]]:
+        seed: int | None = None,
+        options: dict[str, Any] | None = None,
+    ) -> tuple[np.ndarray, dict[str, Any]]:
         return self._get_obs(), self._get_info()
 
     def step(
         self, actions: np.ndarray
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
         """Run one full DTA simulation.
 
         Args:
@@ -211,14 +211,14 @@ class ODLevelWrapper:
             actions_t = actions.detach().contiguous().to(self._device, dtype=torch.long)
         else:
             actions_t = torch.tensor(actions, dtype=torch.long, device=self._device)
-        
+
         A = self.bandit.num_agents
 
         # ── CSR route lookup: compute per-leg starts/ends/lens ───────
-        route_rows   = self.od_indices_all_legs * self.K + actions_t  # [TotalLegs]
-        route_starts = self.routes_offsets_csr[route_rows]            # [TotalLegs]
-        route_ends   = self.routes_offsets_csr[route_rows + 1]        # [TotalLegs]
-        route_lens   = (route_ends - route_starts).long()             # [TotalLegs]
+        route_rows = self.od_indices_all_legs * self.K + actions_t  # [TotalLegs]
+        route_starts = self.routes_offsets_csr[route_rows]  # [TotalLegs]
+        route_ends = self.routes_offsets_csr[route_rows + 1]  # [TotalLegs]
+        route_lens = (route_ends - route_starts).long()  # [TotalLegs]
 
         # ── Build sparse CSR paths (paths_flat + path_offsets) ────────
         num_legs_np = self.bandit.scenario.num_legs.cpu()
@@ -228,7 +228,7 @@ class ODLevelWrapper:
         leg_total = 1 + route_lens
         agent_flat_len = torch.zeros(A, device=self._device, dtype=torch.long)
         agent_flat_len.scatter_add_(0, agent_per_leg, leg_total)
-        agent_flat_len += (num_legs_np.to(self._device).long() - 1)
+        agent_flat_len += num_legs_np.to(self._device).long() - 1
 
         path_offsets = torch.zeros(A + 1, device=self._device, dtype=torch.long)
         path_offsets[1:] = torch.cumsum(agent_flat_len, dim=0)
@@ -249,7 +249,7 @@ class ODLevelWrapper:
         agent_cs_start[agent_per_leg[first_leg_pos]] = (
             global_cs[first_leg_pos] - leg_contrib_with_sep[first_leg_pos]
         )
-        intra_offset   = global_cs - leg_contrib_with_sep - agent_cs_start[agent_per_leg]
+        intra_offset = global_cs - leg_contrib_with_sep - agent_cs_start[agent_per_leg]
         leg_write_start = path_offsets[agent_per_leg] + intra_offset
 
         non_first = ~first_mask
@@ -274,14 +274,16 @@ class ODLevelWrapper:
                     chunk_route_lens,
                 )
 
-                chunk_cumsum_lens = torch.zeros(end_idx - start_idx + 1, device=self._device, dtype=torch.long)
+                chunk_cumsum_lens = torch.zeros(
+                    end_idx - start_idx + 1, device=self._device, dtype=torch.long
+                )
                 chunk_cumsum_lens[1:] = torch.cumsum(chunk_route_lens, dim=0)
 
                 edge_rank = (
                     torch.arange(chunk_total_edges, device=self._device, dtype=torch.long)
                     - chunk_cumsum_lens[chunk_leg_of_edge - start_idx]
                 )
-                
+
                 src_idx = route_starts[chunk_leg_of_edge] + edge_rank
                 dst_idx = leg_write_start[chunk_leg_of_edge] + 1 + edge_rank
                 paths_flat[dst_idx] = self.routes_flat_csr[src_idx]
@@ -291,7 +293,9 @@ class ODLevelWrapper:
         del leg_total, leg_contrib_with_sep, first_mask, global_cs, agent_cs_start
         del intra_offset, non_first, first_leg_pos, agent_per_leg
         del route_rows, route_starts, route_ends, route_lens
-        import gc; gc.collect()
+        import gc
+
+        gc.collect()
 
         # ── Run the bandit simulation ────────────────────────────────
         paths_flat = paths_flat.detach().contiguous()
@@ -316,16 +320,11 @@ class ODLevelWrapper:
             [dep_matrix[i, leg_j].item() for i, leg_j in self.leg_to_agent],
             device=self._device,
         )
-        valid_leg_mask = (dep_per_leg >= 0)
+        valid_leg_mask = dep_per_leg >= 0
 
         # ── Extract edge costs for semi-bandit feedback ──
+        # Note: semi-bandit is not implemented for the OD-level wrapper.
         semi_bandit_costs = None
-        if self.feedback_type == "semi":
-            dynamic_tt = self.bandit.dnl.get_dynamic_link_travel_times()
-            edge_tt = dynamic_tt.mean(dim=0) if dynamic_tt is not None else self.bandit.dnl.edge_static[:, 4]
-            # selected_routes is no longer available; skip semi-bandit for OD wrapper
-            # (semi-bandit is not used with od_pair formulation in practice)
-            pass
 
         # ── Package outputs (filtered by valid_leg_mask) ─────────────
         terminated = np.ones(self.num_envs, dtype=bool)
@@ -359,7 +358,7 @@ class ODLevelWrapper:
                 departure_times=self.bandit.scenario.departure_times,
                 od_indices=self.od_indices_all_legs,
             )
-            
+
             path_metrics = compute_empirical_nash_metrics_tensor(
                 actual_travel_times=torch.tensor(travel_times, device=self._device),
                 actions=actions_t,
@@ -374,10 +373,10 @@ class ODLevelWrapper:
     #  Utility
     # ══════════════════════════════════════════════════════════════════
 
-    def get_candidate_paths_info(self) -> Dict[str, Any]:
+    def get_candidate_paths_info(self) -> dict[str, Any]:
         """Return summary info about the candidate paths structure."""
         total_edges = int(self.routes_flat_csr.shape[0])
-        num_routes  = self.num_unique_od * self.K
+        num_routes = self.num_unique_od * self.K
         return {
             "num_od_pairs": self.num_od_pairs,
             "K": self.K,

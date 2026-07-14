@@ -16,25 +16,31 @@ Methods:
 
 import argparse
 import os
+
 import numpy as np
 import torch
 
-from tamarl.envs.scenario_loader import load_scenario
 from tamarl.envs.components.path_enumerator import get_or_compute_top_k_paths
+from tamarl.envs.scenario_loader import load_scenario
+
 
 def main():
     parser = argparse.ArgumentParser(
         description="Pre-compute top-k paths for a scenario.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--scenario", type=str, required=True,
-                        help="Path to the scenario directory")
-    parser.add_argument("--population", type=str, default=None,
-                        help="Population filter (e.g. '100' or '1pct')")
-    parser.add_argument("--k", type=int, default=9,
-                        help="Number of paths to compute per OD pair (default: 9)")
-    parser.add_argument("--timestep", type=float, default=1.0,
-                        help="Timestep duration in seconds (default: 1.0)")
+    parser.add_argument(
+        "--scenario", type=str, required=True, help="Path to the scenario directory"
+    )
+    parser.add_argument(
+        "--population", type=str, default=None, help="Population filter (e.g. '100' or '1pct')"
+    )
+    parser.add_argument(
+        "--k", type=int, default=9, help="Number of paths to compute per OD pair (default: 9)"
+    )
+    parser.add_argument(
+        "--timestep", type=float, default=1.0, help="Timestep duration in seconds (default: 1.0)"
+    )
     parser.add_argument(
         "--method",
         type=str,
@@ -84,19 +90,14 @@ def main():
                 leg_origins.append(orig)
                 leg_dests.append(dest)
 
-    unique_od = np.unique(
-        np.stack([leg_origins, leg_dests], axis=1),
-        axis=0
-    )
+    unique_od = np.unique(np.stack([leg_origins, leg_dests], axis=1), axis=0)
     print(f"Found {len(unique_od)} unique OD pairs.")
-    print(f"Algorithm: {args.method}" + (
-        f"  |  penalty_factor: {args.penalty_factor}"
-        if args.method == "penalty" else ""
-    ))
+    print(
+        f"Algorithm: {args.method}"
+        + (f"  |  penalty_factor: {args.penalty_factor}" if args.method == "penalty" else "")
+    )
 
-    ff_times = torch.floor(
-        scenario.edge_static[:, 4] / args.timestep
-    ).numpy().astype(np.float64)
+    ff_times = torch.floor(scenario.edge_static[:, 4] / args.timestep).numpy().astype(np.float64)
 
     # Call get_or_compute_top_k_paths which handles caching automatically
     _ = get_or_compute_top_k_paths(
@@ -111,6 +112,7 @@ def main():
     )
 
     print("Done!")
+
 
 if __name__ == "__main__":
     main()

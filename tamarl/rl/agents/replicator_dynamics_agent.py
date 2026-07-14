@@ -14,8 +14,10 @@ Weights Update (update):
   - Apply mean substitution for unchosen routes.
   - Update probabilities using RD equation: p_k(t+1) = p_k(t) * u_k / u_bar
 """
-import torch
+
 from typing import Optional
+
+import torch
 
 
 class ReplicatorDynamicsAgent:
@@ -39,13 +41,13 @@ class ReplicatorDynamicsAgent:
         num_agents: int,
         k_paths: int,
         beta: float = 0.1,
-        prior_mean: Optional[torch.Tensor] = None,
+        prior_mean: torch.Tensor | None = None,
         epsilon_start: float = 0.05,
         epsilon_end: float = 1e-8,
         epsilon_decay: float = 0.99,
         device: str = "cpu",
-        seed: Optional[int] = None,
-        num_models: Optional[int] = None,
+        seed: int | None = None,
+        num_models: int | None = None,
     ):
         if num_models is not None:
             num_agents = num_models
@@ -72,7 +74,9 @@ class ReplicatorDynamicsAgent:
             if nan_rows.any():
                 self.rd_probs[nan_rows] = 1.0 / k_paths
         else:
-            self.rd_probs = torch.ones((self.num_models, k_paths), device=device, dtype=torch.float32) / k_paths
+            self.rd_probs = (
+                torch.ones((self.num_models, k_paths), device=device, dtype=torch.float32) / k_paths
+            )
 
     @property
     def num_agents(self) -> int:
@@ -90,7 +94,7 @@ class ReplicatorDynamicsAgent:
         self,
         obs: torch.Tensor,
         masks: torch.Tensor,
-        aggregation_indices: Optional[torch.Tensor] = None,
+        aggregation_indices: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         N = masks.shape[0]
@@ -105,7 +109,7 @@ class ReplicatorDynamicsAgent:
 
         # 2. Masking valid paths
         p_rd = p_rd * masks.float()
-        
+
         # Fallback if a row becomes all zeros
         row_sums = p_rd.sum(dim=1, keepdim=True)
         zero_rows = (row_sums == 0).squeeze(1)
@@ -117,10 +121,10 @@ class ReplicatorDynamicsAgent:
             all_zero_masks = (mask_sums == 0).squeeze(1)
             if all_zero_masks.any():
                 fallback_probs[all_zero_masks] = 1.0
-            
+
             p_rd[zero_rows] = fallback_probs
             row_sums = p_rd.sum(dim=1, keepdim=True)
-            
+
         p_rd = p_rd / row_sums.clamp(min=1e-10)
 
         # 3. Add exploration noise
@@ -144,14 +148,14 @@ class ReplicatorDynamicsAgent:
         self,
         actions: torch.Tensor,
         rewards: torch.Tensor,
-        aggregation_indices: Optional[torch.Tensor] = None,
+        aggregation_indices: torch.Tensor | None = None,
         **kwargs,
     ) -> None:
         N = actions.shape[0]
         if N == 0:
             return
 
-        valid_mask = kwargs.get('valid_mask')
+        valid_mask = kwargs.get("valid_mask")
         if valid_mask is not None:
             actions = actions[valid_mask]
             rewards = rewards[valid_mask]
@@ -170,7 +174,7 @@ class ReplicatorDynamicsAgent:
 
         sum_rewards = torch.zeros(flat_size, device=self.device, dtype=torch.float32)
         counts = torch.zeros(flat_size, device=self.device, dtype=torch.float32)
-        
+
         sum_rewards.scatter_add_(0, flat_idx, rewards.float())
         counts.scatter_add_(0, flat_idx, torch.ones(N, device=self.device))
 
@@ -185,22 +189,22 @@ class ReplicatorDynamicsAgent:
         # Calculate utility for chosen routes: u_k = exp(beta * mean_reward)
         u_k = torch.zeros_like(mean_rewards)
         # To avoid overflow, we could subtract max before exp, but RD is translation invariant if we scale properly.
-        # u_k = exp(beta * (reward - baseline)). Actually RD: u_k = exp(beta * reward). 
+        # u_k = exp(beta * (reward - baseline)). Actually RD: u_k = exp(beta * reward).
         # If rewards are large negative (e.g. -100 to -1000), beta * reward can underflow.
         # Let's normalize by subtracting the max mean_reward per block before exp.
         # This keeps the ratios identical.
         max_rewards = torch.zeros_like(mean_rewards)
         max_rewards[active] = mean_rewards[active]
-        max_rewards[~active] = -float('inf')
+        max_rewards[~active] = -float("inf")
         block_max = max_rewards.max(dim=1, keepdim=True).values.clamp(min=-1e6)
-        
+
         normalized_mean_rewards = mean_rewards - block_max
         u_k[active] = torch.exp(self.beta * normalized_mean_rewards[active])
 
         # Mean substitution for unchosen routes
         total_counts = counts.sum(dim=1, keepdim=True).clamp(min=1e-10)
         u_bar_observed = (u_k * counts).sum(dim=1, keepdim=True) / total_counts
-        
+
         # Only apply mean substitution for blocks that actually had vehicles
         active_blocks = (total_counts > 1e-10).expand_as(u_k)
         unchosen = (~active) & active_blocks
@@ -208,20 +212,22 @@ class ReplicatorDynamicsAgent:
 
         # Replicator Dynamics update
         active_block_mask = (total_counts > 1e-10).squeeze(1)
-        
+
         u_bar_rd = (self.rd_probs * u_k).sum(dim=1, keepdim=True).clamp(min=1e-10)
-        
+
         new_probs = self.rd_probs.clone()
-        new_probs[active_block_mask] = (self.rd_probs[active_block_mask] * u_k[active_block_mask]) / u_bar_rd[active_block_mask]
-        
+        new_probs[active_block_mask] = (
+            self.rd_probs[active_block_mask] * u_k[active_block_mask]
+        ) / u_bar_rd[active_block_mask]
+
         # Normalize to prevent drift
         new_probs = new_probs / new_probs.sum(dim=1, keepdim=True).clamp(min=1e-10)
-        
+
         # Guard against NaNs
         nan_mask = torch.isnan(new_probs).any(dim=1)
         if nan_mask.any():
             new_probs[nan_mask] = 1.0 / self.k_paths
-            
+
         self.rd_probs = new_probs
 
     def decay_epsilon(self) -> None:

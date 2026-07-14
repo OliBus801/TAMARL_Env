@@ -19,41 +19,41 @@ Algorithms
                   Best for DTA/MARL where spatial diversity matters more than
                   strict optimality.
 """
+
 from __future__ import annotations
 
 import heapq
 import os
 import pickle
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
 
 import igraph as ig
 import numpy as np
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
 
 # ---------------------------------------------------------------------------
 # Worker-process globals – each subprocess gets its own copy via initializer
 # ---------------------------------------------------------------------------
-_WORKER_IG_GRAPH: Optional[ig.Graph] = None           # yen
-_WORKER_RX_GRAPH: Optional[tuple] = None              # sidetrack  (graph, node_edge_map)
-_WORKER_ADJ: Optional[Dict] = None                    # penalty    adjacency list
-_WORKER_BASE_WEIGHTS: Optional[np.ndarray] = None     # penalty    base travel times
+_WORKER_IG_GRAPH: ig.Graph | None = None  # yen
+_WORKER_RX_GRAPH: tuple | None = None  # sidetrack  (graph, node_edge_map)
+_WORKER_ADJ: dict | None = None  # penalty    adjacency list
+_WORKER_BASE_WEIGHTS: np.ndarray | None = None  # penalty    base travel times
 
 
 # ===========================================================================
 #  YEN  –  igraph (exact, multiprocess)
 # ===========================================================================
 
+
 def _init_yen_worker(graph: ig.Graph) -> None:
     global _WORKER_IG_GRAPH
     _WORKER_IG_GRAPH = graph
 
 
-def _compute_yen_chunk(
-    od_chunk: np.ndarray, k: int
-) -> Dict[Tuple[int, int], List[List[int]]]:
+def _compute_yen_chunk(od_chunk: np.ndarray, k: int) -> dict[tuple[int, int], list[list[int]]]:
     global _WORKER_IG_GRAPH
-    result: Dict[Tuple[int, int], List[List[int]]] = {}
+    result: dict[tuple[int, int], list[list[int]]] = {}
     for i in range(od_chunk.shape[0]):
         o, d = int(od_chunk[i, 0]), int(od_chunk[i, 1])
         od_key = (o, d)
@@ -67,9 +67,7 @@ def _compute_yen_chunk(
             paths = []
             for path in paths_edges:
                 if path:
-                    paths.append(
-                        [_WORKER_IG_GRAPH.es[e]["original_id"] for e in path]
-                    )
+                    paths.append([_WORKER_IG_GRAPH.es[e]["original_id"] for e in path])
             result[od_key] = paths
         except Exception:
             result[od_key] = []
@@ -82,10 +80,10 @@ def _enumerate_yen_paths(
     ff_times: np.ndarray,
     od_pairs: np.ndarray,
     k: int,
-) -> Dict[Tuple[int, int], List[List[int]]]:
+) -> dict[tuple[int, int], list[list[int]]]:
     """Exact k-shortest loopless paths via igraph's Yen implementation."""
     # Filter parallel edges – keep only the fastest per (u, v)
-    edge_dict: Dict[Tuple[int, int], Tuple[int, float]] = {}
+    edge_dict: dict[tuple[int, int], tuple[int, float]] = {}
     for e in range(edge_endpoints.shape[0]):
         u, v = int(edge_endpoints[e, 0]), int(edge_endpoints[e, 1])
         w = float(ff_times[e])
@@ -104,16 +102,14 @@ def _enumerate_yen_paths(
     num_workers = os.cpu_count() or 4
     chunks = np.array_split(od_pairs, max(1, num_workers * 4))
 
-    result: Dict[Tuple[int, int], List[List[int]]] = {}
+    result: dict[tuple[int, int], list[list[int]]] = {}
     with ProcessPoolExecutor(
         max_workers=num_workers,
         initializer=_init_yen_worker,
         initargs=(G,),
     ) as executor:
         futures = [
-            executor.submit(_compute_yen_chunk, chunk, k)
-            for chunk in chunks
-            if len(chunk) > 0
+            executor.submit(_compute_yen_chunk, chunk, k) for chunk in chunks if len(chunk) > 0
         ]
         for future in tqdm(
             as_completed(futures), total=len(futures), desc="Yen k-paths (OD chunks)"
@@ -126,21 +122,22 @@ def _enumerate_yen_paths(
 #  SIDETRACK  –  rustworkx (exact, Rust backend, much faster on large graphs)
 # ===========================================================================
 
-def _init_sidetrack_worker(
-    nx_graph, node_edge_map: Dict[Tuple[int, int], int]
-) -> None:
+
+def _init_sidetrack_worker(nx_graph, node_edge_map: dict[tuple[int, int], int]) -> None:
     global _WORKER_NX_GRAPH
     _WORKER_NX_GRAPH = (nx_graph, node_edge_map)
 
+
 def _compute_sidetrack_chunk(
     od_chunk: np.ndarray, k: int
-) -> Dict[Tuple[int, int], List[List[int]]]:
-    import networkx as nx
+) -> dict[tuple[int, int], list[list[int]]]:
     from itertools import islice
+
+    import networkx as nx
 
     global _WORKER_NX_GRAPH
     G, node_edge_map = _WORKER_NX_GRAPH
-    result: Dict[Tuple[int, int], List[List[int]]] = {}
+    result: dict[tuple[int, int], list[list[int]]] = {}
 
     for i in range(od_chunk.shape[0]):
         o, d = int(od_chunk[i, 0]), int(od_chunk[i, 1])
@@ -154,7 +151,7 @@ def _compute_sidetrack_chunk(
             for node_path in paths_nodes:
                 if len(node_path) < 2:
                     continue
-                edge_path: List[int] = []
+                edge_path: list[int] = []
                 valid = True
                 for j in range(len(node_path) - 1):
                     uv = (int(node_path[j]), int(node_path[j + 1]))
@@ -177,12 +174,12 @@ def _enumerate_sidetrack_paths(
     ff_times: np.ndarray,
     od_pairs: np.ndarray,
     k: int,
-) -> Dict[Tuple[int, int], List[List[int]]]:
+) -> dict[tuple[int, int], list[list[int]]]:
     """Exact k-shortest loopless paths via rustworkx (Rust backend)."""
     import networkx as nx
 
     # Filter parallel edges – keep only the fastest per (u, v)
-    edge_dict: Dict[Tuple[int, int], Tuple[int, float]] = {}
+    edge_dict: dict[tuple[int, int], tuple[int, float]] = {}
     for e in range(edge_endpoints.shape[0]):
         u, v = int(edge_endpoints[e, 0]), int(edge_endpoints[e, 1])
         w = float(ff_times[e])
@@ -191,7 +188,7 @@ def _enumerate_sidetrack_paths(
 
     G = nx.DiGraph()
     G.add_nodes_from(range(num_nodes))
-    node_edge_map: Dict[Tuple[int, int], int] = {}
+    node_edge_map: dict[tuple[int, int], int] = {}
     for (u, v), (orig_id, w) in edge_dict.items():
         G.add_edge(u, v, weight=w)
         node_edge_map[(u, v)] = orig_id
@@ -199,7 +196,7 @@ def _enumerate_sidetrack_paths(
     num_workers = os.cpu_count() or 4
     chunks = np.array_split(od_pairs, max(1, num_workers * 4))
 
-    result: Dict[Tuple[int, int], List[List[int]]] = {}
+    result: dict[tuple[int, int], list[list[int]]] = {}
     with ProcessPoolExecutor(
         max_workers=num_workers,
         initializer=_init_sidetrack_worker,
@@ -223,8 +220,9 @@ def _enumerate_sidetrack_paths(
 #  PENALTY  –  iterative Dijkstra with multiplicative edge penalization
 # ===========================================================================
 
+
 def _init_penalty_worker(
-    adj: Dict[int, List[Tuple[int, int]]],
+    adj: dict[int, list[tuple[int, int]]],
     base_weights: np.ndarray,
 ) -> None:
     global _WORKER_ADJ, _WORKER_BASE_WEIGHTS
@@ -233,14 +231,14 @@ def _init_penalty_worker(
 
 
 def _dijkstra_penalty(
-    adj: Dict[int, List[Tuple[int, int]]],
+    adj: dict[int, list[tuple[int, int]]],
     weights: np.ndarray,
     src: int,
     dst: int,
-) -> Optional[List[int]]:
+) -> list[int] | None:
     """Run Dijkstra with given weights; return edge-path or None if unreachable."""
-    dist: Dict[int, float] = {src: 0.0}
-    prev_edge: Dict[int, Tuple[int, int]] = {}  # node -> (edge_id, parent_node)
+    dist: dict[int, float] = {src: 0.0}
+    prev_edge: dict[int, tuple[int, int]] = {}  # node -> (edge_id, parent_node)
     heap = [(0.0, src)]
     visited: set = set()
 
@@ -250,7 +248,7 @@ def _dijkstra_penalty(
             continue
         visited.add(u)
         if u == dst:
-            path: List[int] = []
+            path: list[int] = []
             cur = dst
             while cur != src:
                 eid, par = prev_edge[cur]
@@ -271,9 +269,9 @@ def _compute_penalty_chunk(
     od_chunk: np.ndarray,
     k: int,
     penalty_factor: float,
-) -> Dict[Tuple[int, int], List[List[int]]]:
+) -> dict[tuple[int, int], list[list[int]]]:
     global _WORKER_ADJ, _WORKER_BASE_WEIGHTS
-    result: Dict[Tuple[int, int], List[List[int]]] = {}
+    result: dict[tuple[int, int], list[list[int]]] = {}
 
     for i in range(od_chunk.shape[0]):
         o, d = int(od_chunk[i, 0]), int(od_chunk[i, 1])
@@ -284,8 +282,8 @@ def _compute_penalty_chunk(
 
         # Fresh copy of weights for each (o, d)
         weights = _WORKER_BASE_WEIGHTS.copy()
-        paths: List[List[int]] = []
-        
+        paths: list[list[int]] = []
+
         max_attempts = k * 10
         attempts = 0
 
@@ -294,11 +292,11 @@ def _compute_penalty_chunk(
             attempts += 1
             if path is None:
                 break
-                
+
             # Penalize all edges used by this path to force exploration
             for eid in path:
                 weights[eid] *= penalty_factor
-                
+
             # Only append if strictly distinct
             if path not in paths:
                 paths.append(path)
@@ -314,17 +312,17 @@ def _enumerate_penalty_paths(
     od_pairs: np.ndarray,
     k: int,
     penalty_factor: float = 1.5,
-) -> Dict[Tuple[int, int], List[List[int]]]:
+) -> dict[tuple[int, int], list[list[int]]]:
     """Approximate k spatially-diverse paths via iterative penalized Dijkstra."""
     # Filter parallel edges – keep only the fastest per (u, v)
-    edge_dict: Dict[Tuple[int, int], Tuple[int, float]] = {}
+    edge_dict: dict[tuple[int, int], tuple[int, float]] = {}
     for e in range(edge_endpoints.shape[0]):
         u, v = int(edge_endpoints[e, 0]), int(edge_endpoints[e, 1])
         w = float(ff_times[e])
         if (u, v) not in edge_dict or w < edge_dict[(u, v)][1]:
             edge_dict[(u, v)] = (e, w)
 
-    adj: Dict[int, List[Tuple[int, int]]] = {}
+    adj: dict[int, list[tuple[int, int]]] = {}
     for (u, v), (e, _) in edge_dict.items():
         adj.setdefault(u, []).append((v, e))
 
@@ -333,7 +331,7 @@ def _enumerate_penalty_paths(
     num_workers = os.cpu_count() or 4
     chunks = np.array_split(od_pairs, max(1, num_workers * 4))
 
-    result: Dict[Tuple[int, int], List[List[int]]] = {}
+    result: dict[tuple[int, int], list[list[int]]] = {}
     with ProcessPoolExecutor(
         max_workers=num_workers,
         initializer=_init_penalty_worker,
@@ -357,6 +355,7 @@ def _enumerate_penalty_paths(
 #  Public API
 # ===========================================================================
 
+
 # Kept for backward compatibility (was the original public entry point)
 def enumerate_top_k_paths(
     num_nodes: int,
@@ -366,7 +365,7 @@ def enumerate_top_k_paths(
     k: int,
     method: str = "yen",
     penalty_factor: float = 1.5,
-) -> Dict[Tuple[int, int], List[List[int]]]:
+) -> dict[tuple[int, int], list[list[int]]]:
     """Enumerate top-k paths using the selected algorithm.
 
     Parameters
@@ -379,9 +378,7 @@ def enumerate_top_k_paths(
     if method == "yen":
         return _enumerate_yen_paths(num_nodes, edge_endpoints, ff_times, od_pairs, k)
     elif method == "sidetrack":
-        return _enumerate_sidetrack_paths(
-            num_nodes, edge_endpoints, ff_times, od_pairs, k
-        )
+        return _enumerate_sidetrack_paths(num_nodes, edge_endpoints, ff_times, od_pairs, k)
     elif method == "penalty":
         return _enumerate_penalty_paths(
             num_nodes, edge_endpoints, ff_times, od_pairs, k, penalty_factor
@@ -400,7 +397,7 @@ def get_or_compute_top_k_paths(
     method: str = "yen",
     penalty_factor: float = 1.5,
     force_recompute: bool = False,
-) -> Dict[Tuple[int, int], List[List[int]]]:
+) -> dict[tuple[int, int], list[list[int]]]:
     """Get top-k paths from cache, or compute and cache them.
 
     Each (method, k, penalty_factor) combination uses a distinct cache file so
@@ -421,16 +418,12 @@ def get_or_compute_top_k_paths(
         legacy_path = None
     elif method == "penalty":
         pf_str = f"{penalty_factor:.2f}".rstrip("0").rstrip(".")
-        cache_path = os.path.join(
-            scenario_dir, f"top_k_paths_k{k}_penalty_f{pf_str}.pkl"
-        )
+        cache_path = os.path.join(scenario_dir, f"top_k_paths_k{k}_penalty_f{pf_str}.pkl")
         legacy_path = None
     else:
-        raise ValueError(
-            f"Unknown method '{method}'. Choose from: yen, sidetrack, penalty."
-        )
+        raise ValueError(f"Unknown method '{method}'. Choose from: yen, sidetrack, penalty.")
 
-    paths_dict: Dict[Tuple[int, int], List[List[int]]] = {}
+    paths_dict: dict[tuple[int, int], list[list[int]]] = {}
 
     # Try primary cache
     if not force_recompute and os.path.exists(cache_path):

@@ -4,6 +4,7 @@ Agent sans état qui sélectionne une route uniforme aléatoire parmi les
 routes valides pour chaque véhicule. Agnostique au niveau d'agrégation :
 il reçoit aggregation_indices [N] mais ne l'utilise pas (pas de paramètres).
 """
+
 from __future__ import annotations
 
 from typing import Optional
@@ -25,7 +26,7 @@ class RandomAgent:
         seed:        Graine aléatoire pour la reproductibilité.
     """
 
-    def __init__(self, num_agents: int, k: int, seed: Optional[int] = None):
+    def __init__(self, num_agents: int, k: int, seed: int | None = None):
         self.num_agents = num_agents
         self.k = k
         if seed is not None:
@@ -35,7 +36,7 @@ class RandomAgent:
         self,
         obs: torch.Tensor,
         masks: torch.Tensor,
-        aggregation_indices: Optional[torch.Tensor] = None,
+        aggregation_indices: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         """Échantillonne une route valide uniformément pour chaque véhicule.

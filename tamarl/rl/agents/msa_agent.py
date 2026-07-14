@@ -17,6 +17,7 @@ Mise à jour (update)
     par bloc préférant chaque chemin.
   - Blended Update : probs ← (1 - α) * probs + α * target_distribution.
 """
+
 from __future__ import annotations
 
 import math
@@ -55,7 +56,7 @@ class MSAAgent:
         env,
         k_paths: int,
         device: str = "cpu",
-        seed: Optional[int] = None,
+        seed: int | None = None,
         alpha_max: float = 1.0,
         alpha_min: float = 0.05,
         alpha_decay: float = 0.01,
@@ -109,7 +110,7 @@ class MSAAgent:
         self,
         obs: torch.Tensor,
         masks: torch.Tensor,
-        aggregation_indices: Optional[torch.Tensor] = None,
+        aggregation_indices: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         """Échantillonne une action par leg selon la distribution MSA courante.
@@ -161,7 +162,7 @@ class MSAAgent:
         self,
         actions: torch.Tensor,
         rewards: torch.Tensor,
-        aggregation_indices: Optional[torch.Tensor] = None,
+        aggregation_indices: torch.Tensor | None = None,
         **kwargs,
     ) -> None:
         """Mise à jour MSA via l'oracle TD sur tous les K chemins.
@@ -174,7 +175,9 @@ class MSAAgent:
             aggregation_indices:  [N] mapping legs → blocs B.
         """
         self.episode += 1
-        alpha = self.alpha_min + (self.alpha_max - self.alpha_min) * math.exp(-self.alpha_decay * self.episode)
+        alpha = self.alpha_min + (self.alpha_max - self.alpha_min) * math.exp(
+            -self.alpha_decay * self.episode
+        )
 
         dnl = self._env.bandit.dnl
         if not dnl.collect_link_tt:
@@ -192,7 +195,7 @@ class MSAAgent:
         )
 
         # Strategic Ignorance: mask out unstarted legs from the oracle output
-        valid_mask = kwargs.get('valid_mask')
+        valid_mask = kwargs.get("valid_mask")
         if valid_mask is not None:
             best_k = best_k[valid_mask]
             aggregation_indices = aggregation_indices[valid_mask]
@@ -220,7 +223,9 @@ class MSAAgent:
 
         # ── MSA blend: p ← (1 - α) * p + α * target ──────────────────
         # On ne met à jour que les blocs actifs pour éviter l'underflow vers zéro des inactifs
-        self.probs[active_blocks] = (1.0 - alpha) * self.probs[active_blocks] + alpha * target[active_blocks]
+        self.probs[active_blocks] = (1.0 - alpha) * self.probs[active_blocks] + alpha * target[
+            active_blocks
+        ]
 
     # ──────────────────────────────────────────────────────────────────
     #  Housekeeping
@@ -230,7 +235,9 @@ class MSAAgent:
         pass
 
     def __repr__(self) -> str:
-        alpha = self.alpha_min + (self.alpha_max - self.alpha_min) * math.exp(-self.alpha_decay * self.episode)
+        alpha = self.alpha_min + (self.alpha_max - self.alpha_min) * math.exp(
+            -self.alpha_decay * self.episode
+        )
         return (
             f"MSAAgent(B={self.num_models}, N_legs={self.num_envs}, "
             f"K={self.k_paths}, episode={self.episode}, α={alpha:.4f})"

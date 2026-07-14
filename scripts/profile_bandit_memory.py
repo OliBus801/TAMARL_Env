@@ -1,25 +1,27 @@
 import argparse
-import os
-import torch
-import numpy as np
-import time
 import inspect
+import os
+import time
 
-from tamarl.envs.dta_bandit_env import DTABanditEnv
+import numpy as np
+import torch
+
 from tamarl.envs.agent_level_wrapper import AgentLevelWrapper
-from tamarl.envs.od_level_wrapper import ODLevelWrapper
 from tamarl.envs.centralized_level_wrapper import CentralizedLevelWrapper
+from tamarl.envs.dta_bandit_env import DTABanditEnv
+from tamarl.envs.od_level_wrapper import ODLevelWrapper
 from tamarl.rl.agents.random_agent import RandomAgent
-from tamarl.rl.train_bandit import _build_parser, load_config, _CLI_TO_KWARGS, run_episode, train
+from tamarl.rl.train_bandit import _CLI_TO_KWARGS, _build_parser, load_config, run_episode, train
+
 
 def run_bandit_profiling(kwargs):
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    
-    if device == 'cuda':
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
         mem_start = torch.cuda.memory_allocated() / 1024**2
         print(f"VRAM at start: {mem_start:.2f} MB")
-    
+
     print("\n--- 1. Instantiating DTABanditEnv ---")
     bandit = DTABanditEnv(
         scenario_path=kwargs["scenario_path"],
@@ -28,17 +30,17 @@ def run_bandit_profiling(kwargs):
         scale_factor=kwargs.get("scale_factor", 1.0),
         max_steps=kwargs.get("max_steps", 36000),
         device=device,
-        track_events=False
+        track_events=False,
     )
-    
-    if device == 'cuda':
+
+    if device == "cuda":
         mem_bandit = torch.cuda.memory_allocated() / 1024**2
         print(f"VRAM after DTABanditEnv: {mem_bandit:.2f} MB")
 
     top_k_paths = kwargs.get("top_k", 3)
     formulation = kwargs.get("formulation", "agent")
     feedback_type = kwargs.get("feedback_type", "full")
-    
+
     print(f"\n--- 2. Instantiating Wrapper (formulation={formulation}, top_k={top_k_paths}) ---")
     if formulation == "agent":
         env = AgentLevelWrapper(bandit=bandit, top_k=top_k_paths, feedback_type=feedback_type)
@@ -48,52 +50,55 @@ def run_bandit_profiling(kwargs):
         env = CentralizedLevelWrapper(bandit=bandit, top_k=top_k_paths, feedback_type=feedback_type)
     else:
         raise ValueError(f"Unknown formulation: {formulation}")
-    
-    if device == 'cuda':
+
+    if device == "cuda":
         mem_wrapper = torch.cuda.memory_allocated() / 1024**2
         print(f"VRAM after {env.__class__.__name__}: {mem_wrapper:.2f} MB")
-        
+
         # Breakdown wrapper tensors
-        if hasattr(env, 'candidate_routes'):
+        if hasattr(env, "candidate_routes"):
             cr = env.candidate_routes
             size_mb = cr.element_size() * cr.nelement() / 1024**2
-            print(f"  - candidate_routes: {size_mb:.2f} MB (dtype: {cr.dtype}, shape: {list(cr.shape)})")
-            
+            print(
+                f"  - candidate_routes: {size_mb:.2f} MB (dtype: {cr.dtype}, shape: {list(cr.shape)})"
+            )
+
     print("\n--- 3. Running 1 Episode (like train_bandit.py) ---")
     agent = RandomAgent(num_agents=env.num_envs, k=top_k_paths)
-    
-    print("Running run_episode(env, agent)... (This triggers reset, action generation, step & update)")
-    
-    if device == 'cuda':
+
+    print(
+        "Running run_episode(env, agent)... (This triggers reset, action generation, step & update)"
+    )
+
+    if device == "cuda":
         torch.cuda.empty_cache()
-        mem_before_step = torch.cuda.memory_allocated() / 1024**2
-    
+
     # Execute the full episode cycle manually tracking memory (Zero overhead)
-    if device == 'cuda':
+    if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
-        
+
     t0 = time.time()
     run_episode(env, agent)
     elapsed = time.time() - t0
-    
+
     print(f"\nEpisode finished in {elapsed:.2f} seconds.")
 
-    if device == 'cuda':
+    if device == "cuda":
         mem_after_step = torch.cuda.memory_allocated() / 1024**2
         peak_step = torch.cuda.max_memory_allocated() / 1024**2
         print(f"\nVRAM after 1 episode: {mem_after_step:.2f} MB")
         print(f"Peak VRAM during episode: {peak_step:.2f} MB")
-        
+
         with open("memory_summary_bandit.txt", "w") as f:
             f.write(torch.cuda.memory_summary(device=device))
         print("\nSaved detailed memory summary to memory_summary_bandit.txt")
 
     # Final breakdown of DNL inside bandit
     if bandit.dnl is not None:
-        print("\n--- Final Breakdown of inner TorchDNLMATSim ---")
+        print("\n--- Final Breakdown of inner TorchDNL ---")
         tensors = [
-            ('paths_flat', getattr(bandit.dnl, 'paths_flat', None)),
-            ('interval_tt_sum', getattr(bandit.dnl, 'interval_tt_sum', None)),
+            ("paths_flat", getattr(bandit.dnl, "paths_flat", None)),
+            ("interval_tt_sum", getattr(bandit.dnl, "interval_tt_sum", None)),
         ]
         for name, t in tensors:
             if t is not None:
@@ -104,15 +109,13 @@ def run_bandit_profiling(kwargs):
 def main():
     parser = _build_parser()
     parser.description = "Profile the One-Shot Bandit DTA memory footprint"
-    
+
     args, unknown = parser.parse_known_args()
 
     # 1. Start with train() defaults
     sig = inspect.signature(train)
     kwargs = {
-        k: v.default
-        for k, v in sig.parameters.items()
-        if v.default is not inspect.Parameter.empty
+        k: v.default for k, v in sig.parameters.items() if v.default is not inspect.Parameter.empty
     }
 
     # 2. Override with JSON config if provided
@@ -134,8 +137,9 @@ def main():
     # 4. Ensure scenario_path is set
     if "scenario_path" not in kwargs or kwargs["scenario_path"] is None:
         parser.error("--scenario is required (via CLI or config file)")
-        
+
     run_bandit_profiling(kwargs)
+
 
 if __name__ == "__main__":
     main()

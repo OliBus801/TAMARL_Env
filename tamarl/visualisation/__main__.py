@@ -1,4 +1,4 @@
-"""CLI entry point for the TAMARL_Env visualization module.
+"""CLI entry point for the TrafficGym visualization module.
 
 Usage:
     python -m tamarl.visualisation <scenario_folder> <output_folder> [options]
@@ -10,91 +10,82 @@ import os
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate GIF/MP4 visualization or open live viewer of a TAMARL_Env simulation."
+        description="Generate GIF/MP4 visualization or open live viewer of a TrafficGym simulation."
     )
     parser.add_argument(
-        "scenario_folder",
-        help="Path to the scenario folder (must contain a *network*.xml file)."
+        "scenario_folder", help="Path to the scenario folder (must contain a *network*.xml file)."
     )
     parser.add_argument(
         "output_folder",
-        help="Name of the output folder. Base path is assumed to be scenario_folder. (must contain an *events*.csv file)."
+        help="Name of the output folder. Base path is assumed to be scenario_folder. (must contain an *events*.csv file).",
     )
     parser.add_argument(
-        "--format", "-f",
+        "--format",
+        "-f",
         choices=["gif", "mp4"],
         default="gif",
-        help="Output format (default: gif)."
+        help="Output format (default: gif).",
     )
+    parser.add_argument("--fps", type=int, default=5, help="Frames per second (default: 5).")
     parser.add_argument(
-        "--fps",
-        type=int,
-        default=5,
-        help="Frames per second (default: 5)."
-    )
-    parser.add_argument(
-        "--output", "-o",
+        "--output",
+        "-o",
         default=None,
-        help="Output file path. Defaults to <output_folder>/simulation.<format>."
+        help="Output file path. Defaults to <output_folder>/simulation.<format>.",
     )
-    parser.add_argument(
-        "--dpi",
-        type=int,
-        default=150,
-        help="DPI resolution (default: 150)."
-    )
+    parser.add_argument("--dpi", type=int, default=150, help="DPI resolution (default: 150).")
     parser.add_argument(
         "--scale-factor",
         type=float,
         default=1.0,
         help="Scale factor for graph elements (nodes, agents, links). "
-             "Use >1 for small scenarios, <1 for large ones (default: 1.0)."
+        "Use >1 for small scenarios, <1 for large ones (default: 1.0).",
     )
     parser.add_argument(
         "--text-scale-factor",
         type=float,
         default=1.0,
-        help="Scale factor for text labels on nodes, links, and agent IDs (default: 1.0)."
+        help="Scale factor for text labels on nodes, links, and agent IDs (default: 1.0).",
     )
     parser.add_argument(
         "--no-labels",
         action="store_true",
         default=False,
         help="Hide all text labels (node IDs, link info, agent IDs). "
-             "Useful for large scenarios where text clutters the view."
+        "Useful for large scenarios where text clutters the view.",
     )
     parser.add_argument(
         "--live",
         action="store_true",
         default=False,
         help="Open an interactive live viewer instead of rendering to file. "
-             "Ideal for large scenarios with many timesteps."
+        "Ideal for large scenarios with many timesteps.",
     )
     parser.add_argument(
         "--speed",
         type=int,
         default=1,
-        help="Initial playback speed in live mode (timesteps per tick, default: 1)."
+        help="Initial playback speed in live mode (timesteps per tick, default: 1).",
     )
     parser.add_argument(
         "--hours",
         type=float,
         nargs=2,
-        metavar=('START', 'END'),
-        help="Filter events to a specific time range in hours (e.g. '--hours 7 7.25')."
+        metavar=("START", "END"),
+        help="Filter events to a specific time range in hours (e.g. '--hours 7 7.25').",
     )
     parser.add_argument(
         "--zoom-factor",
         type=float,
         default=1.0,
-        help="Zoom factor to scale the map bounds. > 1 zooms in, < 1 zooms out (default: 1.0)."
+        help="Zoom factor to scale the map bounds. > 1 zooms in, < 1 zooms out (default: 1.0).",
     )
     parser.add_argument(
         "--zoom-center",
         type=float,
         nargs=2,
-        metavar=('X', 'Y'),
-        help="Target coordinates (X, Y) to center the zoom. Left empty, centers on the default network center."
+        metavar=("X", "Y"),
+        help="Target coordinates (X, Y) to center the zoom. Left empty, centers on the default network center.",
     )
 
     args = parser.parse_args()
@@ -107,6 +98,7 @@ def main():
 
     if args.live:
         from tamarl.visualisation.renderer import render_live
+
         render_live(
             scenario_folder=args.scenario_folder,
             output_folder=output_folder,
@@ -120,6 +112,7 @@ def main():
         )
     else:
         from tamarl.visualisation.renderer import render_animation
+
         render_name = args.output
         if render_name is None:
             output_path = os.path.join(output_folder, f"simulation.{args.format}")
@@ -141,6 +134,7 @@ def main():
             zoom_factor=args.zoom_factor,
             zoom_center=args.zoom_center,
         )
+
 
 if __name__ == "__main__":
     main()

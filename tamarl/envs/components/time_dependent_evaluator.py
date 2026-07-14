@@ -1,7 +1,7 @@
 """Time-Dependent Path Evaluator.
 
 Reconstructs experienced link travel times from the data collected during
-a completed TorchDNLMATSim simulation and uses them to evaluate the Top-K 
+a completed TorchDNL simulation and uses them to evaluate the Top-K
 candidate paths for every OD pair in an O(A × K × MaxPathLen) vectorised
 PyTorch forward pass.
 
@@ -27,23 +27,24 @@ Typical usage (inside AgentLevelWrapper.step or a post-episode callback):
     # path_costs : [TotalLegs, K]  – TD travel time (seconds) for each path
     # best_k     : [TotalLegs]     – index of the cheapest path
 """
+
 from __future__ import annotations
 
 from typing import Optional, Tuple
 
 import torch
 
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Low-level helpers (no state)
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 def evaluate_paths_time_dependent(
-    dynamic_tt: torch.Tensor,       # [NumIntervals, NumEdges] average travel time in seconds
-    link_tt_interval: float,        # width of interval in seconds
-    routes: torch.Tensor,           # [Batch, K, MaxRouteLen] edge indices, -1 = padding
-    first_edges: torch.Tensor,      # [Batch] first-edge index per leg
-    departure_times_sec: torch.Tensor,# [Batch] departure time in seconds
+    dynamic_tt: torch.Tensor,  # [NumIntervals, NumEdges] average travel time in seconds
+    link_tt_interval: float,  # width of interval in seconds
+    routes: torch.Tensor,  # [Batch, K, MaxRouteLen] edge indices, -1 = padding
+    first_edges: torch.Tensor,  # [Batch] first-edge index per leg
+    departure_times_sec: torch.Tensor,  # [Batch] departure time in seconds
     num_edges: int,
 ) -> torch.Tensor:
     """Evaluate K candidate routes for each element of a batch in O(Batch×K×L).
@@ -67,22 +68,22 @@ def evaluate_paths_time_dependent(
 
     # Current simulated clock in seconds for every (batch, k) pair
     current_time_sec = departure_times_sec.unsqueeze(1).expand(Batch, K).clone()
-    
+
     # helper for processing one step on an edge
     def _traverse(edges_mask, edges_b_k, cur_time_b_k):
         flat_mask = edges_mask.reshape(-1)
         valid_indices = torch.nonzero(flat_mask, as_tuple=True)[0]
         if valid_indices.numel() == 0:
             return torch.zeros_like(cur_time_b_k)
-            
+
         flat_edges = edges_b_k.reshape(-1)[valid_indices].clamp(min=0, max=num_edges - 1)
         flat_times = cur_time_b_k.reshape(-1)[valid_indices]
-        
+
         # Find which interval the agent arrives at the link
         interval_idx = (flat_times / link_tt_interval).long().clamp(max=NumIntervals - 1)
-        
+
         step_tt_sec = dynamic_tt[interval_idx, flat_edges]
-        
+
         result = torch.zeros(Batch * K, device=device, dtype=torch.float32)
         result[valid_indices] = step_tt_sec
         return result.view(Batch, K)
@@ -96,7 +97,7 @@ def evaluate_paths_time_dependent(
     # ── Route edges (vary per K path) ────────────────────────────────────────
     for step in range(MaxLen):
         edges = routes[:, :, step]  # [Batch, K]
-        valid_mask = (edges >= 0)   # [Batch, K]
+        valid_mask = edges >= 0  # [Batch, K]
         if not valid_mask.any():
             break
 
@@ -108,11 +109,10 @@ def evaluate_paths_time_dependent(
     return path_costs
 
 
-
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Stateful convenience class
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 class TimeDependentEvaluator:
     """Stateful wrapper around the two low-level helpers above.
@@ -130,35 +130,35 @@ class TimeDependentEvaluator:
 
     def __init__(
         self,
-        routes_flat_csr: torch.Tensor,    # [TotalActualEdges] int32
-        routes_offsets_csr: torch.Tensor, # [NumOD * K + 1] int64
-        K: int,                           # number of candidate routes per OD
-        first_edges: torch.Tensor,        # [TotalLegs]
-        od_indices: torch.Tensor,         # [TotalLegs]
+        routes_flat_csr: torch.Tensor,  # [TotalActualEdges] int32
+        routes_offsets_csr: torch.Tensor,  # [NumOD * K + 1] int64
+        K: int,  # number of candidate routes per OD
+        first_edges: torch.Tensor,  # [TotalLegs]
+        od_indices: torch.Tensor,  # [TotalLegs]
         link_tt_interval: float = 300.0,
         device: str = "cpu",
-        leg_agent_map: Optional[torch.Tensor] = None,  # [TotalLegs] → agent idx
+        leg_agent_map: torch.Tensor | None = None,  # [TotalLegs] → agent idx
     ):
-        self.routes_flat_csr    = routes_flat_csr.to(device)
+        self.routes_flat_csr = routes_flat_csr.to(device)
         self.routes_offsets_csr = routes_offsets_csr.to(device)
-        self.K                  = K
-        self.first_edges        = first_edges.to(device)
-        self.od_indices         = od_indices.to(device)
-        self.link_tt_interval   = link_tt_interval
-        self.device             = device
-        self._leg_agent_map     = leg_agent_map.to(device) if leg_agent_map is not None else None
+        self.K = K
+        self.first_edges = first_edges.to(device)
+        self.od_indices = od_indices.to(device)
+        self.link_tt_interval = link_tt_interval
+        self.device = device
+        self._leg_agent_map = leg_agent_map.to(device) if leg_agent_map is not None else None
 
     # ------------------------------------------------------------------
     def evaluate(
         self,
-        dnl,  # TorchDNLMATSim instance (after a completed simulation)
+        dnl,  # TorchDNL instance (after a completed simulation)
         departure_times: torch.Tensor,  # [A] scenario departure times (steps)
-        od_indices: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        od_indices: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run the time-dependent path evaluation.
 
         Args:
-            dnl:            A *completed* TorchDNLMATSim instance.
+            dnl:            A *completed* TorchDNL instance.
             departure_times:[A] departure times in simulation **steps**
                             (will be converted to seconds using ``dnl.dt``).
             od_indices:     Optional override for the leg→OD mapping.
@@ -173,8 +173,10 @@ class TimeDependentEvaluator:
 
         # ── Fetch interval-based average link travel times ───────────
         if not dnl.collect_link_tt:
-            raise ValueError("TimeDependentEvaluator requires dnl.collect_link_tt=True to evaluate paths.")
-            
+            raise ValueError(
+                "TimeDependentEvaluator requires dnl.collect_link_tt=True to evaluate paths."
+            )
+
         dynamic_tt = dnl.get_dynamic_link_travel_times()
         if dynamic_tt is None:
             # Fallback to free flow travel time if simulation hasn't run
@@ -197,18 +199,19 @@ class TimeDependentEvaluator:
         for start_idx in range(0, Batch, CHUNK_SIZE):
             end_idx = min(start_idx + CHUNK_SIZE, Batch)
             chunk_size = end_idx - start_idx
-            
+
             od_chunk = od_idx[start_idx:end_idx]
             dep_sec_chunk = dep_sec_all[start_idx:end_idx]
             fe_chunk = fe_all[start_idx:end_idx]
 
             # ── Reconstruct minimal-width route tensor for this chunk ─────
             route_rows_2d = od_chunk.unsqueeze(1) * self.K + torch.arange(
-                self.K, device=self.device, dtype=torch.long).unsqueeze(0)
+                self.K, device=self.device, dtype=torch.long
+            ).unsqueeze(0)
             route_rows_flat = route_rows_2d.reshape(-1)
             starts = self.routes_offsets_csr[route_rows_flat]
-            ends   = self.routes_offsets_csr[route_rows_flat + 1]
-            lens   = (ends - starts).long()
+            ends = self.routes_offsets_csr[route_rows_flat + 1]
+            lens = (ends - starts).long()
             max_len = int(lens.max().item()) if lens.numel() > 0 and lens.max() > 0 else 0
 
             routes_chunk = torch.full(
@@ -218,10 +221,16 @@ class TimeDependentEvaluator:
                 total_e = int(lens.sum().item())
                 if total_e > 0:
                     bk_of_e = torch.repeat_interleave(
-                        torch.arange(chunk_size * self.K, device=self.device, dtype=torch.long), lens)
-                    cs_bk = torch.zeros(chunk_size * self.K + 1, device=self.device, dtype=torch.long)
+                        torch.arange(chunk_size * self.K, device=self.device, dtype=torch.long),
+                        lens,
+                    )
+                    cs_bk = torch.zeros(
+                        chunk_size * self.K + 1, device=self.device, dtype=torch.long
+                    )
                     cs_bk[1:] = torch.cumsum(lens, dim=0)
-                    rank = torch.arange(total_e, device=self.device, dtype=torch.long) - cs_bk[bk_of_e]
+                    rank = (
+                        torch.arange(total_e, device=self.device, dtype=torch.long) - cs_bk[bk_of_e]
+                    )
                     routes_chunk[bk_of_e, rank] = self.routes_flat_csr[starts[bk_of_e] + rank]
             routes_chunk = routes_chunk.view(chunk_size, self.K, max(max_len, 1))
 
@@ -238,16 +247,16 @@ class TimeDependentEvaluator:
 
             # Free intermediates
             del route_rows_2d, route_rows_flat, starts, ends, lens, routes_chunk
-        
+
         # ── Concatenate and compute best_k ────────────────────────────
         path_costs = torch.cat(all_path_costs, dim=0)  # [TotalLegs, K]
-        best_k = path_costs.argmin(dim=1)              # [TotalLegs]
+        best_k = path_costs.argmin(dim=1)  # [TotalLegs]
 
         return path_costs, best_k
 
     # ------------------------------------------------------------------
     @classmethod
-    def from_wrapper(cls, env) -> "TimeDependentEvaluator":
+    def from_wrapper(cls, env) -> TimeDependentEvaluator:
         """Convenience constructor from a wrapper instance (any formulation).
 
         Args:

@@ -4,23 +4,23 @@ Converts DNL events (integer tuples) to CSV format compatible with
 the visualization renderer, then calls render_animation or render_live.
 """
 
-import os
 import csv
+import os
 import tempfile
 from typing import Dict, Optional
 
-from tamarl.core.dnl_matsim import TorchDNLMATSim, EVENT_TYPE_NAMES
+from tamarl.core.torchdnl import EVENT_TYPE_NAMES, TorchDNL
 
 
 def write_events_csv(
-    dnl: TorchDNLMATSim,
+    dnl: TorchDNL,
     output_path: str,
-    idx_to_link_id: Dict[int, str],
+    idx_to_link_id: dict[int, str],
 ):
     """Write DNL events to a CSV file compatible with the renderer.
 
     Args:
-        dnl: TorchDNLMATSim instance with track_events=True
+        dnl: TorchDNL instance with track_events=True
         output_path: path to write the events CSV
         idx_to_link_id: reverse map from edge index → link string ID
     """
@@ -30,9 +30,9 @@ def write_events_csv(
 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
-    with open(output_path, 'w', newline='') as f:
+    with open(output_path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(['time', 'type', 'person', 'link', 'extra'])
+        writer.writerow(["time", "type", "person", "link", "extra"])
 
         for evt in events:
             time_val = evt[0]
@@ -40,32 +40,32 @@ def write_events_csv(
             agent_id = int(evt[2])
             edge_id = int(evt[3])
 
-            evt_name = EVENT_TYPE_NAMES.get(evt_type_int, f'unknown_{evt_type_int}')
+            evt_name = EVENT_TYPE_NAMES.get(evt_type_int, f"unknown_{evt_type_int}")
             link_str = idx_to_link_id.get(edge_id, str(edge_id))
-            person_str = f'agent_{agent_id}'
+            person_str = f"agent_{agent_id}"
 
-            writer.writerow([time_val, evt_name, person_str, link_str, ''])
+            writer.writerow([time_val, evt_name, person_str, link_str, ""])
 
     return True
 
 
 def render_episode(
     scenario_path: str,
-    dnl: TorchDNLMATSim,
-    idx_to_link_id: Dict[int, str],
+    dnl: TorchDNL,
+    idx_to_link_id: dict[int, str],
     episode: int,
-    fmt: str = 'gif',
-    output_dir: Optional[str] = None,
+    fmt: str = "gif",
+    output_dir: str | None = None,
     render_fps: int = 5,
-    render_hours: Optional[tuple] = None,
+    render_hours: tuple | None = None,
     render_speed: int = 1,
-    filename: Optional[str] = None,
+    filename: str | None = None,
 ):
     """Render a completed episode's events to gif/mp4 or show live.
 
     Args:
         scenario_path: path to the scenario folder (contains network XML)
-        dnl: TorchDNLMATSim instance after episode completion
+        dnl: TorchDNL instance after episode completion
         idx_to_link_id: reverse map edge_idx → link string ID
         episode: episode number (for naming the output file)
         fmt: 'gif', 'mp4', or 'live'
@@ -74,7 +74,7 @@ def render_episode(
     from tamarl.visualisation.renderer import render_animation, render_live
 
     if output_dir is None:
-        output_dir = os.path.join(scenario_path, 'renders')
+        output_dir = os.path.join(scenario_path, "renders")
     os.makedirs(output_dir, exist_ok=True)
 
     time_range = None
@@ -82,7 +82,7 @@ def render_episode(
         time_range = (render_hours[0] * 3600.0, render_hours[1] * 3600.0)
 
     # Write events to a system temp CSV
-    fd, events_csv_path = tempfile.mkstemp(suffix='.csv', prefix=f'events_ep{episode}_')
+    fd, events_csv_path = tempfile.mkstemp(suffix=".csv", prefix=f"events_ep{episode}_")
     os.close(fd)
     has_events = write_events_csv(dnl, events_csv_path, idx_to_link_id)
 
@@ -94,17 +94,23 @@ def render_episode(
             pass
         return
 
-    if fmt == 'live':
-        render_live(scenario_path, output_dir, time_range=time_range, initial_speed=render_speed, events_file=events_csv_path)
+    if fmt == "live":
+        render_live(
+            scenario_path,
+            output_dir,
+            time_range=time_range,
+            initial_speed=render_speed,
+            events_file=events_csv_path,
+        )
     else:
         if filename:
             output_path = os.path.join(output_dir, f"{filename}.{fmt}")
         else:
-            output_path = os.path.join(output_dir, f'episode_{episode}.{fmt}')
-            
+            output_path = os.path.join(output_dir, f"episode_{episode}.{fmt}")
+
         render_animation(
-            scenario_path,      # scenario_folder (positional)
-            output_dir,         # output_folder (positional)
+            scenario_path,  # scenario_folder (positional)
+            output_dir,  # output_folder (positional)
             output_path=output_path,
             fmt=fmt,
             fps=render_fps,

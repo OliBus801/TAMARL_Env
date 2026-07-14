@@ -15,8 +15,10 @@ Mise à jour des poids (update)
     véhicule puis agrégé (moyenné) par bloc via scatter_add_.
   - Mise à jour des paramètres a posteriori self.means et self.stds [B, K].
 """
-import torch
+
 from typing import Optional
+
+import torch
 
 
 class ThompsonSamplingAgent:
@@ -41,15 +43,15 @@ class ThompsonSamplingAgent:
 
     def __init__(
         self,
-        num_agents: int,       # B (nombre de blocs de paramètres)
+        num_agents: int,  # B (nombre de blocs de paramètres)
         k_paths: int,
-        prior_mean: Optional[torch.Tensor] = None,
+        prior_mean: torch.Tensor | None = None,
         prior_std: float = 10000.0,
-        env_std: Optional[torch.Tensor] = None,
+        env_std: torch.Tensor | None = None,
         device: str = "cpu",
-        seed: Optional[int] = None,
+        seed: int | None = None,
         # Alias moderne
-        num_models: Optional[int] = None,
+        num_models: int | None = None,
     ):
         if num_models is not None:
             num_agents = num_models
@@ -64,14 +66,10 @@ class ThompsonSamplingAgent:
                 prior_mean = torch.tensor(prior_mean, device=device, dtype=torch.float32)
             self.means = prior_mean.to(device).float()
         else:
-            self.means = torch.zeros(
-                (num_models, k_paths), device=device, dtype=torch.float32
-            )
+            self.means = torch.zeros((num_models, k_paths), device=device, dtype=torch.float32)
 
         # ── Écarts-types a posteriori [B, K] (croyance) ─────────────
-        self.stds = torch.full(
-            (num_agents, k_paths), prior_std, device=device, dtype=torch.float32
-        )
+        self.stds = torch.full((num_agents, k_paths), prior_std, device=device, dtype=torch.float32)
 
         # ── Variance environnementale [B, 1] ─────────────────────────
         if env_std is not None:
@@ -81,9 +79,7 @@ class ThompsonSamplingAgent:
                 env_std = env_std.unsqueeze(1)  # [B, 1]
             self.env_var = env_std.to(device).float() ** 2  # [B, 1]
         else:
-            self.env_var = torch.full(
-                (num_agents, 1), 100.0 ** 2, device=device, dtype=torch.float32
-            )
+            self.env_var = torch.full((num_agents, 1), 100.0**2, device=device, dtype=torch.float32)
 
         if seed is not None:
             torch.manual_seed(seed)
@@ -99,7 +95,7 @@ class ThompsonSamplingAgent:
         self,
         obs: torch.Tensor,
         masks: torch.Tensor,
-        aggregation_indices: Optional[torch.Tensor] = None,
+        aggregation_indices: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         """Échantillonne depuis la distribution a posteriori et agit greedy.
@@ -122,7 +118,7 @@ class ThompsonSamplingAgent:
 
         # 1. Projection des paramètres a posteriori [B, K] → [N, K]
         m = self.means[aggregation_indices]  # [N, K]
-        s = self.stds[aggregation_indices]   # [N, K]
+        s = self.stds[aggregation_indices]  # [N, K]
 
         # 2. Tirage Thompson
         samples = torch.normal(mean=m, std=s)  # [N, K]
@@ -142,7 +138,7 @@ class ThompsonSamplingAgent:
         self,
         actions: torch.Tensor,
         rewards: torch.Tensor,
-        aggregation_indices: Optional[torch.Tensor] = None,
+        aggregation_indices: torch.Tensor | None = None,
         **kwargs,
     ) -> None:
         """Mise à jour bayésienne conjuguée des distributions a posteriori.
@@ -161,7 +157,7 @@ class ThompsonSamplingAgent:
             return
 
         # Strategic Ignorance: filter out unstarted legs
-        valid_mask = kwargs.get('valid_mask')
+        valid_mask = kwargs.get("valid_mask")
         if valid_mask is not None:
             actions = actions[valid_mask]
             rewards = rewards[valid_mask]
@@ -197,9 +193,9 @@ class ThompsonSamplingAgent:
         # env_var est [B, 1] → on expand pour [B, K]
         env_var_bk = self.env_var.expand_as(self.means)  # [B, K]
 
-        old_mean = self.means   # [B, K]
-        old_var = self.stds ** 2  # [B, K]
-        ev = env_var_bk           # [B, K]
+        old_mean = self.means  # [B, K]
+        old_var = self.stds**2  # [B, K]
+        ev = env_var_bk  # [B, K]
 
         # 1/σ²_new = 1/σ²_old + 1/σ²_env
         new_var = 1.0 / ((1.0 / old_var) + (1.0 / ev))

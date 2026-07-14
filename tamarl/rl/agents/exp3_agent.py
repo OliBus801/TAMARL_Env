@@ -16,9 +16,11 @@ Mise à jour des poids (update)
   - Agrégation vers [B, K] via scatter_add_ (moyenne par bloc).
   - Mise à jour multiplicative de self.weights[B, K] sur les blocs actifs.
 """
+
+from typing import Optional
+
 import torch
 import torch.nn.functional as F
-from typing import Optional
 
 
 class Exp3Agent:
@@ -43,15 +45,15 @@ class Exp3Agent:
 
     def __init__(
         self,
-        num_agents: int,       # B (nombre de blocs de paramètres)
+        num_agents: int,  # B (nombre de blocs de paramètres)
         k_paths: int,
         eta: float = 0.01,
         gamma: float = 0.05,
         rho: float = 1.0,
         device: str = "cpu",
-        seed: Optional[int] = None,
+        seed: int | None = None,
         # Alias moderne
-        num_models: Optional[int] = None,
+        num_models: int | None = None,
     ):
         if num_models is not None:
             num_agents = num_models
@@ -67,14 +69,12 @@ class Exp3Agent:
             torch.manual_seed(seed)
 
         # Poids internes [B, K], initialisés à 1.0 selon Exp3 standard
-        self.weights = torch.ones(
-            (num_agents, k_paths), device=device, dtype=torch.float32
-        )
+        self.weights = torch.ones((num_agents, k_paths), device=device, dtype=torch.float32)
 
         # Probabilités du dernier tirage [N, K] — sauvegardées pour l'update
-        self._last_probs: Optional[torch.Tensor] = None
+        self._last_probs: torch.Tensor | None = None
         # Aggregation_indices utilisés lors du dernier tirage — nécessaires pour l'update
-        self._last_agg_idx: Optional[torch.Tensor] = None
+        self._last_agg_idx: torch.Tensor | None = None
 
     # ── Rétrocompatibilité ───────────────────────────────────────────────
     @property
@@ -87,7 +87,7 @@ class Exp3Agent:
         self,
         obs: torch.Tensor,
         masks: torch.Tensor,
-        aggregation_indices: Optional[torch.Tensor] = None,
+        aggregation_indices: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         """Échantillonne des actions selon la distribution Hedge + uniforme.
@@ -148,7 +148,7 @@ class Exp3Agent:
         self,
         actions: torch.Tensor,
         rewards: torch.Tensor,
-        aggregation_indices: Optional[torch.Tensor] = None,
+        aggregation_indices: torch.Tensor | None = None,
         **kwargs,
     ) -> None:
         """Mise à jour multiplicative Exp3 : w[a] *= exp(-eta * cost_hat / p_a).
@@ -170,7 +170,7 @@ class Exp3Agent:
             return
 
         # Strategic Ignorance: filter out unstarted legs
-        valid_mask = kwargs.get('valid_mask')
+        valid_mask = kwargs.get("valid_mask")
         if valid_mask is not None:
             # _last_probs is [N_full, K], so we must filter it BEFORE filtering actions
             if self._last_probs is not None:

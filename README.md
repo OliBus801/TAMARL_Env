@@ -1,6 +1,6 @@
 # TAMARL_Env
 
-Modular multi-agent reinforcement learning environment for dynamic traffic assignment. Built on **PyTorch**, it features a fully vectorized, highly optimized mesoscopic traffic simulator (`TorchDNLMATSim`) inspired by MATSim's queue model.
+Modular multi-agent reinforcement learning environment for dynamic traffic assignment. Built on **PyTorch**, it features a fully vectorized, highly optimized mesoscopic traffic simulator (`TorchDNL`) inspired by MATSim's queue model.
 
 ## 🚀 Features
 
@@ -12,7 +12,7 @@ Modular multi-agent reinforcement learning environment for dynamic traffic assig
 
 ## 🏗️ Structure
 
-- `tamarl/core/dnl_matsim.py`: The core `TorchDNLMATSim` PyTorch simulator engine.
+- `tamarl/core/torchdnl.py`: The core `TorchDNL` PyTorch simulator engine.
 - `tamarl/envs/`: Environment wrappers and scenario loading.
 - `tamarl/data/scenarios/`: XML network and MATSim population definition files.
 - `tamarl/visualisation/`: Tools for rendering networks and plotting simulation histograms.
@@ -23,9 +23,9 @@ Modular multi-agent reinforcement learning environment for dynamic traffic assig
 ### 1. Basic Simulation (Static Paths)
 ```python
 import torch
-from tamarl.core.dnl_matsim import TorchDNLMATSim
+from tamarl.core.torchdnl import TorchDNL
 
-dnl = TorchDNLMATSim(
+dnl = TorchDNL(
     edge_static=edges_tensor,      # [length, free_speed, storage_cap, flow_cap, ff_time]
     paths=agent_paths,             # Pre-calculated routes
     edge_endpoints=endpoints,      # Network connectivity
@@ -38,7 +38,7 @@ for _ in range(num_steps):
 
 ### 2. Reinforcement Learning Mode (Dynamic Routing)
 ```python
-dnl = TorchDNLMATSim(
+dnl = TorchDNL(
     edge_static=edges_tensor, 
     paths=None,                    # Explicitly enables RL mode
     first_edges=starting_edges,
@@ -57,7 +57,7 @@ dnl.next_edge[agent_id] = chosen_next_edge
 
 **Run Simulator Unit Tests:**
 ```bash
-PYTHONPATH=. pytest tests/test_dnl_matsim.py
+PYTHONPATH=. pytest tests/test_torchdnl.py
 ```
 
 **Run Performance Benchmarks:**

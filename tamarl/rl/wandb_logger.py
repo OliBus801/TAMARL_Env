@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional
 
 class WandbLogger:
     """Thin wrapper around wandb for training metric logging.
-    
+
     If enabled=False or wandb is unavailable, all methods are no-ops.
     """
 
@@ -20,19 +20,20 @@ class WandbLogger:
         run_name: str = "undefined",
         scenario_id: str = "undefined",
         agent_type: str = "undefined",
-        config: Optional[Dict[str, Any]] = None,
+        config: dict[str, Any] | None = None,
         enabled: bool = True,
-        tags: Optional[List[str]] = None,
+        tags: list[str] | None = None,
     ):
         self.enabled = enabled
         self._wandb = None
         self._run = None
-        
+
         if not enabled:
             return
-        
+
         try:
             import wandb
+
             self._wandb = wandb
             self._run = wandb.init(
                 project=project,
@@ -47,11 +48,11 @@ class WandbLogger:
                 tags=tags,
                 reinit=True,
             )
-            
+
             # Use 'episode' as the custom x-axis for all metrics plotted
             self._wandb.define_metric("episode")
             self._wandb.define_metric("*", step_metric="episode")
-            
+
             print(f"📊 W&B run: {self._run.url}")
         except ImportError:
             print("⚠️  wandb not installed, logging disabled")
@@ -60,15 +61,15 @@ class WandbLogger:
             print(f"⚠️  wandb init failed: {e}, logging disabled")
             self.enabled = False
 
-    def log_config(self, config: Dict[str, Any]):
+    def log_config(self, config: dict[str, Any]):
         """Log additional config values after init."""
         if not self.enabled or self._wandb is None:
             return
         self._wandb.config.update(config, allow_val_change=True)
 
-    def log_episode(self, episode: int, metrics: Dict[str, Any]):
+    def log_episode(self, episode: int, metrics: dict[str, Any]):
         """Log per-episode metrics.
-        
+
         Args:
             episode: episode index (0-based)
             metrics: dict of metric_name → value
@@ -77,9 +78,9 @@ class WandbLogger:
             return
         self._wandb.log({"episode": episode, **metrics})
 
-    def log_summary(self, summary: Dict[str, Any]):
+    def log_summary(self, summary: dict[str, Any]):
         """Log final summary metrics (appear in run summary table).
-        
+
         Args:
             summary: dict of metric_name → value
         """
@@ -87,8 +88,6 @@ class WandbLogger:
             return
         for key, val in summary.items():
             self._wandb.run.summary[key] = val
-
-
 
     def finish(self):
         """Finalize the wandb run."""

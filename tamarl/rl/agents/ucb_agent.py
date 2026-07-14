@@ -14,8 +14,10 @@ Mise à jour des poids (update)
   - Mise à jour de la moyenne incrémentale : Q = Q + (R_mean - Q) / N_total.
   - Incrément du compteur de temps global t_per_model [B].
 """
-import torch
+
 from typing import Optional
+
+import torch
 
 
 class UCBAgent:
@@ -34,12 +36,12 @@ class UCBAgent:
 
     def __init__(
         self,
-        num_agents: int,       # B (nombre de blocs de paramètres)
+        num_agents: int,  # B (nombre de blocs de paramètres)
         k_paths: int,
         c_exploration: float = 100.0,
         device: str = "cpu",
         # Alias moderne
-        num_models: Optional[int] = None,
+        num_models: int | None = None,
     ):
         if num_models is not None:
             num_agents = num_models
@@ -50,9 +52,7 @@ class UCBAgent:
         self.device = device
 
         # Compteurs d'utilisation [B, K]
-        self.action_counts = torch.zeros(
-            (num_agents, k_paths), device=device, dtype=torch.float32
-        )
+        self.action_counts = torch.zeros((num_agents, k_paths), device=device, dtype=torch.float32)
 
         # Q-values estimées [B, K] — bruit initial pour briser la symétrie
         self.q_values = (
@@ -73,7 +73,7 @@ class UCBAgent:
         self,
         obs: torch.Tensor,
         masks: torch.Tensor,
-        aggregation_indices: Optional[torch.Tensor] = None,
+        aggregation_indices: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         """Sélectionne l'action avec le score UCB le plus élevé.
@@ -95,9 +95,9 @@ class UCBAgent:
             aggregation_indices = torch.arange(N, device=self.device)
 
         # 1. Projection [B, K] → [N, K]
-        counts = self.action_counts[aggregation_indices]   # [N, K]
-        q_vals = self.q_values[aggregation_indices]        # [N, K]
-        t = self.t_per_model[aggregation_indices]          # [N]
+        counts = self.action_counts[aggregation_indices]  # [N, K]
+        q_vals = self.q_values[aggregation_indices]  # [N, K]
+        t = self.t_per_model[aggregation_indices]  # [N]
 
         # 2. Terme d'exploration UCB
         ln_t = torch.log(t).unsqueeze(1)  # [N, 1]
@@ -121,7 +121,7 @@ class UCBAgent:
         self,
         actions: torch.Tensor,
         rewards: torch.Tensor,
-        aggregation_indices: Optional[torch.Tensor] = None,
+        aggregation_indices: torch.Tensor | None = None,
         **kwargs,
     ) -> None:
         """Met à jour les Q-values et les compteurs via moyenne incrémentale.
@@ -140,7 +140,7 @@ class UCBAgent:
             return
 
         # Strategic Ignorance: filter out unstarted legs
-        valid_mask = kwargs.get('valid_mask')
+        valid_mask = kwargs.get("valid_mask")
         if valid_mask is not None:
             actions = actions[valid_mask]
             rewards = rewards[valid_mask]

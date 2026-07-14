@@ -1,14 +1,16 @@
 """Metrics for evaluating DTA environment performance."""
 
 from typing import Dict, List, Optional
+
 import numpy as np
 import torch
-from tamarl.core.dnl_matsim import TorchDNLMATSim
 
+from tamarl.core.torchdnl import TorchDNL
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _get_all_leg_travel_times(dnl: TorchDNLMATSim) -> torch.Tensor:
+
+def _get_all_leg_travel_times(dnl: TorchDNL) -> torch.Tensor:
     """Collect travel times for ALL agents, including those still en-route.
 
     For arrived agents (status == 3): uses the recorded leg_metrics.
@@ -22,7 +24,7 @@ def _get_all_leg_travel_times(dnl: TorchDNLMATSim) -> torch.Tensor:
     parts: list[torch.Tensor] = []
 
     # 1. Completed legs from arrived agents
-    done_mask = (dnl.status == 3)
+    done_mask = dnl.status == 3
     if done_mask.any():
         done_tt = dnl.leg_metrics[done_mask, :, 1]  # [D, MaxLegs]
         valid = done_tt > 0
@@ -53,7 +55,7 @@ def _get_all_leg_travel_times(dnl: TorchDNLMATSim) -> torch.Tensor:
         # Status 1/2/4 agents are by definition on an active leg.
         # Status 0 agents (between legs) haven't started their current leg yet,
         # so only their completed legs (2a) count.
-        actually_en_route = (dnl.status[er_agents] != 0)
+        actually_en_route = dnl.status[er_agents] != 0
         if actually_en_route.any():
             in_progress_tt = (dnl.current_step - dep_times[actually_en_route]).float()
             # Clamp to 0 in case of edge timing quirks
@@ -67,7 +69,8 @@ def _get_all_leg_travel_times(dnl: TorchDNLMATSim) -> torch.Tensor:
 
 # ── Core Metrics ──────────────────────────────────────────────────────────────
 
-def compute_tstt(dnl: TorchDNLMATSim) -> float:
+
+def compute_tstt(dnl: TorchDNL) -> float:
     """Compute Total System Travel Time (TSTT).
 
     Includes all agents: arrived agents use their recorded travel time;
@@ -80,7 +83,7 @@ def compute_tstt(dnl: TorchDNLMATSim) -> float:
     return 0.0
 
 
-def compute_mean_travel_time(dnl: TorchDNLMATSim) -> float:
+def compute_mean_travel_time(dnl: TorchDNL) -> float:
     """Compute mean travel time across all agents (arrived + en-route)."""
     tt = _get_all_leg_travel_times(dnl)
     if tt.numel() > 0:
@@ -88,7 +91,7 @@ def compute_mean_travel_time(dnl: TorchDNLMATSim) -> float:
     return 0.0
 
 
-def compute_arrival_rate(dnl: TorchDNLMATSim) -> float:
+def compute_arrival_rate(dnl: TorchDNL) -> float:
     """Fraction of agents that have arrived at their destination."""
     done_count = (dnl.status == 3).sum().item()
     return done_count / dnl.num_agents if dnl.num_agents > 0 else 0.0
@@ -96,7 +99,8 @@ def compute_arrival_rate(dnl: TorchDNLMATSim) -> float:
 
 # ── Travel Time Distribution ────────────────────────────────────────────────
 
-def compute_travel_time_stats(dnl: TorchDNLMATSim) -> Dict[str, float]:
+
+def compute_travel_time_stats(dnl: TorchDNL) -> dict[str, float]:
     """Compute detailed travel time statistics across all agents.
 
     Includes en-route agents whose current-leg travel time is estimated
@@ -107,61 +111,59 @@ def compute_travel_time_stats(dnl: TorchDNLMATSim) -> Dict[str, float]:
     """
     tt = _get_all_leg_travel_times(dnl)
     if tt.numel() == 0:
-        return {k: 0.0 for k in ['mean', 'std', 'min', 'max', 'median', 'p90', 'p95']}
+        return {k: 0.0 for k in ["mean", "std", "min", "max", "median", "p90", "p95"]}
 
     tt_sec = tt.cpu().float() * dnl.dt
     tt_np = tt_sec.numpy()
 
     return {
-        'mean': float(tt_np.mean()),
-        'std': float(tt_np.std()),
-        'min': float(tt_np.min()),
-        'max': float(tt_np.max()),
-        'median': float(np.median(tt_np)),
-        'p90': float(np.percentile(tt_np, 90)),
-        'p95': float(np.percentile(tt_np, 95)),
+        "mean": float(tt_np.mean()),
+        "std": float(tt_np.std()),
+        "min": float(tt_np.min()),
+        "max": float(tt_np.max()),
+        "median": float(np.median(tt_np)),
+        "p90": float(np.percentile(tt_np, 90)),
+        "p95": float(np.percentile(tt_np, 95)),
     }
 
 
 # ── Episode Reward ──────────────────────────────────────────────────────────
 
-def compute_mean_episode_reward(cumulative_rewards: Dict[str, float]) -> float:
+
+def compute_mean_episode_reward(cumulative_rewards: dict[str, float]) -> float:
     """Mean cumulative reward across all agents in an episode."""
     if not cumulative_rewards:
         return 0.0
     return float(np.mean(list(cumulative_rewards.values())))
 
 
-def compute_reward_stats(cumulative_rewards: Dict[str, float]) -> Dict[str, float]:
+def compute_reward_stats(cumulative_rewards: dict[str, float]) -> dict[str, float]:
     """Detailed reward statistics across all agents."""
     if not cumulative_rewards:
-        return {k: 0.0 for k in ['mean', 'std', 'min', 'max']}
-    
+        return {k: 0.0 for k in ["mean", "std", "min", "max"]}
+
     vals = np.array(list(cumulative_rewards.values()))
     return {
-        'mean': float(vals.mean()),
-        'std': float(vals.std()),
-        'min': float(vals.min()),
-        'max': float(vals.max()),
+        "mean": float(vals.mean()),
+        "std": float(vals.std()),
+        "min": float(vals.min()),
+        "max": float(vals.max()),
     }
-
-
 
 
 # ── Nash Regret & Relative Gap (Empirical O(N)) ─────────────────────────────
 
 
-
 def compute_empirical_nash_metrics_tensor(
-    actual_travel_times: torch.Tensor, # [N] Temps réels vécus
-    actions: torch.Tensor,             # [N] Index du chemin pris (0 à K-1)
-    estimated_times: torch.Tensor,     # [N, K] Temps estimés par les N-Curves via l'évaluateur
+    actual_travel_times: torch.Tensor,  # [N] Temps réels vécus
+    actions: torch.Tensor,  # [N] Index du chemin pris (0 à K-1)
+    estimated_times: torch.Tensor,  # [N, K] Temps estimés par les N-Curves via l'évaluateur
     epsilon_threshold: float = 60.0,
-    valid_mask: torch.Tensor = None,   # [N] bool — True for legs that actually departed
+    valid_mask: torch.Tensor = None,  # [N] bool — True for legs that actually departed
 ) -> dict:
     """
     Calcule le Nash Regret et le Relative Gap de façon 100% tensorisée.
-    
+
     If valid_mask is provided, only legs where valid_mask==True are considered.
     This prevents unstarted legs (travel_time=0) from corrupting the metrics.
     """
@@ -173,29 +175,26 @@ def compute_empirical_nash_metrics_tensor(
 
     N = actual_travel_times.shape[0]
     if N == 0:
-        return {'mean_regret': 0.0, 'max_regret': 0.0, 'epsilon_compliance_rate': 0.0}
+        return {"mean_regret": 0.0, "max_regret": 0.0, "epsilon_compliance_rate": 0.0}
 
     # 1. Copie pour ne pas altérer le tenseur de l'évaluateur
     agent_options = estimated_times.clone()
-    
+
     # 2. RÈGLE D'OR : Masquer l'action prise avec infini
     batch_indices = torch.arange(N, device=actions.device)
-    agent_options[batch_indices, actions] = float('inf')
-    
+    agent_options[batch_indices, actions] = float("inf")
+
     # 3. Meilleure alternative (Best-Response)
     best_alt_tt, _ = torch.min(agent_options, dim=1)
-    
+
     # 4. Regret (borné à 0)
     regrets = torch.clamp(actual_travel_times - best_alt_tt, min=0.0)
-    
-    # 5. Synthèse
-    total_regret = regrets.sum()
-    epsilon_compliance = (regrets <= epsilon_threshold).float().mean().item()
-    
-    return {
-        'mean_regret': regrets.mean().item(),
-        'max_regret': regrets.max().item(),
-        'std_regret': regrets.std().item() if regrets.numel() > 1 else 0.0,
-        'epsilon_compliance_rate': epsilon_compliance,
-    }
 
+    epsilon_compliance = (regrets <= epsilon_threshold).float().mean().item()
+
+    return {
+        "mean_regret": regrets.mean().item(),
+        "max_regret": regrets.max().item(),
+        "std_regret": regrets.std().item() if regrets.numel() > 1 else 0.0,
+        "epsilon_compliance_rate": epsilon_compliance,
+    }

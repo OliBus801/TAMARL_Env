@@ -5,8 +5,10 @@ en temps de parcours libre). Agnostique au niveau d'agrégation : il reçoit
 un mapping aggregation_indices [N] mais n'en a pas besoin car sa politique
 est purement basée sur les masques d'action (sans paramètres internes).
 """
-import torch
+
 from typing import Optional
+
+import torch
 
 
 class AONAgent:
@@ -19,14 +21,14 @@ class AONAgent:
     agent_level, od_pair, ou tout autre mode.
     """
 
-    def __init__(self, seed: Optional[int] = None):
+    def __init__(self, seed: int | None = None):
         pass
 
     def get_actions_batched(
         self,
         obs: torch.Tensor,
         masks: torch.Tensor,
-        aggregation_indices: Optional[torch.Tensor] = None,
+        aggregation_indices: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         """Sélectionne la route 0 (plus court chemin libre) pour tous les véhicules.
@@ -49,9 +51,7 @@ class AONAgent:
         # Filet de sécurité : si route 0 invalide, prendre la première route valide
         is_route_zero_invalid = ~masks[:, 0].bool()
         if is_route_zero_invalid.any():
-            fallback_actions = torch.argmax(
-                masks[is_route_zero_invalid].int(), dim=1
-            )
+            fallback_actions = torch.argmax(masks[is_route_zero_invalid].int(), dim=1)
             actions[is_route_zero_invalid] = fallback_actions
 
         return actions

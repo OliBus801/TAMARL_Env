@@ -15,6 +15,7 @@ Memory comparison for Berlin 1% (32 314 OD, K=9, MaxRouteLen=844):
     Dense:  32314 × 9 × 844 × 4 B =  936 MB
     CSR:    32314 × 9 × avg_len × 4 B + 32314 × 9 × 8 B ≈  50-120 MB (typ.)
 """
+
 from __future__ import annotations
 
 from typing import Dict, List, Tuple
@@ -23,11 +24,11 @@ import numpy as np
 
 
 def build_routes_csr(
-    paths_dict: Dict[Tuple[int, int], List[List[int]]],
-    unique_od: np.ndarray,   # [NumUniqueOD, 2] int array
+    paths_dict: dict[tuple[int, int], list[list[int]]],
+    unique_od: np.ndarray,  # [NumUniqueOD, 2] int array
     top_k: int,
     edge_static_np: np.ndarray | None = None,  # [E, 5] for FFTT computation
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
     """Build CSR candidate routes from a paths dictionary.
 
     Args:
@@ -50,7 +51,7 @@ def build_routes_csr(
     masks_np = np.zeros((num_unique_od, top_k), dtype=bool)
 
     # First pass: determine lengths and validity
-    route_arrays: List[np.ndarray] = []
+    route_arrays: list[np.ndarray] = []
     for od_idx in range(num_unique_od):
         od_key = (int(unique_od[od_idx, 0]), int(unique_od[od_idx, 1]))
         paths_list = paths_dict.get(od_key, [])
@@ -62,7 +63,7 @@ def build_routes_csr(
                 path = np.array(paths_list[p_idx], dtype=np.int32)
                 route_arrays.append(path)
                 routes_offsets_np[row + 1] = len(path)
-                masks_np[od_idx, k_idx] = (k_idx < len(paths_list))
+                masks_np[od_idx, k_idx] = k_idx < len(paths_list)
             else:
                 route_arrays.append(np.array([], dtype=np.int32))
                 routes_offsets_np[row + 1] = 0
@@ -84,12 +85,14 @@ def build_routes_csr(
             for k_idx in range(top_k):
                 row = od_idx * top_k + k_idx
                 start = int(routes_offsets_np[row])
-                end   = int(routes_offsets_np[row + 1])
+                end = int(routes_offsets_np[row + 1])
                 if masks_np[od_idx, k_idx] and end > start:
                     path_edges = routes_flat_np[start:end]
                     # The agent starts in the capacity buffer of the `first_edge`, which is NOT part of `path_edges`.
                     # Therefore, ALL edges in `path_edges` are fully traversed by the agent.
-                    fftt_matrix_np[od_idx, k_idx] = edge_static_np[path_edges, 4].sum() if len(path_edges) > 0 else 0.0
+                    fftt_matrix_np[od_idx, k_idx] = (
+                        edge_static_np[path_edges, 4].sum() if len(path_edges) > 0 else 0.0
+                    )
                 else:
                     fftt_matrix_np[od_idx, k_idx] = np.inf
 

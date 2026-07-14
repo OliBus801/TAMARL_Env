@@ -17,8 +17,10 @@ Weights Update (update)
   - Aggregation to [B, K] via scatter_add_ (average per block).
   - Update of self.q_values[B, K] only on active entries.
 """
-import torch
+
 from typing import Optional
+
+import torch
 
 
 class EpsilonGreedyAgent:
@@ -39,17 +41,17 @@ class EpsilonGreedyAgent:
 
     def __init__(
         self,
-        num_agents: int,       # B (number of parameter blocks)
+        num_agents: int,  # B (number of parameter blocks)
         k_paths: int,
-        prior_mean: Optional[torch.Tensor] = None,
+        prior_mean: torch.Tensor | None = None,
         epsilon_start: float = 1.0,
         epsilon_end: float = 0.05,
         epsilon_decay: float = 0.995,
         alpha: float = 0.1,
         device: str = "cpu",
-        seed: Optional[int] = None,
+        seed: int | None = None,
         # Alias moderne : num_models prend le dessus sur num_agents si fourni
-        num_models: Optional[int] = None,
+        num_models: int | None = None,
     ):
         # Alias resolution: num_models takes priority
         if num_models is not None:
@@ -87,7 +89,7 @@ class EpsilonGreedyAgent:
         self,
         obs: torch.Tensor,
         masks: torch.Tensor,
-        aggregation_indices: Optional[torch.Tensor] = None,
+        aggregation_indices: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         """Selects an action for each of the N vehicles.
@@ -141,7 +143,7 @@ class EpsilonGreedyAgent:
         self,
         actions: torch.Tensor,
         rewards: torch.Tensor,
-        aggregation_indices: Optional[torch.Tensor] = None,
+        aggregation_indices: torch.Tensor | None = None,
         **kwargs,
     ) -> None:
         """Updates Q-values via EMA, aggregated by parameter block.
@@ -160,7 +162,7 @@ class EpsilonGreedyAgent:
             return
 
         # Strategic Ignorance: filter out unstarted legs
-        valid_mask = kwargs.get('valid_mask')
+        valid_mask = kwargs.get("valid_mask")
         if valid_mask is not None:
             actions = actions[valid_mask]
             rewards = rewards[valid_mask]

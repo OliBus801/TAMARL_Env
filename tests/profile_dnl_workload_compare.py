@@ -1,17 +1,17 @@
 """Compare DNL workload profiles for fixed-route benchmark and bandit training.
 
 This script answers a question that cProfile alone does not: when
-``dnl_matsim.step`` is slower in the RL loop, are the internal batches larger?
+``torchdnl.step`` is slower in the RL loop, are the internal batches larger?
 
-It instruments a ``TorchDNLMATSim`` instance at each tick and records:
+It instruments a ``TorchDNL`` instance at each tick and records:
 
 * per-phase timings for nodes_A, flow_update, links_B, and demand_C;
 * workload sizes before each tick, such as spatial candidates and demand queue;
 * every ``torch.argsort`` call made inside a DNL phase, including input size.
 
-The fixed-route benchmark run uses the MATSim route strings as ``paths``.
+The fixed-route benchmark run uses the route strings as ``paths``.
 The training run uses ``DTABanditEnv`` plus the selected bandit wrapper and
-profiles the ``TorchDNLMATSim`` instance created inside ``bandit.reset(paths)``.
+profiles the ``TorchDNL`` instance created inside ``bandit.reset(paths)``.
 """
 
 from __future__ import annotations
@@ -24,12 +24,13 @@ import time
 import types
 import xml.etree.ElementTree as ET
 from collections import defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 np = None
 torch = None
-TorchDNLMATSim = None
+TorchDNL = None
 DTABanditEnv = None
 AgentLevelWrapper = None
 ODLevelWrapper = None
@@ -41,7 +42,7 @@ load_config = None
 
 def _load_runtime_deps() -> None:
     """Import heavy runtime dependencies only after argparse has run."""
-    global np, torch, TorchDNLMATSim, DTABanditEnv, AgentLevelWrapper
+    global np, torch, TorchDNL, DTABanditEnv, AgentLevelWrapper
     global ODLevelWrapper, CentralizedLevelWrapper, RandomAgent, parse_network
     global load_config
 
@@ -51,18 +52,20 @@ def _load_runtime_deps() -> None:
     import numpy as _np
     import torch as _torch
 
-    from tamarl.core.dnl_matsim import TorchDNLMATSim as _TorchDNLMATSim
-    from tamarl.envs.dta_bandit_env import DTABanditEnv as _DTABanditEnv
+    from tamarl.core.torchdnl import TorchDNL as _TorchDNL
     from tamarl.envs.agent_level_wrapper import AgentLevelWrapper as _AgentLevelWrapper
+    from tamarl.envs.centralized_level_wrapper import (
+        CentralizedLevelWrapper as _CentralizedLevelWrapper,
+    )
+    from tamarl.envs.dta_bandit_env import DTABanditEnv as _DTABanditEnv
     from tamarl.envs.od_level_wrapper import ODLevelWrapper as _ODLevelWrapper
-    from tamarl.envs.centralized_level_wrapper import CentralizedLevelWrapper as _CentralizedLevelWrapper
     from tamarl.envs.scenario_loader import parse_network as _parse_network
     from tamarl.rl.agents.random_agent import RandomAgent as _RandomAgent
     from tamarl.rl.train_bandit import load_config as _load_config
 
     np = _np
     torch = _torch
-    TorchDNLMATSim = _TorchDNLMATSim
+    TorchDNL = _TorchDNL
     DTABanditEnv = _DTABanditEnv
     AgentLevelWrapper = _AgentLevelWrapper
     ODLevelWrapper = _ODLevelWrapper
@@ -89,20 +92,18 @@ WORKLOAD_KEYS = (
 def _time_to_sec(value: str) -> int:
     parts = value.split(":")
     if len(parts) != 3:
-        raise ValueError(f"Unsupported MATSim time value: {value!r}")
+        raise ValueError(f"Unsupported time value: {value!r}")
     h, m, s = (int(float(p)) for p in parts)
     return h * 3600 + m * 60 + s
 
 
 def _locate_scenario_files(
     root_folder: str,
-    population_filter: Optional[str],
-) -> Tuple[str, str]:
+    population_filter: str | None,
+) -> tuple[str, str]:
     files = [f for f in os.listdir(root_folder) if f.endswith(".xml")]
     net_candidates = [f for f in files if "network" in f.lower()]
-    pop_candidates = [
-        f for f in files if "population" in f.lower() or "plans" in f.lower()
-    ]
+    pop_candidates = [f for f in files if "population" in f.lower() or "plans" in f.lower()]
 
     if population_filter:
         token_matches = []
@@ -110,9 +111,7 @@ def _locate_scenario_files(
             tokens = candidate.replace("-", "_").replace(".", "_").split("_")
             if population_filter in tokens:
                 token_matches.append(candidate)
-        pop_candidates = token_matches or [
-            p for p in pop_candidates if population_filter in p
-        ]
+        pop_candidates = token_matches or [p for p in pop_candidates if population_filter in p]
 
     if not net_candidates:
         raise FileNotFoundError(f"No network XML found in {root_folder}")
@@ -132,10 +131,10 @@ def _locate_scenario_files(
 
 def _parse_population_paths(
     population_file: str,
-    link_id_to_idx: Dict[str, int],
-) -> List[Dict[str, Any]]:
-    """Parse MATSim plans into full fixed paths for benchmark-mode DNL."""
-    agents: List[Dict[str, Any]] = []
+    link_id_to_idx: dict[str, int],
+) -> list[dict[str, Any]]:
+    """Parse agent plans into full fixed paths for benchmark-mode DNL."""
+    agents: list[dict[str, Any]] = []
     skipped_legs = 0
 
     context = ET.iterparse(population_file, events=("end",))
@@ -158,9 +157,9 @@ def _parse_population_paths(
 
         first_dep_time = 0
         first_act = True
-        person_legs: List[List[int]] = []
-        act_end_times: List[int] = []
-        act_durations: List[int] = []
+        person_legs: list[list[int]] = []
+        act_end_times: list[int] = []
+        act_durations: list[int] = []
 
         for plan_element in list(selected_plan):
             if plan_element.tag in ("act", "activity"):
@@ -183,15 +182,13 @@ def _parse_population_paths(
             elif plan_element.tag == "leg" and plan_element.get("mode") == "car":
                 route_tag = plan_element.find("route")
                 route_text = (
-                    route_tag.text.strip()
-                    if route_tag is not None and route_tag.text
-                    else None
+                    route_tag.text.strip() if route_tag is not None and route_tag.text else None
                 )
                 if not route_text:
                     skipped_legs += 1
                     continue
 
-                path_indices: List[int] = []
+                path_indices: list[int] = []
                 valid_path = True
                 for link_id in route_text.split():
                     edge_idx = link_id_to_idx.get(link_id)
@@ -226,19 +223,16 @@ def _parse_population_paths(
 
 
 def _pack_fixed_route_agents(
-    agents: List[Dict[str, Any]],
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    agents: list[dict[str, Any]],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     num_agents = len(agents)
     max_path_len = max(
-        sum(len(leg) for leg in agent["legs"]) + len(agent["legs"]) - 1
-        for agent in agents
+        sum(len(leg) for leg in agent["legs"]) + len(agent["legs"]) - 1 for agent in agents
     )
     max_acts = max(len(agent["act_end_times"]) for agent in agents)
 
     paths = torch.full((num_agents, max_path_len), -1, dtype=torch.int32)
-    departure_times = torch.tensor(
-        [agent["dep_time"] for agent in agents], dtype=torch.int32
-    )
+    departure_times = torch.tensor([agent["dep_time"] for agent in agents], dtype=torch.int32)
     act_end_times = torch.full((num_agents, max_acts), -1, dtype=torch.int32)
     act_durations = torch.full((num_agents, max_acts), -1, dtype=torch.int32)
     num_legs = torch.zeros(num_agents, dtype=torch.int32)
@@ -266,10 +260,8 @@ def _pack_fixed_route_agents(
     return paths, departure_times, act_end_times, act_durations, num_legs
 
 
-def build_fixed_route_dnl(args: argparse.Namespace) -> TorchDNLMATSim:
-    network_file, population_file = _locate_scenario_files(
-        args.scenario, args.population
-    )
+def build_fixed_route_dnl(args: argparse.Namespace) -> TorchDNL:
+    network_file, population_file = _locate_scenario_files(args.scenario, args.population)
     print(f"  Benchmark network:    {network_file}")
     print(f"  Benchmark population: {population_file}")
 
@@ -284,11 +276,11 @@ def build_fixed_route_dnl(args: argparse.Namespace) -> TorchDNLMATSim:
     edge_endpoints = torch.tensor(
         [[edge["u"], edge["v"]] for edge in edges_data], dtype=torch.int32
     )
-    paths, departure_times, act_end_times, act_durations, num_legs = (
-        _pack_fixed_route_agents(agents)
+    paths, departure_times, act_end_times, act_durations, num_legs = _pack_fixed_route_agents(
+        agents
     )
 
-    return TorchDNLMATSim(
+    return TorchDNL(
         edge_static=edge_static,
         paths=paths,
         device=args.device,
@@ -306,7 +298,7 @@ def build_fixed_route_dnl(args: argparse.Namespace) -> TorchDNLMATSim:
     )
 
 
-def _summary(values: Iterable[float]) -> Dict[str, float]:
+def _summary(values: Iterable[float]) -> dict[str, float]:
     arr = np.asarray(list(values), dtype=np.float64)
     if arr.size == 0:
         return {
@@ -341,17 +333,17 @@ class DNLWorkloadProfiler:
 
     def __init__(self, name: str):
         self.name = name
-        self.current_phase: Optional[str] = None
+        self.current_phase: str | None = None
         self.wall_time = 0.0
-        self.step_times: List[float] = []
-        self.phase_times: Dict[str, List[float]] = defaultdict(list)
-        self.section_times: Dict[str, List[float]] = defaultdict(list)
-        self.workloads: Dict[str, List[int]] = defaultdict(list)
-        self.argsort_records: List[ArgsortRecord] = []
-        self.final_status_counts: Dict[str, int] = {}
-        self.extra: Dict[str, Any] = {}
+        self.step_times: list[float] = []
+        self.phase_times: dict[str, list[float]] = defaultdict(list)
+        self.section_times: dict[str, list[float]] = defaultdict(list)
+        self.workloads: dict[str, list[int]] = defaultdict(list)
+        self.argsort_records: list[ArgsortRecord] = []
+        self.final_status_counts: dict[str, int] = {}
+        self.extra: dict[str, Any] = {}
 
-    def record_snapshot(self, dnl: TorchDNLMATSim) -> None:
+    def record_snapshot(self, dnl: TorchDNL) -> None:
         status = dnl.status
         ready = dnl.wakeup_time <= dnl.current_step
         buffer_ready = (status == 2) & ready
@@ -363,12 +355,8 @@ class DNLWorkloadProfiler:
             "en_route_agents": int(((status == 1) | (status == 2)).sum().item()),
             "buffer_total": int((status == 2).sum().item()),
             "spatial_total": int((status == 1).sum().item()),
-            "nodes_A_candidates": int(
-                (buffer_ready & (dnl.next_edge != -1)).sum().item()
-            ),
-            "rl_decision_waiters": int(
-                (buffer_ready & (dnl.next_edge == -1)).sum().item()
-            ),
+            "nodes_A_candidates": int((buffer_ready & (dnl.next_edge != -1)).sum().item()),
+            "rl_decision_waiters": int((buffer_ready & (dnl.next_edge == -1)).sum().item()),
             "links_B_candidates": int(spatial_ready.sum().item()),
             "demand_C_exiters": int((status == 4).sum().item()),
             "demand_C_waiting": int(waiting_ready.sum().item()),
@@ -393,7 +381,7 @@ class DNLWorkloadProfiler:
             ArgsortRecord(self.current_phase or "outside_dnl_phase", size, seconds)
         )
 
-    def record_final_status(self, dnl: TorchDNLMATSim) -> None:
+    def record_final_status(self, dnl: TorchDNL) -> None:
         status = dnl.status
         self.final_status_counts = {
             "waiting_or_activity": int((status == 0).sum().item()),
@@ -403,8 +391,8 @@ class DNLWorkloadProfiler:
             "exiter": int((status == 4).sum().item()),
         }
 
-    def summarize(self) -> Dict[str, Any]:
-        argsort_by_phase: Dict[str, Dict[str, Dict[str, float]]] = {}
+    def summarize(self) -> dict[str, Any]:
+        argsort_by_phase: dict[str, dict[str, dict[str, float]]] = {}
         for phase in sorted({record.phase for record in self.argsort_records}):
             phase_records = [r for r in self.argsort_records if r.phase == phase]
             argsort_by_phase[phase] = {
@@ -417,16 +405,11 @@ class DNLWorkloadProfiler:
             "wall_time_s": self.wall_time,
             "dnl_steps": len(self.step_times),
             "step_times_s": _summary(self.step_times),
-            "phase_times_s": {
-                phase: _summary(self.phase_times.get(phase, [])) for phase in PHASES
-            },
+            "phase_times_s": {phase: _summary(self.phase_times.get(phase, [])) for phase in PHASES},
             "section_times_s": {
-                section: _summary(values)
-                for section, values in sorted(self.section_times.items())
+                section: _summary(values) for section, values in sorted(self.section_times.items())
             },
-            "workloads": {
-                key: _summary(self.workloads.get(key, [])) for key in WORKLOAD_KEYS
-            },
+            "workloads": {key: _summary(self.workloads.get(key, [])) for key in WORKLOAD_KEYS},
             "argsort": argsort_by_phase,
             "argsort_total_s": float(sum(r.seconds for r in self.argsort_records)),
             "argsort_calls": len(self.argsort_records),
@@ -460,10 +443,10 @@ class ArgsortPatch:
         return False
 
 
-def instrument_dnl(dnl: TorchDNLMATSim, profiler: DNLWorkloadProfiler) -> None:
+def instrument_dnl(dnl: TorchDNL, profiler: DNLWorkloadProfiler) -> None:
     """Replace one DNL instance's step method with an instrumented equivalent."""
 
-    def profiled_step(self: TorchDNLMATSim):
+    def profiled_step(self: TorchDNL):
         profiler.record_snapshot(self)
         step_t0 = time.perf_counter()
 
@@ -576,6 +559,7 @@ def run_training_profile(args: argparse.Namespace) -> DNLWorkloadProfiler:
     bandit.step = profiled_bandit_step
 
     if original_evaluate is not None:
+
         def profiled_evaluate(*eval_args, **eval_kwargs):
             t0_eval = time.perf_counter()
             result = original_evaluate(*eval_args, **eval_kwargs)
@@ -612,7 +596,9 @@ def run_training_profile(args: argparse.Namespace) -> DNLWorkloadProfiler:
                 masks_t,
                 aggregation_indices=aggregation_indices,
             )
-            profiler.record_section_time("agent.get_actions_batched", time.perf_counter() - t0_action)
+            profiler.record_section_time(
+                "agent.get_actions_batched", time.perf_counter() - t0_action
+            )
 
             actions = actions_t.cpu().numpy()
             t0_env_step = time.perf_counter()
@@ -649,7 +635,7 @@ def _fmt(value: float, width: int = 12, precision: int = 3) -> str:
     return f"{value:{width}.{precision}f}"
 
 
-def print_run_report(summary: Dict[str, Any]) -> None:
+def print_run_report(summary: dict[str, Any]) -> None:
     name = summary["name"]
     print("\n" + "-" * 72)
     print(f"  {name.upper()} SUMMARY")
@@ -719,7 +705,7 @@ def _ratio(training_value: float, benchmark_value: float) -> str:
     return f"{training_value / benchmark_value:.2f}x"
 
 
-def print_comparison(benchmark: Dict[str, Any], training: Dict[str, Any]) -> None:
+def print_comparison(benchmark: dict[str, Any], training: dict[str, Any]) -> None:
     print("\n" + "=" * 72)
     print("  TRAINING / BENCHMARK COMPARISON")
     print("=" * 72)
@@ -798,7 +784,7 @@ def print_comparison(benchmark: Dict[str, Any], training: Dict[str, Any]) -> Non
 
 def write_tick_csv(
     output_dir: str,
-    profilers: List[DNLWorkloadProfiler],
+    profilers: list[DNLWorkloadProfiler],
 ) -> None:
     os.makedirs(output_dir, exist_ok=True)
     for profiler in profilers:
@@ -813,7 +799,7 @@ def write_tick_csv(
 
 
 def _apply_config(args: argparse.Namespace) -> argparse.Namespace:
-    values: Dict[str, Any] = {
+    values: dict[str, Any] = {
         "scenario": None,
         "population": None,
         "max_steps": 86400,
@@ -868,8 +854,7 @@ def _apply_config(args: argparse.Namespace) -> argparse.Namespace:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Profile and compare DNL workload sizes in fixed-route benchmark "
-            "and RL training loops."
+            "Profile and compare DNL workload sizes in fixed-route benchmark and RL training loops."
         )
     )
     parser.add_argument("--config", default=None, help="Training-style JSON config")
@@ -954,7 +939,7 @@ def main() -> None:
     print(f"  Top-k paths:   {args.top_k_paths}")
     print(f"  Mode:          {args.mode}")
 
-    profilers: List[DNLWorkloadProfiler] = []
+    profilers: list[DNLWorkloadProfiler] = []
     if args.mode in ("both", "benchmark"):
         profilers.append(run_benchmark_profile(args))
     if args.mode in ("both", "training"):

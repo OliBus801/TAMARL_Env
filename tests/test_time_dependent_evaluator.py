@@ -10,21 +10,23 @@ Run with:
     conda activate ml
     PYTHONPATH=. python tests/test_time_dependent_evaluator.py tamarl/data/scenarios/grid_world/3x3 --population 100
 """
+
 import argparse
 import sys
+
 import torch
 
-from tamarl.envs.dta_bandit_env import DTABanditEnv
 from tamarl.envs.agent_level_wrapper import AgentLevelWrapper
 from tamarl.envs.components.time_dependent_evaluator import TimeDependentEvaluator
+from tamarl.envs.dta_bandit_env import DTABanditEnv
 
 
 def run_tests(scenario_path: str, population: str, device: str = "cpu"):
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print("  TimeDependentEvaluator — Integration Tests")
     print(f"  Scenario : {scenario_path}")
     print(f"  Pop      : {population}  |  Device: {device}")
-    print(f"{'='*60}\n")
+    print(f"{'=' * 60}\n")
 
     # ── Build environment ─────────────────────────────────────────────
     K = 3
@@ -59,8 +61,7 @@ def run_tests(scenario_path: str, population: str, device: str = "cpu"):
     )
     assert path_costs_e.shape == (env.num_envs, K)
     assert best_k_e.shape == (env.num_envs,)
-    assert (best_k_e >= 0).all() and (best_k_e < K).all(), \
-        "best_k out of [0, K) range!"
+    assert (best_k_e >= 0).all() and (best_k_e < K).all(), "best_k out of [0, K) range!"
     print(f"  ✓ path_costs shape: {list(path_costs_e.shape)}")
     assert not path_costs_e.isnan().any(), "NaN in path_costs!"
     assert (path_costs_e >= 0).all(), "Negative path cost found!"
@@ -68,7 +69,7 @@ def run_tests(scenario_path: str, population: str, device: str = "cpu"):
     print(f"  ✓ Max cost: {path_costs_e.max().item():.1f} s")
     print(f"  ✓ Mean cost (path 0): {path_costs_e[:, 0].mean().item():.1f} s")
     print(f"  ✓ best_k range: [{best_k_e.min().item()}, {best_k_e.max().item()}]")
-    
+
     best_k_hist = torch.bincount(best_k_e, minlength=K)
     for k in range(K):
         print(f"    path {k} chosen as best: {best_k_hist[k].item()} legs")
@@ -83,11 +84,11 @@ def run_tests(scenario_path: str, population: str, device: str = "cpu"):
     mean_abs_err = (td_cost_path0_leg0 - experienced_tt_leg0).abs().mean().item()
     print(f"  Leg-0 agents: {len(leg0_indices)}")
     print(f"  Mean |TD_cost(path0) - experienced_TT|: {mean_abs_err:.2f} s")
-    print(f"  (Expected small-ish if congestion is moderate)")
+    print("  (Expected small-ish if congestion is moderate)")
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print("  All tests passed ✓")
-    print(f"{'='*60}\n")
+    print(f"{'=' * 60}\n")
 
     env.close()
 
