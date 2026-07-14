@@ -1,66 +1,101 @@
-# TAMARL_Env
+# TrafficGym 🚦
 
-Modular multi-agent reinforcement learning environment for dynamic traffic assignment. Built on **PyTorch**, it features a fully vectorized, highly optimized mesoscopic traffic simulator (`TorchDNL`) inspired by MATSim's queue model.
+![License](https://img.shields.io/badge/license-MIT-blue.svg)
+![Python](https://img.shields.io/badge/python-3.8%2B-blue)
+![PyTorch](https://img.shields.io/badge/PyTorch-GPU%20Accelerated-orange)
 
-## 🚀 Features
+**TrafficGym** is a high-performance, GPU-accelerated Dynamic Traffic Assignment (DTA) environment designed specifically for Multi-Agent Reinforcement Learning (MARL). 
 
-- **GPU-Accelerated Simulation**: Fully tensorized operations for routing, traffic flow, and queueing capable of handling massive agent populations.
-- **MATSim Queue Dynamics**: Accurately models downstream spatial buffers, capacity flow limits, and spillback/gridlock resolution (`stuck_threshold`).
-- **Reinforcement Learning Mode**: Interactively inject dynamic `next_edge` routing decisions at each timestep without pre-calculated paths.
-- **Event Tracking**: Optional output of standard MATSim telemetry (`DEPARTURE`, `ENTERED_LINK`, `ARRIVAL`, etc.) for downstream analytics.
-- **PettingZoo & SB3 Ready**: Flexible foundation tailored for Multi-Agent Reinforcement Learning (MARL) research.
+It features **TorchDNL**, a vectorized Dynamic Network Loading engine implemented entirely in PyTorch, which is capable of scaling to large city networks while retaining micro-level agent resolution.
 
-## 🏗️ Structure
+![TrafficGym Demo](tamarl/data/scenarios/grid_world/3x3/output/simulation.gif)
+*A demonstration of the environment in a 3x3 grid scenario.*
 
-- `tamarl/core/torchdnl.py`: The core `TorchDNL` PyTorch simulator engine.
-- `tamarl/envs/`: Environment wrappers and scenario loading.
-- `tamarl/data/scenarios/`: XML network and MATSim population definition files.
-- `tamarl/visualisation/`: Tools for rendering networks and plotting simulation histograms.
-- `tests/`: Simple Pytest suite and benchmarking tools.
+## ✨ Features
 
-## 💻 Usage
+- **Blazing Fast Simulation**: TorchDNL computes traffic dynamics directly on the GPU using sparse tensor operations, bypassing the overhead of traditional CPU-based simulators.
+- **Gymnasium & PettingZoo Compatible**: Wrappers provide seamless integration with standard RL libraries.
+- **Multiple Formulations**: Route traffic using different bandit formulations (Agent-Level, OD-Level, Centralized).
+- **Extensible & Research-Ready**: Comes with benchmarking scripts, memory profilers, and diverse test scenarios (Grid Worlds, Sioux Falls, Los Angeles).
+- **Visualization Suite**: Built-in visualizer to render your networks and evaluate traffic conditions.
 
-### 1. Basic Simulation (Static Paths)
+## 🚀 Installation
+
+TrafficGym is built on modern Python packaging.
+
+1. **Clone the repository:**
+   ```bash
+   git clone https://github.com/AnonymousAuthors/TrafficGym.git
+   cd TrafficGym
+   ```
+
+2. **Create a virtual environment (optional but recommended):**
+   ```bash
+   conda create -n trafficgym python=3.10
+   conda activate trafficgym
+   ```
+
+3. **Install the package:**
+   ```bash
+   pip install -e .
+   ```
+
+## 🏁 Quick Start
+
+TrafficGym acts like any other `Gymnasium` environment. Here's a quick example running a random agent on a 3x3 grid world:
+
 ```python
 import torch
-from tamarl.core.torchdnl import TorchDNL
+from tamarl.envs.dta_bandit_env import DTABanditEnv
+from tamarl.envs.agent_level_wrapper import AgentLevelWrapper
 
-dnl = TorchDNL(
-    edge_static=edges_tensor,      # [length, free_speed, storage_cap, flow_cap, ff_time]
-    paths=agent_paths,             # Pre-calculated routes
-    edge_endpoints=endpoints,      # Network connectivity
-    device='cuda'
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# 1. Instantiate the base bandit environment
+bandit = DTABanditEnv(
+    scenario_path="tamarl/data/scenarios/grid_world/3x3",
+    population_filter="100",
+    device=device,
 )
 
-for _ in range(num_steps):
-    dnl.step()
+# 2. Wrap it for RL (Agent-level formulation)
+env = AgentLevelWrapper(bandit=bandit, top_k=3)
+
+# 3. Standard RL loop
+obs, info = env.reset()
+done = False
+
+while not done:
+    # Random actions for demonstration
+    actions = {agent_id: env.action_space(agent_id).sample() for agent_id in env.agents}
+    
+    obs, rewards, terminations, truncations, infos = env.step(actions)
+    
+    done = all(terminations.values()) or all(truncations.values())
+
+print("Simulation complete! ✅")
 ```
 
-### 2. Reinforcement Learning Mode (Dynamic Routing)
-```python
-dnl = TorchDNL(
-    edge_static=edges_tensor, 
-    paths=None,                    # Explicitly enables RL mode
-    first_edges=starting_edges,
-    destinations=target_nodes,
-    edge_endpoints=endpoints,
-    device='cuda'
-)
+## 📊 Generating the Demo GIF
 
-dnl.step()
-
-# Environment provides the next edge dynamically for routing agents
-dnl.next_edge[agent_id] = chosen_next_edge 
-```
-
-### 3. Benchmarks & Testing
-
-**Run Simulator Unit Tests:**
+To generate the demonstration GIF yourself, run the included script:
 ```bash
-PYTHONPATH=. pytest tests/test_torchdnl.py
+./scripts/generate_demo_gif.sh
 ```
 
-**Run Performance Benchmarks:**
-```bash
-PYTHONPATH=. python tests/benchmark_matsim_dnl.py tamarl/data/scenarios/grid_world/3x3 --population 100
+## 📄 License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+## 📚 Citation
+
+If you use TrafficGym in your research, please cite our paper:
+
+```bibtex
+@inproceedings{anonymous2025trafficgym,
+  title={TrafficGym: A GPU-Accelerated Dynamic Traffic Assignment Environment for MARL},
+  author={Anonymous Authors},
+  booktitle={Under Double-Blind Review},
+  year={2025}
+}
 ```
