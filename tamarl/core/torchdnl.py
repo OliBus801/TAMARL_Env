@@ -1,8 +1,11 @@
+from __future__ import annotations
+
 import cProfile
 import io
 import math
 import os
 import pstats
+from typing import Any, Optional
 
 import psutil
 import torch
@@ -37,25 +40,25 @@ class TorchDNL:
     def __init__(
         self,
         edge_static: torch.Tensor,
-        paths: torch.Tensor = None,
+        paths: torch.Tensor | None = None,
         device: str = "cuda",
-        departure_times: torch.Tensor = None,
-        edge_endpoints: torch.Tensor = None,
-        act_end_times: torch.Tensor = None,
-        act_durations: torch.Tensor = None,
-        num_legs: torch.Tensor = None,
+        departure_times: torch.Tensor | None = None,
+        edge_endpoints: torch.Tensor | None = None,
+        act_end_times: torch.Tensor | None = None,
+        act_durations: torch.Tensor | None = None,
+        num_legs: torch.Tensor | None = None,
         stuck_threshold: int = 10,
         dt: float = 1.0,
-        seed: int = None,
+        seed: int | None = None,
         enable_profiling: bool = False,
         track_events: bool = False,
-        first_edges: torch.Tensor = None,
-        destinations: torch.Tensor = None,
+        first_edges: torch.Tensor | None = None,
+        destinations: torch.Tensor | None = None,
         collect_link_tt: bool = False,
         link_tt_interval: float = 300.0,
-        paths_flat: torch.Tensor = None,
-        path_offsets: torch.Tensor = None,
-        max_steps: int = None,
+        paths_flat: torch.Tensor | None = None,
+        path_offsets: torch.Tensor | None = None,
+        max_steps: int | None = None,
     ):
         """
         Initialize the TorchDNL simulation engine.
@@ -304,7 +307,13 @@ class TorchDNL:
             self._event_count = 0
             self._cpu_events_blocks = []
 
-    def reset(self):
+    def reset(self) -> None:
+        """
+        Reset the simulation state for a new episode.
+
+        Clears all edge occupancies, agent statuses, event buffers, and resets
+        departure times and time intervals to their initial states.
+        """
         self.edge_occupancy.fill_(0)
         self.edge_capacity_accumulator.copy_(self.flow_capacity_per_step)
         self.step_edge_limits.fill_(0)
@@ -770,7 +779,6 @@ class TorchDNL:
                 self.current_leg[cont_agents] += 1
                 self._departure_emitted[cont_agents] = False  # reset for next leg
 
-
                 # Setup next_edge for the upcoming leg
                 # In paths tensor, leg boundaries are separated by single -2
                 # We just need to advance path_ptr by 2 (current is -2, next is start)
@@ -862,7 +870,7 @@ class TorchDNL:
     # =========================================================================
     # Finalize agents that are still in-network when simulation ends
     # =========================================================================
-    def finalize_stuck_agents(self):
+    def finalize_stuck_agents(self) -> None:
         """Finalize metrics for agents still in-network at the end of simulation.
 
         Called after the simulation loop completes. For each agent:
@@ -942,7 +950,14 @@ class TorchDNL:
     # =========================================================================
     # Step
     # =========================================================================
-    def step(self):
+    def step(self) -> None:
+        """
+        Execute one simulation step.
+
+        Processes nodes (moving agents from capacity buffers to downstream spatial buffers),
+        updates flow capacities, processes links (moving agents along links and handling arrivals),
+        schedules new demand, and collects dynamic link travel times if enabled.
+        """
         # A. Process Nodes (Capacity -> Downstream Spatial)
         self._process_nodes_A()
 
@@ -996,11 +1011,21 @@ class TorchDNL:
 
         self.current_step += 1
 
-    def stop_profiling(self):
+    def stop_profiling(self) -> None:
+        """
+        Stop the internal cProfile profiler.
+        """
         if self.profiler:
             self.profiler.disable()
 
-    def print_stats(self, sort="cumtime", limit=20):
+    def print_stats(self, sort: str = "cumtime", limit: int = 20) -> None:
+        """
+        Print profiling statistics.
+
+        Args:
+            sort: The sort order for the statistics (e.g., 'cumtime', 'tottime').
+            limit: The maximum number of rows to print.
+        """
         if self.profiler:
             print("\n--- 📊 Profiling Stats ---")
 
@@ -1035,11 +1060,11 @@ class TorchDNL:
 
         return compute_time, mem_mb, vram_mb
 
-    def get_snapshot(self):
+    def get_snapshot(self) -> dict[str, Any]:
         """Returns current edge occupancy"""
         return self.edge_occupancy.clone()
 
-    def get_metrics(self):
+    def get_metrics(self) -> dict[str, Any]:
         """
         Return dict with:
         - arrived_count
@@ -1073,7 +1098,7 @@ class TorchDNL:
             "n_imputed_legs": getattr(self, "n_imputed_legs", 0),
         }
 
-    def get_leg_histogram(self):
+    def get_leg_histogram(self) -> list[int]:
         """
         Return histogram of path_pointer for en-route agents.
         """
@@ -1085,7 +1110,7 @@ class TorchDNL:
         hist = torch.histc(pointers.float(), bins=max_ptr, min=0, max=max_ptr - 1)
         return hist
 
-    def get_events(self):
+    def get_events(self) -> list[torch.Tensor]:
         """
         Return the list of recorded events, sorted by time.
         Events are processed on CPU to avoid CUDA OOM for large scenarios.
