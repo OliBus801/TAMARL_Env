@@ -148,6 +148,7 @@ class MAPPOAgent(PPOBase):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--scenario", type=str, default="data/scenarios/SiouxFalls")
+    parser.add_argument("--population", type=str, default=None, help="Population file filter (e.g. '100')")
     parser.add_argument("--algo", type=str, default="mappo", choices=["ippo", "mappo"])
     parser.add_argument("--episodes", type=int, default=5)
     parser.add_argument("--max_steps", type=int, default=36000)
@@ -176,7 +177,8 @@ def main():
     bandit_env = DTABanditEnv(
         scenario_path=args.scenario,
         device=device,
-        max_steps=args.max_steps
+        max_steps=args.max_steps,
+        population_filter=args.population
     )
     
     # 2. Setup Agent Wrapper (for routes)
