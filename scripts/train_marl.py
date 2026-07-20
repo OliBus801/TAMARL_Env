@@ -151,9 +151,24 @@ def main():
     parser.add_argument("--algo", type=str, default="mappo", choices=["ippo", "mappo"])
     parser.add_argument("--episodes", type=int, default=5)
     parser.add_argument("--max_steps", type=int, default=36000)
+    parser.add_argument("--k", type=int, default=3, help="Number of paths in the agent's action space")
+    parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
+    parser.add_argument("--wandb_project", type=str, default="TorchDNL-MARL", help="W&B project name")
+    parser.add_argument("--wandb_tags", type=str, default=None, help="W&B run tags (comma-separated or JSON list string)")
     args = parser.parse_args()
     
-    wandb.init(project="TorchDNL-MARL", config=vars(args))
+    if args.wandb:
+        tags = None
+        if args.wandb_tags:
+            if args.wandb_tags.startswith("[") and args.wandb_tags.endswith("]"):
+                import json
+                try:
+                    tags = json.loads(args.wandb_tags)
+                except Exception:
+                    tags = [t.strip() for t in args.wandb_tags.split(",")]
+            else:
+                tags = [t.strip() for t in args.wandb_tags.split(",")]
+        wandb.init(project=args.wandb_project, config=vars(args), tags=tags)
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
@@ -165,7 +180,7 @@ def main():
     )
     
     # 2. Setup Agent Wrapper (for routes)
-    agent_wrapper = AgentLevelWrapper(bandit_env, top_k=3)
+    agent_wrapper = AgentLevelWrapper(bandit_env, top_k=args.k)
     
     # 3. Setup POMDP Wrapper
     env = POMDPWrapper(agent_wrapper)
@@ -173,8 +188,8 @@ def main():
     # 4. Setup Agent
     num_edges = len(bandit_env.scenario.edge_static)
     state_dim = num_edges
-    obs_dim = 1 + 3 * 2 # t_norm + FFTT (3) + Occ (3, mock)
-    action_dim = 3
+    obs_dim = 1 + args.k * 2 # t_norm + FFTT (k) + Occ (k, mock)
+    action_dim = args.k
     
     if args.algo == "mappo":
         agent = MAPPOAgent(obs_dim, state_dim, action_dim, device)
@@ -196,8 +211,6 @@ def main():
                 last_reported_time = env.t
                 
             # Formatting obs based on POMDPWrapper return
-            # POMDPWrapper returns obs tuple if we didn't fix it properly, but we fixed it to return `obs, S` inside `_get_obs`
-            # Wait, `env._get_obs` returns `obs, S`.
             obs_tensor, S = env._get_obs(active_indices)
             S_batch = S.unsqueeze(0).repeat(len(active_indices), 1)
             
@@ -239,7 +252,8 @@ def main():
         
         log_dict = {"Mean Travel Time": mean_tt, "Episode": ep}
         log_dict.update(update_metrics)
-        wandb.log(log_dict)
+        if args.wandb:
+            wandb.log(log_dict)
         
 if __name__ == "__main__":
     main()
