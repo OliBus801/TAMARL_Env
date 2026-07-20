@@ -7,7 +7,7 @@ the visualization renderer, then calls render_animation or render_live.
 import csv
 import os
 import tempfile
-from typing import Dict, Optional
+from typing import Optional
 
 from tamarl.core.torchdnl import EVENT_TYPE_NAMES, TorchDNL
 
@@ -60,6 +60,7 @@ def render_episode(
     render_hours: tuple | None = None,
     render_speed: int = 1,
     filename: str | None = None,
+    show_labels: bool = True,
 ):
     """Render a completed episode's events to gif/mp4 or show live.
 
@@ -101,6 +102,7 @@ def render_episode(
             time_range=time_range,
             initial_speed=render_speed,
             events_file=events_csv_path,
+            show_labels=show_labels,
         )
     else:
         if filename:
@@ -118,6 +120,7 @@ def render_episode(
             time_range=time_range,
             speed=render_speed,
             events_file=events_csv_path,
+            show_labels=show_labels,
         )
 
     # Clean up the events CSV after rendering

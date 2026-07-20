@@ -26,7 +26,7 @@ import xml.etree.ElementTree as ET
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Optional
 
 np = None
 torch = None

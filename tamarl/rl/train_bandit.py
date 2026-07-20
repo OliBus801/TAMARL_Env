@@ -8,7 +8,7 @@ import argparse
 import json
 import os
 import time
-from typing import Dict, List, Optional
+from typing import Optional
 
 import numpy as np
 import torch
@@ -238,6 +238,7 @@ def train(
     render_fps: int = 5,
     render_hours: tuple | None = None,
     render_speed: int = 1,
+    render_no_text: bool = False,
     # W&B
     wandb_enabled: bool = False,
     wandb_project: str = "tamarl",
@@ -794,6 +795,7 @@ def train(
                     render_hours=render_hours,
                     render_speed=render_speed,
                     filename=f"{agent_type}-{scenario_id}-{ep + 1}",
+                    show_labels=not render_no_text,
                 )
 
             window_stats = []
@@ -852,6 +854,7 @@ def train(
             render_hours=render_hours,
             render_speed=render_speed,
             filename=f"{agent_type}-{scenario_id}-final",
+            show_labels=not render_no_text,
         )
 
     # ── Sanity Check Plots ──
@@ -1128,6 +1131,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Start and end hours for rendering",
     )
     parser.add_argument("--render_speed", type=int, default=None, help="Speed factor for rendering")
+    parser.add_argument(
+        "--render_no_text",
+        action="store_true",
+        default=None,
+        help="Force not rendering text/labels on the network links",
+    )
 
     parser.add_argument("--profile_memory", action="store_true", help="Enable memory profiling")
     parser.add_argument(
@@ -1232,6 +1241,7 @@ _CLI_TO_KWARGS = {
     "render_fps": "render_fps",
     "render_hours": "render_hours",
     "render_speed": "render_speed",
+    "render_no_text": "render_no_text",
     "epsilon_ratio": "epsilon_ratio",
     "link_tt_interval": "link_tt_interval",
     "profile_memory": "profile_memory",

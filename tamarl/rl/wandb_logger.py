@@ -5,7 +5,7 @@ Provides a thin wrapper around wandb with graceful no-op when disabled.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Optional
 
 
 class WandbLogger:

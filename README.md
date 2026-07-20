@@ -4,12 +4,14 @@
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue)
 ![PyTorch](https://img.shields.io/badge/PyTorch-GPU%20Accelerated-orange)
 
+![TrafficGym at scale](tamarl/data/scenarios/berlin/output/1pct_8to12/simulation-ezgif.com-crop.gif)
+
 **TrafficGym** is a high-performance, GPU-accelerated Dynamic Traffic Assignment (DTA) environment designed specifically for Multi-Agent Reinforcement Learning (MARL). 
 
 It features **TorchDNL**, a vectorized Dynamic Network Loading engine implemented entirely in PyTorch, which is capable of scaling to large city networks while retaining micro-level agent resolution.
 
-![TrafficGym Demo](tamarl/data/scenarios/grid_world/3x3/output/simulation.gif)
-*A demonstration of the environment in a 3x3 grid scenario.*
+![TrafficGym Demo](tamarl/data/scenarios/shockwave/simple/output/simulation.gif)
+*A demonstration of the environment in a toy bottleneck scenario.*
 
 ## ✨ Features
 
