@@ -27,12 +27,11 @@ class POMDPWrapper:
         
         A = self.num_agents
         
-        # Create a dummy paths_flat and path_offsets
-        # Each agent gets exactly max_route_len edges, padded with -1
-        # Actually, let's just make it simple: 1 leg per agent for now.
+        # Each agent gets exactly max_route_len edges, prepended with first_edge, and a terminator.
+        # So we need max_route_len + 2 spaces per agent.
         
-        self.path_offsets = torch.arange(0, (A + 1) * (self.max_route_len + 1), self.max_route_len + 1, device=self.device, dtype=torch.long)
-        self.paths_flat = torch.full((A * (self.max_route_len + 1),), -1, device=self.device, dtype=torch.int32)
+        self.path_offsets = torch.arange(0, (A + 1) * (self.max_route_len + 2), self.max_route_len + 2, device=self.device, dtype=torch.long)
+        self.paths_flat = torch.full((A * (self.max_route_len + 2),), -1, device=self.device, dtype=torch.int32)
         
         # Reset bandit with dummy paths
         self.bandit.reset(paths_flat=self.paths_flat, path_offsets=self.path_offsets)
@@ -140,5 +139,9 @@ class POMDPWrapper:
             # CRITICAL: update next_edge because TorchDNL reads it at reset()
             self.dnl.next_edge[agent_idx] = self.paths_flat[write_start].long()
             
+        # We must advance the simulation by one step so we don't query the same agents again
+        self.dnl.step()
+        self.t += 1
+        
         # Fast forward
         return self._fast_forward()
