@@ -18,7 +18,6 @@ Memory comparison for Berlin 1% (32 314 OD, K=9, MaxRouteLen=844):
 
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
 
 import numpy as np
 

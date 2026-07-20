@@ -1,6 +1,6 @@
 """Metrics for evaluating DTA environment performance."""
 
-from typing import Dict, List, Optional
+from typing import Optional
 
 import numpy as np
 import torch

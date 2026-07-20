@@ -248,7 +248,6 @@ def run_benchmark(
     def get_mem():
         return process.memory_info().rss / 1024 / 1024
 
-
     # 1. Locate files
     files = [f for f in os.listdir(root_folder) if f.endswith(".xml")]
     network_file = None

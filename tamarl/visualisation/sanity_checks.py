@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import csv
 import os
-from typing import Dict, List, Optional, Tuple
+from typing import Optional
 
 import matplotlib
 import numpy as np

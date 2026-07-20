@@ -26,7 +26,7 @@ import heapq
 import os
 import pickle
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from typing import Dict, List, Optional, Tuple
+from typing import Optional
 
 import igraph as ig
 import numpy as np
