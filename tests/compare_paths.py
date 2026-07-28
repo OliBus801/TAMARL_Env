@@ -141,7 +141,7 @@ def main():
         raise FileNotFoundError(f"No network file found in {args.scenario}")
 
     print(f"Loading network from: {network_file}")
-    node_id_to_idx, edges_data, link_id_to_idx = parse_network(network_file)
+    node_id_to_idx, edges_data, link_id_to_idx, _ = parse_network(network_file)
 
     num_edges = len(edges_data)
     edge_lengths = np.array([e["attr"][0] for e in edges_data])

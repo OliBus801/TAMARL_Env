@@ -228,6 +228,8 @@ def train(
     # Agent
     agent_type: str = "random",
     top_k_paths: int = 3,
+    path_method: str = "penalty",
+    penalty_factor: float = 1.5,
     formulation: str = "agent",
     bandit_feedback: str = "full",
     # Logging
@@ -262,6 +264,10 @@ def train(
     exp3_gamma: float = 0.05,
     # Replicator Dynamics
     rd_beta: float = 0.1,
+    # MSA
+    msa_alpha_max: float = 1.0,
+    msa_alpha_min: float = 0.05,
+    msa_alpha_decay: float = 0.01,
     # Reload paths
     reload_paths: bool = False,
     # Profiling
@@ -271,6 +277,8 @@ def train(
     macro_od_size: float | None = None,
     # Save Pickles
     save_pickle: bool = False,
+    # Return env/agent instead of just all_stats (used by ablation harnesses)
+    return_env: bool = False,
 ):
     """Run the training loop for the One-Shot Bandit environment.
 
@@ -304,6 +312,8 @@ def train(
         "log_interval": log_interval,
         "agent_type": agent_type,
         "top_k_paths": top_k_paths,
+        "path_method": path_method,
+        "penalty_factor": penalty_factor,
         "formulation": formulation,
         "bandit_feedback": bandit_feedback,
         "epsilon_ratio": epsilon_ratio,
@@ -314,6 +324,9 @@ def train(
         "exp3_eta": exp3_eta,
         "exp3_gamma": exp3_gamma,
         "rd_beta": rd_beta,
+        "msa_alpha_max": msa_alpha_max,
+        "msa_alpha_min": msa_alpha_min,
+        "msa_alpha_decay": msa_alpha_decay,
         "reload_paths": reload_paths,
         "wandb_agent": wandb_agent,
     }
@@ -329,7 +342,10 @@ def train(
     )
     print(f"  Log interval:  every {log_interval} episodes")
     print(f"  Device:        {device} | Seed: {seed}")
-    print(f"  Top-k Paths:   {top_k_paths} | Scale Factor: {scale_factor}")
+    print(
+        f"  Top-k Paths:   {top_k_paths} | Path Method: {path_method} "
+        f"({penalty_factor}x) | Scale Factor: {scale_factor}"
+    )
     print(f"  Formulation:   {formulation} | Feedback: {bandit_feedback}")
     print(f"{'=' * 65}\n")
 
@@ -371,6 +387,8 @@ def train(
             top_k=top_k_paths,
             feedback_type=bandit_feedback,
             reload_paths=reload_paths,
+            method=path_method,
+            penalty_factor=penalty_factor,
         )
     elif formulation == "od_pair":
         env = ODLevelWrapper(
@@ -378,6 +396,8 @@ def train(
             top_k=top_k_paths,
             feedback_type=bandit_feedback,
             reload_paths=reload_paths,
+            method=path_method,
+            penalty_factor=penalty_factor,
         )
     elif formulation == "centralized":
         env = CentralizedLevelWrapper(
@@ -385,6 +405,8 @@ def train(
             top_k=top_k_paths,
             feedback_type=bandit_feedback,
             reload_paths=reload_paths,
+            method=path_method,
+            penalty_factor=penalty_factor,
         )
     else:
         raise ValueError(f"Unknown formulation: {formulation}")
@@ -521,6 +543,9 @@ def train(
             k_paths=top_k_paths,
             device=device,
             seed=seed,
+            alpha_max=msa_alpha_max,
+            alpha_min=msa_alpha_min,
+            alpha_decay=msa_alpha_decay,
         )
     elif agent_type == "evo_swap":
         from tamarl.rl.agents.evo_swap_agent import EvoSwapAgent
@@ -885,6 +910,8 @@ def train(
         tqdm.write(f"  ✅ Sanity check plots saved to {output_dir}")
 
     env.close()
+    if return_env:
+        return all_stats, env, agent
     return all_stats
 
 
@@ -915,6 +942,8 @@ def load_config(config_path: str) -> dict:
         "device": "device",
         "seed": "seed",
         "top_k_paths": "top_k_paths",
+        "path_method": "path_method",
+        "penalty_factor": "penalty_factor",
         "formulation": "formulation",
         "bandit_feedback": "bandit_feedback",
         "ucb_c": "ucb_c",
@@ -965,6 +994,15 @@ def load_config(config_path: str) -> dict:
     rd = cfg.get("replicator_dynamics", {})
     if "beta" in rd:
         kwargs["rd_beta"] = rd["beta"]
+
+    # ── MSA ──
+    msa = cfg.get("msa", {})
+    if "alpha_max" in msa:
+        kwargs["msa_alpha_max"] = msa["alpha_max"]
+    if "alpha_min" in msa:
+        kwargs["msa_alpha_min"] = msa["alpha_min"]
+    if "alpha_decay" in msa:
+        kwargs["msa_alpha_decay"] = msa["alpha_decay"]
 
     # ── Logging ──
     log = cfg.get("logging", {})
@@ -1096,6 +1134,18 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--top_k_paths", type=int, default=None, help="Number of top-k loopless paths (default: 3)"
     )
+    parser.add_argument(
+        "--path_method",
+        default=None,
+        choices=["yen", "sidetrack", "penalty"],
+        help="Candidate-route enumeration method (default: penalty)",
+    )
+    parser.add_argument(
+        "--penalty_factor",
+        type=float,
+        default=None,
+        help="Multiplicative edge penalty for the 'penalty' path method (default: 1.5)",
+    )
 
     # W&B
     parser.add_argument(
@@ -1188,6 +1238,18 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--rd_beta", type=float, default=None, help="Temperature parameter for RD agent"
     )
+    parser.add_argument(
+        "--msa_alpha_max", type=float, default=None, help="MSA step-size upper bound (default: 1.0)"
+    )
+    parser.add_argument(
+        "--msa_alpha_min", type=float, default=None, help="MSA step-size lower bound (default: 0.05)"
+    )
+    parser.add_argument(
+        "--msa_alpha_decay",
+        type=float,
+        default=None,
+        help="MSA step-size exponential decay rate (default: 0.01)",
+    )
 
     # Metrics Config
     parser.add_argument(
@@ -1220,6 +1282,8 @@ _CLI_TO_KWARGS = {
     "seed": "seed",
     "log_interval": "log_interval",
     "top_k_paths": "top_k_paths",
+    "path_method": "path_method",
+    "penalty_factor": "penalty_factor",
     "formulation": "formulation",
     "bandit_feedback": "bandit_feedback",
     "epsilon_start": "epsilon_start",
@@ -1232,6 +1296,9 @@ _CLI_TO_KWARGS = {
     "exp3_eta": "exp3_eta",
     "exp3_gamma": "exp3_gamma",
     "rd_beta": "rd_beta",
+    "msa_alpha_max": "msa_alpha_max",
+    "msa_alpha_min": "msa_alpha_min",
+    "msa_alpha_decay": "msa_alpha_decay",
     "wandb": "wandb_enabled",
     "wandb_project": "wandb_project",
     "wandb_tags": "wandb_tags",

@@ -394,7 +394,7 @@ def get_or_compute_top_k_paths(
     ff_times: np.ndarray,
     od_pairs: np.ndarray,
     k: int,
-    method: str = "yen",
+    method: str = "penalty",
     penalty_factor: float = 1.5,
     force_recompute: bool = False,
 ) -> dict[tuple[int, int], list[list[int]]]:

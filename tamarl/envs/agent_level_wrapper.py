@@ -59,6 +59,8 @@ class AgentLevelWrapper:
         top_k: int = 3,
         feedback_type: str = "full",
         reload_paths: bool = False,
+        method: str = "penalty",
+        penalty_factor: float = 1.5,
     ):
         self.bandit = bandit
         self.K = top_k
@@ -123,6 +125,8 @@ class AgentLevelWrapper:
             ff_times=ff_times,
             od_pairs=unique_od.astype(np.int32),
             k=top_k,
+            method=method,
+            penalty_factor=penalty_factor,
             force_recompute=reload_paths,
         )
 
