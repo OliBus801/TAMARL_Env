@@ -8,9 +8,10 @@ import os
 import pickle
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from typing import Optional
 
+import numpy as np
 import torch
+from scipy.spatial import cKDTree
 
 
 @dataclass
@@ -88,17 +89,91 @@ def parse_network(network_file: str, scale_factor: float = 1.0, timestep: float 
     return node_id_to_idx, edges, link_id_to_idx, node_coords
 
 
-def parse_population(pop_file: str, link_id_to_idx: dict[str, int], node_id_to_idx: dict[str, int]):
+def parse_facilities(facilities_file: str) -> dict[str, tuple[float, float]]:
+    """Parse a MATSim facilities.xml file into a facility_id -> (x, y) map."""
+    facility_coords: dict[str, tuple[float, float]] = {}
+    context = ET.iterparse(facilities_file, events=("end",))
+    for event, elem in context:
+        if elem.tag == "facility":
+            fid = elem.get("id")
+            x = elem.get("x")
+            y = elem.get("y")
+            if fid is not None and x is not None and y is not None:
+                facility_coords[fid] = (float(x), float(y))
+            elem.clear()
+    return facility_coords
+
+
+class GeometrySnapper:
+    """Snaps raw x/y coordinates to the network when a population file carries no
+    precomputed MATSim <route> (e.g. Kyoto, Mexico City): trip origins snap to the
+    nearest edge (by its "from" node) and trip destinations snap to the nearest node.
+    """
+
+    def __init__(self, edges_data: list[dict], node_coords_list: list[list[float]]):
+        node_coords = np.asarray(node_coords_list, dtype=np.float64)
+        self._node_tree = cKDTree(node_coords)
+        edge_origin_coords = np.asarray(
+            [node_coords_list[e["u"]] for e in edges_data], dtype=np.float64
+        )
+        self._edge_tree = cKDTree(edge_origin_coords)
+
+    def nearest_edges(self, points: np.ndarray) -> np.ndarray:
+        _, idx = self._edge_tree.query(points)
+        return idx
+
+    def nearest_nodes(self, points: np.ndarray) -> np.ndarray:
+        _, idx = self._node_tree.query(points)
+        return idx
+
+
+def _activity_position(
+    el, facility_coords: dict[str, tuple[float, float]] | None
+) -> tuple[float, float] | None:
+    x = el.get("x")
+    y = el.get("y")
+    if x is not None and y is not None:
+        return float(x), float(y)
+    if facility_coords is not None:
+        fac_id = el.get("facility")
+        if fac_id is not None and fac_id in facility_coords:
+            return facility_coords[fac_id]
+    return None
+
+
+def _next_activity(elements: list, idx: int):
+    for k in range(idx + 1, len(elements)):
+        if elements[k].tag in ("act", "activity"):
+            return elements[k]
+    return None
+
+
+def parse_population(
+    pop_file: str,
+    link_id_to_idx: dict[str, int],
+    node_id_to_idx: dict[str, int],
+    facility_coords: dict[str, tuple[float, float]] | None = None,
+    snapper: GeometrySnapper | None = None,
+):
     """Parse a traffic population XML file for RL mode.
+
+    If a leg has no usable <route> (missing, or referencing unknown link ids), and
+    both `facility_coords` and `snapper` are provided, the origin/destination are
+    instead resolved from the surrounding activities' x/y (or facility=) coordinates,
+    snapped onto the network. This is a fallback for scenarios (e.g. Kyoto, Mexico
+    City) whose population files carry no precomputed routes.
 
     Returns:
         agents: list of dicts per person with keys:
             - dep_time (int)
-            - legs (list of dicts: {'first_edge': int, 'dest_link_id': str})
+            - legs (list of dicts: {'first_edge': int, 'dest_link_id': str} or
+              {'first_edge': int, 'dest_node': int} for geometry-snapped legs)
             - act_end_times (list of int, per intermediate activity)
             - act_durations (list of int, per intermediate activity)
     """
     agents = []
+    # (leg_placeholder, origin_xy, dest_xy) pending a batched KD-tree snap resolution.
+    pending_snaps: list[tuple[dict, tuple[float, float], tuple[float, float]]] = []
 
     def time_to_sec(t_str):
         h, m, s = map(int, t_str.split(":"))
@@ -125,8 +200,9 @@ def parse_population(pop_file: str, link_id_to_idx: dict[str, int], node_id_to_i
                 act_durations = []
 
                 first_act = True
+                last_act_el = None
 
-                for el in elements:
+                for idx, el in enumerate(elements):
                     if el.tag in ["act", "activity"]:
                         end_time_str = el.get("end_time")
                         duration_str = el.get("duration")
@@ -149,6 +225,8 @@ def parse_population(pop_file: str, link_id_to_idx: dict[str, int], node_id_to_i
                             act_end_times.append(act_end)
                             act_durations.append(act_dur)
 
+                        last_act_el = el
+
                     elif el.tag == "leg":
                         mode = el.get("mode")
                         if mode == "car":
@@ -158,6 +236,8 @@ def parse_population(pop_file: str, link_id_to_idx: dict[str, int], node_id_to_i
                                 if (route_tag is not None and route_tag.text)
                                 else None
                             )
+                            first_edge = None
+                            dest_link_id = None
                             if route_str:
                                 link_ids = route_str.split(" ")
                                 first_link_id = link_ids[0]
@@ -167,12 +247,29 @@ def parse_population(pop_file: str, link_id_to_idx: dict[str, int], node_id_to_i
                                     first_link_id in link_id_to_idx
                                     and last_link_id in link_id_to_idx
                                 ):
-                                    person_legs.append(
-                                        {
-                                            "first_edge": link_id_to_idx[first_link_id],
-                                            "dest_link_id": last_link_id,
-                                        }
-                                    )
+                                    first_edge = link_id_to_idx[first_link_id]
+                                    dest_link_id = last_link_id
+
+                            if first_edge is not None:
+                                person_legs.append(
+                                    {"first_edge": first_edge, "dest_link_id": dest_link_id}
+                                )
+                            elif snapper is not None:
+                                next_act_el = _next_activity(elements, idx)
+                                origin_pos = (
+                                    _activity_position(last_act_el, facility_coords)
+                                    if last_act_el is not None
+                                    else None
+                                )
+                                dest_pos = (
+                                    _activity_position(next_act_el, facility_coords)
+                                    if next_act_el is not None
+                                    else None
+                                )
+                                if origin_pos is not None and dest_pos is not None:
+                                    placeholder = {"first_edge": None, "dest_node": None}
+                                    person_legs.append(placeholder)
+                                    pending_snaps.append((placeholder, origin_pos, dest_pos))
 
                 if len(person_legs) > 0:
                     num_boundaries = len(person_legs) - 1
@@ -189,6 +286,15 @@ def parse_population(pop_file: str, link_id_to_idx: dict[str, int], node_id_to_i
                     )
 
             elem.clear()
+
+    if pending_snaps:
+        origins = np.array([p[1] for p in pending_snaps], dtype=np.float64)
+        dests = np.array([p[2] for p in pending_snaps], dtype=np.float64)
+        edge_idxs = snapper.nearest_edges(origins)
+        node_idxs = snapper.nearest_nodes(dests)
+        for (placeholder, _, _), e_idx, n_idx in zip(pending_snaps, edge_idxs, node_idxs):
+            placeholder["first_edge"] = int(e_idx)
+            placeholder["dest_node"] = int(n_idx)
 
     return agents
 
@@ -230,6 +336,7 @@ def load_scenario(
 
     net_candidates = [f for f in files if "network" in f.lower()]
     pop_candidates = [f for f in files if "population" in f.lower() or "plans" in f.lower()]
+    facility_candidates = [f for f in files if "facilit" in f.lower()]
 
     if net_candidates:
         network_file = os.path.join(root_folder, net_candidates[0])
@@ -262,7 +369,28 @@ def load_scenario(
     node_id_to_idx, edges_data, link_id_to_idx, node_coords_list = parse_network(
         network_file, scale_factor, timestep
     )
-    agents = parse_population(population_file, link_id_to_idx, node_id_to_idx)
+
+    # Fallback for population files with no precomputed <route> (e.g. Kyoto, Mexico
+    # City): if a facilities.xml is present, snap activity/facility coordinates onto
+    # the network to recover each leg's origin edge / destination node.
+    facility_coords = None
+    snapper = None
+    if facility_candidates:
+        facilities_file = os.path.join(root_folder, facility_candidates[0])
+        print(
+            f"Found facilities file {facilities_file}; using it as an OD fallback "
+            "for legs with no precomputed route."
+        )
+        facility_coords = parse_facilities(facilities_file)
+        snapper = GeometrySnapper(edges_data, node_coords_list)
+
+    agents = parse_population(
+        population_file,
+        link_id_to_idx,
+        node_id_to_idx,
+        facility_coords=facility_coords,
+        snapper=snapper,
+    )
 
     if len(agents) == 0:
         raise ValueError(f"No valid trips found in population file {population_file}.")
@@ -296,7 +424,10 @@ def load_scenario(
         num_legs[i] = len(legs)
         for j, leg in enumerate(legs):
             first_edges[i, j] = leg["first_edge"]
-            destinations[i, j] = edge_to_node[leg["dest_link_id"]]
+            if leg.get("dest_node") is not None:
+                destinations[i, j] = leg["dest_node"]
+            else:
+                destinations[i, j] = edge_to_node[leg["dest_link_id"]]
 
         n_acts = len(a["act_end_times"])
         if n_acts > 0:
