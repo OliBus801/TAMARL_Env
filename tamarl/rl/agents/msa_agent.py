@@ -20,7 +20,6 @@ Mise à jour (update)
 
 from __future__ import annotations
 
-import math
 from typing import Optional
 
 import torch
@@ -35,7 +34,13 @@ class MSAAgent:
         p_{n+1}(k) = (1 - α_n) * p_n(k)  +  α_n * Target_n(k)
 
     where ``Target_n(k)`` is the proportion of legs in the block for which `k`
-    is the best-response path (minimum TD cost), and ``α_n`` decays exponentially.
+    is the best-response path (minimum TD cost), and ``α_n`` follows the
+    classical vanishing power-law schedule ``α_n = alpha_max / n**alpha_power``
+    (harmonic ``1/n`` for ``alpha_power=1.0``, the textbook MSA choice, see
+    Sheffi 1985). This satisfies the Robbins-Monro conditions (Σα_n = ∞,
+    Σα_n² < ∞ for ``0.5 < alpha_power <= 1``) required for the successive
+    averages to actually converge to a Wardrop equilibrium rather than
+    degenerating into repeated all-or-nothing best-response reassignment.
 
     The distribution is initialized in "All-or-Nothing" (AoN) mode: 100%
     probability on the free-flow shortest path.
@@ -46,9 +51,12 @@ class MSAAgent:
         k_paths:     Number of candidate routes per OD pair (K).
         device:      Torch device string.
         seed:        Optional RNG seed for reproducibility.
-        alpha_max:   Maximum value for the MSA step size.
-        alpha_min:   Minimum value for the MSA step size.
-        alpha_decay: Exponential decay rate for alpha.
+        alpha_max:   Scale of the MSA step size (alpha at episode 1 == alpha_max).
+        alpha_min:   Hard floor for numerical safety only. Defaults to 0.0 (no
+                     floor) so the schedule actually vanishes as required by
+                     theory; a positive value here reintroduces the same
+                     non-convergent behavior this schedule is meant to fix.
+        alpha_power: Exponent of the power-law decay (1.0 = classical 1/n).
     """
 
     def __init__(
@@ -58,15 +66,15 @@ class MSAAgent:
         device: str = "cpu",
         seed: int | None = None,
         alpha_max: float = 1.0,
-        alpha_min: float = 0.05,
-        alpha_decay: float = 0.01,
+        alpha_min: float = 0.0,
+        alpha_power: float = 1.0,
     ):
         self._env = env
         self.k_paths = k_paths
         self.device = device
         self.alpha_max = alpha_max
         self.alpha_min = alpha_min
-        self.alpha_decay = alpha_decay
+        self.alpha_power = alpha_power
 
         if seed is not None:
             torch.manual_seed(seed)
@@ -175,9 +183,7 @@ class MSAAgent:
             aggregation_indices:  [N] mapping legs → blocs B.
         """
         self.episode += 1
-        alpha = self.alpha_min + (self.alpha_max - self.alpha_min) * math.exp(
-            -self.alpha_decay * self.episode
-        )
+        alpha = max(self.alpha_min, self.alpha_max / (self.episode**self.alpha_power))
 
         dnl = self._env.bandit.dnl
         if not dnl.collect_link_tt:
@@ -235,9 +241,8 @@ class MSAAgent:
         pass
 
     def __repr__(self) -> str:
-        alpha = self.alpha_min + (self.alpha_max - self.alpha_min) * math.exp(
-            -self.alpha_decay * self.episode
-        )
+        n = max(self.episode, 1)
+        alpha = max(self.alpha_min, self.alpha_max / (n**self.alpha_power))
         return (
             f"MSAAgent(B={self.num_models}, N_legs={self.num_envs}, "
             f"K={self.k_paths}, episode={self.episode}, α={alpha:.4f})"

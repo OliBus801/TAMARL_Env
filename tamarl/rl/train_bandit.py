@@ -266,8 +266,8 @@ def train(
     rd_beta: float = 0.1,
     # MSA
     msa_alpha_max: float = 1.0,
-    msa_alpha_min: float = 0.05,
-    msa_alpha_decay: float = 0.01,
+    msa_alpha_min: float = 0.0,
+    msa_alpha_power: float = 1.0,
     # Reload paths
     reload_paths: bool = False,
     # Profiling
@@ -326,7 +326,7 @@ def train(
         "rd_beta": rd_beta,
         "msa_alpha_max": msa_alpha_max,
         "msa_alpha_min": msa_alpha_min,
-        "msa_alpha_decay": msa_alpha_decay,
+        "msa_alpha_power": msa_alpha_power,
         "reload_paths": reload_paths,
         "wandb_agent": wandb_agent,
     }
@@ -545,7 +545,7 @@ def train(
             seed=seed,
             alpha_max=msa_alpha_max,
             alpha_min=msa_alpha_min,
-            alpha_decay=msa_alpha_decay,
+            alpha_power=msa_alpha_power,
         )
     elif agent_type == "evo_swap":
         from tamarl.rl.agents.evo_swap_agent import EvoSwapAgent
@@ -1001,8 +1001,8 @@ def load_config(config_path: str) -> dict:
         kwargs["msa_alpha_max"] = msa["alpha_max"]
     if "alpha_min" in msa:
         kwargs["msa_alpha_min"] = msa["alpha_min"]
-    if "alpha_decay" in msa:
-        kwargs["msa_alpha_decay"] = msa["alpha_decay"]
+    if "alpha_power" in msa:
+        kwargs["msa_alpha_power"] = msa["alpha_power"]
 
     # ── Logging ──
     log = cfg.get("logging", {})
@@ -1239,16 +1239,19 @@ def _build_parser() -> argparse.ArgumentParser:
         "--rd_beta", type=float, default=None, help="Temperature parameter for RD agent"
     )
     parser.add_argument(
-        "--msa_alpha_max", type=float, default=None, help="MSA step-size upper bound (default: 1.0)"
+        "--msa_alpha_max", type=float, default=None, help="MSA step-size scale, alpha at episode 1 (default: 1.0)"
     )
     parser.add_argument(
-        "--msa_alpha_min", type=float, default=None, help="MSA step-size lower bound (default: 0.05)"
-    )
-    parser.add_argument(
-        "--msa_alpha_decay",
+        "--msa_alpha_min",
         type=float,
         default=None,
-        help="MSA step-size exponential decay rate (default: 0.01)",
+        help="MSA step-size hard floor for numerical safety (default: 0.0, i.e. no floor)",
+    )
+    parser.add_argument(
+        "--msa_alpha_power",
+        type=float,
+        default=None,
+        help="Exponent of the MSA power-law decay alpha_n = alpha_max / n**power (default: 1.0, classical 1/n)",
     )
 
     # Metrics Config
@@ -1298,7 +1301,7 @@ _CLI_TO_KWARGS = {
     "rd_beta": "rd_beta",
     "msa_alpha_max": "msa_alpha_max",
     "msa_alpha_min": "msa_alpha_min",
-    "msa_alpha_decay": "msa_alpha_decay",
+    "msa_alpha_power": "msa_alpha_power",
     "wandb": "wandb_enabled",
     "wandb_project": "wandb_project",
     "wandb_tags": "wandb_tags",

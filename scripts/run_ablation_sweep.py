@@ -51,11 +51,15 @@ AXES: dict[str, list[tuple[str, str, dict]]] = {
         for agent in ("ucb", "msa")
     ],
     # B1: MSA step-size schedule sensitivity.
+    # alpha_n = alpha_max / n**alpha_power (vanishing power-law, Robbins-Monro
+    # satisfied for 0.5 < alpha_power <= 1; "non_vanishing_control" deliberately
+    # violates this — a floored/constant step size — as a known-bad control to
+    # contrast against the classical harmonic schedule.
     "B_msa_alpha_sweep": [
-        ("default", "msa", {"msa_alpha_max": 1.0, "msa_alpha_min": 0.05, "msa_alpha_decay": 0.01}),
-        ("slow_decay", "msa", {"msa_alpha_max": 1.0, "msa_alpha_min": 0.05, "msa_alpha_decay": 0.002}),
-        ("fast_decay", "msa", {"msa_alpha_max": 1.0, "msa_alpha_min": 0.05, "msa_alpha_decay": 0.05}),
-        ("near_constant_avg", "msa", {"msa_alpha_max": 0.2, "msa_alpha_min": 0.2, "msa_alpha_decay": 0.0}),
+        ("harmonic", "msa", {"msa_alpha_max": 1.0, "msa_alpha_min": 0.0, "msa_alpha_power": 1.0}),
+        ("slow_power", "msa", {"msa_alpha_max": 1.0, "msa_alpha_min": 0.0, "msa_alpha_power": 0.6}),
+        ("fast_power", "msa", {"msa_alpha_max": 1.0, "msa_alpha_min": 0.0, "msa_alpha_power": 0.9}),
+        ("non_vanishing_control", "msa", {"msa_alpha_max": 0.2, "msa_alpha_min": 0.2, "msa_alpha_power": 0.0}),
     ],
     # B3: TD-oracle time-bin granularity (shared by MSA's update target and
     # the Wardrop Regret metric).
